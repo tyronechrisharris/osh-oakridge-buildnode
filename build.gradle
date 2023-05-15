@@ -1,0 +1,58 @@
+apply from: gradle.oshCoreDir + '/common.gradle'
+description = ''
+
+allprojects {
+    version = 0.1
+}
+
+subprojects {
+    repositories.addAll(rootProject.repositories)
+}
+
+dependencies {
+    // FROM OSH-CORE
+    implementation 'org.sensorhub:sensorhub-core:' + oshCoreVersion
+    implementation 'org.sensorhub:sensorhub-core-osgi:' + oshCoreVersion
+    implementation 'org.sensorhub:sensorhub-datastore-h2:' + oshCoreVersion
+    implementation 'org.sensorhub:sensorhub-service-swe:' + oshCoreVersion
+    implementation 'org.sensorhub:sensorhub-webui-core:' + oshCoreVersion
+    implementation 'org.sensorhub:sensorhub-service-sweapi:' + oshCoreVersion
+
+    // FROM OSH-ADDONS
+    implementation project(':sensorhub-driver-videocam')
+    implementation project(':sensorhub-driver-rtpcam')
+    implementation project(':sensorhub-process-ffmpeg')
+    implementation project(':sensorhub-driver-fakegps')
+    implementation project(':sensorhub-service-video')
+
+    // FROM OSH-OAKRIDGE-MODULES
+}
+
+configurations {
+    rel
+    dev
+    stable
+}
+
+distributions{
+    rel {
+        distributionBaseName = 'osh-node'
+        contents {
+            from 'scripts/standard'
+            from 'scripts/keystores'
+            from 'config/standard'
+            from 'README.md'
+            into('web'){
+                from 'web'
+            }
+            into('trusted_certificates') {
+                from 'scripts/trusted_certificates'
+            }
+            into('lib') {
+                from 'third-party-drivers'
+            }
+        }
+    }
+}
+
+apply from: gradle.oshCoreDir + '/release.gradle'

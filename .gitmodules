@@ -1,0 +1,9 @@
+[submodule "include/osh-oakridge-modules"]
+	path = include/osh-oakridge-modules
+	url = git@github.com:Botts-Innovative-Research/osh-oakridge-modules.git
+[submodule "include/osh-core"]
+	path = include/osh-core
+	url = git@github.com:opensensorhub/osh-core.git
+[submodule "include/osh-addons"]
+	path = include/osh-addons
+	url = git@github.com:opensensorhub/osh-addons.git

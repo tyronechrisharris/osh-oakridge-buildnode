@@ -1,0 +1,70 @@
+rootProject.name = 'osh-ornl-node'
+gradle.ext.oshCoreDir = "$rootDir/include/osh-core"
+gradle.ext.oshAddonsDir = "$rootDir/include/osh-addons"
+gradle.ext.oshOakridgeModules = "$rootDir/include/osh-oakridge-modules"
+
+includeBuild gradle.oshCoreDir
+
+include 'sensorhub-driver-fakegps'
+project(':sensorhub-driver-fakegps').projectDir = "$gradle.oshAddonsDir/sensors/simulated/sensorhub-driver-fakegps" as File
+
+include 'sensorhub-process-ffmpeg'
+project(':sensorhub-process-ffmpeg').projectDir = "$gradle.oshAddonsDir/processing/sensorhub-process-ffmpeg" as File
+
+include 'sensorhub-service-video'
+project(':sensorhub-service-video').projectDir = "$gradle.oshAddonsDir/services/sensorhub-service-video" as File
+
+include 'sensorhub-driver-videocam'
+project(':sensorhub-driver-videocam').projectDir = "$gradle.oshAddonsDir/sensors/video/sensorhub-driver-videocam" as File
+
+include 'sensorhub-driver-v4l'
+project(':sensorhub-driver-v4l').projectDir = "$gradle.oshAddonsDir/sensors/video/sensorhub-driver-v4l" as File
+
+include 'sensorhub-driver-rtpcam'
+project(':sensorhub-driver-rtpcam').projectDir = "$gradle.oshAddonsDir/sensors/video/sensorhub-driver-rtpcam" as File
+
+
+// include all folders with build.gradle as subprojects from osh-oakridge-modules
+FileTree subprojects = fileTree("$gradle.oshOakridgeModules/sensors").include('**/build.gradle')
+subprojects.files.each { File f ->
+    // To exclude a project use the following if by adding a new '&& !f.toString().contains('project-name')'
+    // To include a project using the following remove its corresponding '&& !f.toString().contains('project-name')'
+    if (!f.toString().contains('planetscope')) {
+        File projectFolder = f.parentFile
+        if (projectFolder != rootDir) {
+            String projectName = ':' + projectFolder.name
+            include projectName
+            project(projectName).projectDir = projectFolder
+        }
+    }
+}
+
+subprojects = fileTree("$gradle.oshOakridgeModules/processing").include('**/build.gradle')
+subprojects.files.each { File f ->
+    File projectFolder = f.parentFile
+    if (projectFolder != rootDir) {
+        String projectName = ':' + projectFolder.name
+        include projectName
+        project(projectName).projectDir = projectFolder
+    }
+}
+
+subprojects = fileTree("$gradle.oshOakridgeModules/services").include('**/build.gradle')
+subprojects.files.each { File f ->
+    File projectFolder = f.parentFile
+    if (projectFolder != rootDir) {
+        String projectName = ':' + projectFolder.name
+        include projectName
+        project(projectName).projectDir = projectFolder
+    }
+}
+
+subprojects = fileTree("$gradle.oshOakridgeModules/tools").include('**/build.gradle')
+subprojects.files.each { File f ->
+    File projectFolder = f.parentFile
+    if (projectFolder != rootDir) {
+        String projectName = ':' + projectFolder.name
+        include projectName
+        project(projectName).projectDir = projectFolder
+    }
+}
