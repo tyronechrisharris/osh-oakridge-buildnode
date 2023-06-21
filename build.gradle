@@ -50,6 +50,8 @@ distributions{
             }
             into('lib') {
                 from 'third-party-drivers'
+                from project.configurations.runtimeClasspath
+
             }
         }
     }
