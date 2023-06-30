@@ -26,6 +26,8 @@ dependencies {
     implementation project(':sensorhub-service-video')
 
     // FROM OSH-OAKRIDGE-MODULES
+    implementation project(':sensorhub-driver-kromek-d3s')
+    implementation project(':sensorhub-driver-rs350')
 }
 
 configurations {
