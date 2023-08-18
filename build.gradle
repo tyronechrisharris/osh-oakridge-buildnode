@@ -41,7 +41,7 @@ configurations {
 
 distributions{
     rel {
-        distributionBaseName = 'osh-node'
+        distributionBaseName = 'osh-node-ornl'
         contents {
             from 'scripts/standard'
             from 'scripts/keystores'
