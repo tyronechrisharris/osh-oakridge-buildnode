@@ -26,11 +26,13 @@ dependencies {
     implementation project(':sensorhub-service-video')
     implementation project(':sensorhub-driver-dahua')
     implementation project(':sensorhub-driver-axis')
+//    implementation project(':sensorhub-driver-openhab')
 //    implementation project(':sensorhub-driver-onvif')
 
     // FROM OSH-OAKRIDGE-MODULES
     implementation project(':sensorhub-driver-kromek-d3s')
     implementation project(':sensorhub-driver-rs350')
+    implementation project(':sensorhub-driver-rapiscan')
 }
 
 configurations {
