@@ -2,7 +2,7 @@ apply from: gradle.oshCoreDir + '/common.gradle'
 description = ''
 
 allprojects {
-    version = 0.1
+    version = 1.0
 }
 
 subprojects {
@@ -30,8 +30,8 @@ dependencies {
 //    implementation project(':sensorhub-driver-onvif')
 
     // FROM OSH-OAKRIDGE-MODULES
-    implementation project(':sensorhub-driver-kromek-d3s')
-    implementation project(':sensorhub-driver-rs350')
+//    implementation project(':sensorhub-driver-kromek-d3s')
+//    implementation project(':sensorhub-driver-rs350')
     implementation project(':sensorhub-driver-rapiscan')
 }
 
@@ -43,7 +43,7 @@ configurations {
 
 distributions{
     rel {
-        distributionBaseName = 'osh-node-ornl'
+        distributionBaseName = 'osh-node-oscas'
         contents {
             from 'scripts/standard'
             from 'scripts/keystores'
