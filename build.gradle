@@ -33,6 +33,7 @@ dependencies {
     implementation project(':sensorhub-driver-rs350')
     implementation project(':sensorhub-driver-kromek-d5')
     implementation project(':sensorhub-driver-rapiscan')
+    implementation project(':sensorhub-driver-aspect')
 }
 
 configurations {
