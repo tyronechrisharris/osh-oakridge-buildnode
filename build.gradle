@@ -30,9 +30,11 @@ dependencies {
 //    implementation project(':sensorhub-driver-onvif')
 
     // FROM OSH-OAKRIDGE-MODULES
-//    implementation project(':sensorhub-driver-kromek-d3s')
-//    implementation project(':sensorhub-driver-rs350')
+    implementation project(':sensorhub-driver-kromek-d3s')
+    implementation project(':sensorhub-driver-rs350')
     implementation project(':sensorhub-driver-rapiscan')
+    implementation project(':sensorhub-driver-aspect')
+    implementation project(':sensorhub-driver-kromek-d5')
 }
 
 configurations {
@@ -58,7 +60,9 @@ distributions{
             into('lib') {
                 from 'third-party-drivers'
                 from project.configurations.runtimeClasspath
-
+            }
+            into('rules') {
+                from 'rules'
             }
         }
     }
