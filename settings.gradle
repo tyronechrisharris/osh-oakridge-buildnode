@@ -36,7 +36,6 @@ project(':sensorhub-driver-axis').projectDir = "$gradle.oshAddonsDir/sensors/vid
 //project(':sensorhub-driver-onvif').projectDir = "$gradle.oshAddonsDir/sensors/video/sensorhub-driver-onvif" as File
 
 
-
 // include all folders with build.gradle as subprojects from osh-oakridge-modules
 FileTree subprojects = fileTree("$gradle.oshOakridgeModules/sensors").include('**/build.gradle')
 subprojects.files.each { File f ->

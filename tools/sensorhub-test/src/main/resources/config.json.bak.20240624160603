@@ -203,56 +203,11 @@
     "autoStart": false
   },
   {
-    "objClass": "com.botts.impl.sensor.rapiscan.RapiscanConfig",
-    "serialNumber": "sensor001",
-    "commSettings": {
-      "objClass": "org.sensorhub.impl.comm.TCPCommProviderConfig",
-      "connection": {
-        "objClass": "org.sensorhub.impl.comm.RobustIPConnectionConfig",
-        "checkReachability": true,
-        "connectTimeout": 3000,
-        "reconnectPeriod": 10000,
-        "reconnectAttempts": 0
-      },
-      "protocol": {
-        "objClass": "org.sensorhub.impl.comm.TCPConfig",
-        "remotePort": 1600,
-        "enableTLS": false,
-        "remoteHost": "192.168.1.69",
-        "localAddress": "AUTO"
-      },
-      "moduleClass": "org.sensorhub.impl.comm.TCPCommProvider",
-      "autoStart": false
-    },
-    "positionConfig": {
-      "objClass": "org.sensorhub.api.sensor.PositionConfig",
-      "location": {
-        "objClass": "org.sensorhub.api.sensor.PositionConfig$LLALocation",
-        "lat": 0.0,
-        "lon": 0.0,
-        "alt": 0.0
-      },
-      "orientation": {
-        "objClass": "org.sensorhub.api.sensor.PositionConfig$EulerOrientation",
-        "heading": 0.0,
-        "pitch": 0.0,
-        "roll": 0.0
-      }
-    },
-    "laneName": "VM250",
-    "supplementalAlgorithm": true,
-    "lastUpdated": "2024-06-24T16:29:55.168-0500",
-    "id": "730dba4f-d4d7-4b53-b61e-c0d6009e7459",
-    "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
-    "name": "New Rapiscan Sensor Driver",
-    "autoStart": false
-  },
-  {
     "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
     "dbConfig": {
       "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
       "indexObsLocation": false,
-      "storagePath": "aspect.db",
+      "storagePath": "rapiscan22.db",
       "memoryCacheSize": 5120,
       "autoCommitBufferSize": 1024,
       "autoCommitPeriod": 10,
@@ -265,18 +220,26 @@
       "autoStart": false
     },
     "systemUIDs": [
-      "urn:osh:sensor:aspect:sensor001"
+      "urn:osh:sensor:rapiscan1",
+      "urn:osh:sensor:rapiscan2",
+      "urn:osh:system:Rapiscan System 1"
     ],
+    "autoPurgeConfig": {
+      "objClass": "org.sensorhub.impl.database.system.MaxAgeAutoPurgeConfig",
+      "maxRecordAge": 604800.0,
+      "enabled": true,
+      "purgePeriod": 3600.0
+    },
     "minCommitPeriod": 10000,
-    "databaseNum": 1,
-    "id": "f88b6074-99f0-48d0-b0b0-133157f8e853",
+    "databaseNum": 2,
+    "id": "9a6d6854-b5b6-4f35-8c5a-969ec1d51751",
     "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "aspect rpm",
+    "name": "New System Driver Database",
     "autoStart": false
   },
   {
     "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig",
-    "uniqueID": "1",
+    "uniqueID": "Rapiscan System 1",
     "subsystems": [
       {
         "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
@@ -286,17 +249,49 @@
           "positionConfig": {
             "objClass": "org.sensorhub.api.sensor.PositionConfig"
           },
-          "supplementalAlgorithm": false,
-          "lastUpdated": "2024-06-26T16:19:59.922-0500",
-          "id": "358b2783-0e83-4a30-b9be-e538270f3481",
+          "laneId": 0,
+          "lastUpdated": "2024-06-24T15:59:23.483-0500",
+          "id": "8231527d-1dd8-4ae0-b82c-7653751e43c9",
+          "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
+          "name": "New Rapiscan Sensor Driver",
+          "autoStart": false
+        }
+      },
+      {
+        "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
+        "config": {
+          "objClass": "com.botts.impl.sensor.rapiscan.RapiscanConfig",
+          "serialNumber": "sensor001",
+          "positionConfig": {
+            "objClass": "org.sensorhub.api.sensor.PositionConfig"
+          },
+          "laneId": 0,
+          "lastUpdated": "2024-06-24T15:59:43.392-0500",
+          "id": "fa7c1f0f-04c1-4b12-979e-38b6dcbac4fa",
+          "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
+          "name": "New Rapiscan Sensor Driver",
+          "autoStart": false
+        }
+      },
+      {
+        "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
+        "config": {
+          "objClass": "com.botts.impl.sensor.rapiscan.RapiscanConfig",
+          "serialNumber": "sensor001",
+          "positionConfig": {
+            "objClass": "org.sensorhub.api.sensor.PositionConfig"
+          },
+          "laneId": 0,
+          "lastUpdated": "2024-06-24T16:00:04.517-0500",
+          "id": "19fe9771-ad61-425b-af97-7bfc5db5f2e9",
           "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
           "name": "New Rapiscan Sensor Driver",
           "autoStart": false
         }
       }
     ],
-    "lastUpdated": "2024-06-26T16:19:48.896-0500",
-    "id": "d75630e8-6bef-4ed6-b66b-6647a09d3df4",
+    "lastUpdated": "2024-06-24T15:59:10.840-0500",
+    "id": "a742c855-b844-406e-8889-046dfae2b684",
     "moduleClass": "org.sensorhub.impl.sensor.SensorSystem",
     "name": "New Sensor System",
     "autoStart": false

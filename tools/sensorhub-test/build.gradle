@@ -10,4 +10,5 @@ dependencies {
   implementation 'org.sensorhub:sensorhub-service-sweapi:' + oshCoreVersion
 
   implementation project(':sensorhub-driver-rapiscan')
+  implementation project(':sensorhub-driver-aspect')
 }
