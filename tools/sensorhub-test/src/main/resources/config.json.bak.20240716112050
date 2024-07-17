@@ -206,12 +206,11 @@
     },
     "laneConfig": {
       "objClass": "com.botts.impl.sensor.rapiscan.LaneConfig",
-      "laneName": "Entrance Lane",
-      "laneID": 4,
-      "isCollimated": true,
-      "laneWidth": 4.82,
-      "intervals": 5,
-      "occupancyHoldin": 10
+      "laneID": 0,
+      "isCollimated": false,
+      "laneWidth": 0.0,
+      "intervals": 0,
+      "occupancyHoldin": 0
     },
     "supplementalAlgorithm": true,
     "lastUpdated": "2024-07-09T18:25:36.631-0500",

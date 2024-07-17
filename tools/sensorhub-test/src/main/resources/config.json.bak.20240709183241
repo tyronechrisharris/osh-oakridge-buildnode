@@ -190,35 +190,14 @@
       "autoStart": false
     },
     "positionConfig": {
-      "objClass": "org.sensorhub.api.sensor.PositionConfig",
-      "location": {
-        "objClass": "org.sensorhub.api.sensor.PositionConfig$LLALocation",
-        "lat": 0.0,
-        "lon": 0.0,
-        "alt": 0.0
-      },
-      "orientation": {
-        "objClass": "org.sensorhub.api.sensor.PositionConfig$EulerOrientation",
-        "heading": 0.0,
-        "pitch": 0.0,
-        "roll": 0.0
-      }
-    },
-    "laneConfig": {
-      "objClass": "com.botts.impl.sensor.rapiscan.LaneConfig",
-      "laneName": "Entrance Lane",
-      "laneID": 4,
-      "isCollimated": true,
-      "laneWidth": 4.82,
-      "intervals": 5,
-      "occupancyHoldin": 10
+      "objClass": "org.sensorhub.api.sensor.PositionConfig"
     },
     "supplementalAlgorithm": true,
     "lastUpdated": "2024-07-09T18:25:36.631-0500",
     "id": "69226bec-7c15-40eb-82d1-8f8c4fbffaf3",
     "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
     "name": "New Rapiscan Sensor Driver",
-    "autoStart": true
+    "autoStart": false
   },
   {
     "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
@@ -245,6 +224,6 @@
     "id": "16fc70fa-41fb-44b3-a415-0bc0a411fde0",
     "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
     "name": "Occupancy Input Database",
-    "autoStart": true
+    "autoStart": false
   }
 ]

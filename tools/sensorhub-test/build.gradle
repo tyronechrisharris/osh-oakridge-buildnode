@@ -11,4 +11,5 @@ dependencies {
 
   implementation project(':sensorhub-driver-rapiscan')
   implementation project(':sensorhub-driver-aspect')
+  implementation project(':sensorhub-process-rapiscan')
 }
