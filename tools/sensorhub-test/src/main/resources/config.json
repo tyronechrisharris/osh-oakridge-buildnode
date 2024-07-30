@@ -183,68 +183,34 @@
         "objClass": "org.sensorhub.impl.comm.TCPConfig",
         "remotePort": 1600,
         "enableTLS": false,
-        "remoteHost": "10.146.49.247",
+        "remoteHost": "localhost",
         "localAddress": "AUTO"
       },
       "moduleClass": "org.sensorhub.impl.comm.TCPCommProvider",
       "autoStart": false
     },
     "positionConfig": {
-      "objClass": "org.sensorhub.api.sensor.PositionConfig",
-      "location": {
-        "objClass": "org.sensorhub.api.sensor.PositionConfig$LLALocation",
-        "lat": 0.0,
-        "lon": 0.0,
-        "alt": 0.0
-      },
-      "orientation": {
-        "objClass": "org.sensorhub.api.sensor.PositionConfig$EulerOrientation",
-        "heading": 0.0,
-        "pitch": 0.0,
-        "roll": 0.0
+      "objClass": "org.sensorhub.api.sensor.PositionConfig"
+    },
+    "laneName": "Virtual Lane",
+    "laneID": 0,
+    "EMLConfig": {
+      "objClass": "com.botts.impl.sensor.rapiscan.EMLConfig",
+      "isCollimated": false,
+      "supplementalAlgorithm": false,
+      "laneWidth": 0.0,
+      "gammaSetupConfig": {
+        "objClass": "com.botts.impl.sensor.rapiscan.GammaSetupConfig",
+        "intervals": 5,
+        "occupancyHoldin": 10,
+        "algorithm": "1010",
+        "nsigma": 6.0
       }
     },
-    "laneConfig": {
-      "objClass": "com.botts.impl.sensor.rapiscan.LaneConfig",
-      "laneName": "Entrance Lane",
-      "laneID": 4,
-      "isCollimated": true,
-      "laneWidth": 4.82,
-      "intervals": 5,
-      "occupancyHoldin": 10
-    },
-    "supplementalAlgorithm": true,
-    "lastUpdated": "2024-07-09T18:25:36.631-0500",
-    "id": "69226bec-7c15-40eb-82d1-8f8c4fbffaf3",
+    "lastUpdated": "2024-07-29T16:05:37.184-0500",
+    "id": "78bccd30-268c-4711-b033-e92488fb292a",
     "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
     "name": "New Rapiscan Sensor Driver",
-    "autoStart": true
-  },
-  {
-    "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
-    "dbConfig": {
-      "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
-      "indexObsLocation": false,
-      "storagePath": "rapiscan",
-      "memoryCacheSize": 5120,
-      "autoCommitBufferSize": 1024,
-      "autoCommitPeriod": 10,
-      "autoCompactFillRate": 40,
-      "idProviderType": "SEQUENTIAL",
-      "useCompression": false,
-      "readOnly": false,
-      "compactOnClose": false,
-      "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
-      "autoStart": false
-    },
-    "systemUIDs": [
-      "urn:osh:sensor:rapiscan:rpm001"
-    ],
-    "minCommitPeriod": 10000,
-    "databaseNum": 1,
-    "id": "16fc70fa-41fb-44b3-a415-0bc0a411fde0",
-    "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "Occupancy Input Database",
-    "autoStart": true
+    "autoStart": false
   }
 ]
