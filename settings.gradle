@@ -87,7 +87,7 @@ service_submodules.files.each { File f ->
 }
 
 FileTree tools_submodules = fileTree("$gradle.oshOakridgeModules/tools").include('**/build.gradle')
-tools_submodules subprojects.files.each { File f ->
+tools_submodules.files.each { File f ->
     File projectFolder = f.parentFile
     if (projectFolder != rootDir) {
         String projectName = ':' + projectFolder.name
