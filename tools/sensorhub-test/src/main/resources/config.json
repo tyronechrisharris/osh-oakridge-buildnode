@@ -3,10 +3,12 @@
     "objClass": "org.sensorhub.impl.service.HttpServerConfig",
     "httpPort": 8282,
     "httpsPort": 0,
-    "staticDocRootUrl": "web",
+    "staticDocsRootUrl": "/",
+    "staticDocsRootDir": "web",
     "servletsRootUrl": "/sensorhub",
     "authMethod": "BASIC",
     "keyStorePath": ".keystore/ssl_keys",
+    "keyAlias": "jetty",
     "trustStorePath": ".keystore/ssl_trust",
     "enableCORS": true,
     "id": "5cb05c9c-9e08-4fa1-8731-ffaa5846bdc1",
@@ -24,7 +26,9 @@
         "password": "admin",
         "roles": [
           "admin"
-        ]
+        ],
+        "allow": [],
+        "deny": []
       },
       {
         "objClass": "org.sensorhub.impl.security.BasicSecurityRealmConfig$UserConfig",
@@ -33,7 +37,9 @@
         "password": "",
         "roles": [
           "anon"
-        ]
+        ],
+        "allow": [],
+        "deny": []
       },
       {
         "objClass": "org.sensorhub.impl.security.BasicSecurityRealmConfig$UserConfig",
@@ -42,7 +48,9 @@
         "password": "pwd",
         "roles": [
           "sost"
-        ]
+        ],
+        "allow": [],
+        "deny": []
       }
     ],
     "roles": [
@@ -81,6 +89,7 @@
   {
     "objClass": "org.sensorhub.ui.AdminUIConfig",
     "widgetSet": "org.sensorhub.ui.SensorHubWidgetSet",
+    "bundleRepoUrls": [],
     "customPanels": [],
     "customForms": [],
     "id": "5cb05c9c-9123-4fa1-8731-ffaa51489678",
@@ -90,13 +99,7 @@
   },
   {
     "objClass": "org.sensorhub.impl.service.sos.SOSServiceConfig",
-    "enableTransactional": true,
-    "maxObsCount": 100,
-    "maxRecordCount": 100000,
-    "defaultLiveTimeout": 600.0,
-    "dataProviders": [
-    ],
-    "dataConsumers": [],
+    "customDataProviders": [],
     "customFormats": [
       {
         "objClass": "org.sensorhub.impl.service.sos.SOSCustomFormatConfig",
@@ -109,11 +112,17 @@
         "className": "org.sensorhub.impl.service.sos.video.MJPEGSerializer"
       }
     ],
+    "maxObsCount": 100,
+    "maxRecordCount": 100000,
+    "maxFois": 10,
+    "defaultLiveTimeout": 600.0,
+    "templateTimeout": 600,
     "security": {
       "objClass": "org.sensorhub.api.security.SecurityConfig",
       "enableAccessControl": true,
       "requireAuth": false
     },
+    "enableTransactional": true,
     "ogcCapabilitiesInfo": {
       "objClass": "org.sensorhub.impl.service.ogc.OGCServiceConfig$CapabilitiesInfo",
       "title": "SOS Service",
@@ -156,6 +165,50 @@
     "id": "5cb05c9c-9e08-4fa1-8731-ff41e246bdc1",
     "moduleClass": "org.sensorhub.impl.service.sos.SOSService",
     "name": "SOS Service",
+    "autoStart": true
+  },
+  {
+    "objClass": "com.botts.impl.sensor.rapiscan.RapiscanConfig",
+    "serialNumber": "rpm001",
+    "commSettings": {
+      "objClass": "org.sensorhub.impl.comm.TCPCommProviderConfig",
+      "connection": {
+        "objClass": "org.sensorhub.impl.comm.RobustIPConnectionConfig",
+        "checkReachability": true,
+        "connectTimeout": 3000,
+        "reconnectPeriod": 10000,
+        "reconnectAttempts": 0
+      },
+      "protocol": {
+        "objClass": "org.sensorhub.impl.comm.TCPConfig",
+        "remotePort": 1600,
+        "enableTLS": false,
+        "remoteHost": "localhost",
+        "localAddress": "AUTO"
+      },
+      "moduleClass": "org.sensorhub.impl.comm.TCPCommProvider",
+      "autoStart": false
+    },
+    "positionConfig": {
+      "objClass": "org.sensorhub.api.sensor.PositionConfig"
+    },
+    "laneID": 0,
+    "setupGammaConfig": {
+      "objClass": "com.botts.impl.sensor.rapiscan.SetupGammaConfig",
+      "intervals": 5,
+      "occupancyHoldin": 10,
+      "nsigma": 7.0
+    },
+    "emlConfig": {
+      "objClass": "com.botts.impl.sensor.rapiscan.EMLConfig",
+      "emlEnabled": false,
+      "isCollimated": false,
+      "laneWidth": 0.0
+    },
+    "lastUpdated": "2024-07-29T16:05:37.184-0500",
+    "id": "78bccd30-268c-4711-b033-e92488fb292a",
+    "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
+    "name": "New Rapiscan Sensor Driver",
     "autoStart": true
   }
 ]
