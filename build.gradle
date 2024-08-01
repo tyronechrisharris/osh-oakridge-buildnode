@@ -36,7 +36,7 @@ dependencies {
     implementation project(':sensorhub-driver-aspect')
     implementation project(':sensorhub-driver-kromek-d5')
     
-
+    implementation project(':sensorhub-process-rapiscan')
 }
 
 configurations {

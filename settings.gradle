@@ -51,8 +51,8 @@ subprojects.files.each { File f ->
 //    }
 }
 
-subprojects = fileTree("$rootDir/tools").include('**/build.gradle')
-subprojects.files.each { File f ->
+FileTree tools_subprojects = fileTree("$rootDir/tools").include('**/build.gradle')
+tools_subprojects.files.each { File f ->
     // To exclude a project use the following if by adding a new '&& !f.toString().contains('project-name')'
     // To include a project using the following remove its corresponding '&& !f.toString().contains('project-name')'
 //    if (!f.toString().contains('rs350')) {
@@ -66,8 +66,8 @@ subprojects.files.each { File f ->
 }
 
 
-subprojects = fileTree("$gradle.oshOakridgeModules/processing").include('**/build.gradle')
-subprojects.files.each { File f ->
+FileTree process_submodules = fileTree("$gradle.oshOakridgeModules/processing").include('**/build.gradle')
+process_submodules.files.each { File f ->
     File projectFolder = f.parentFile
     if (projectFolder != rootDir) {
         String projectName = ':' + projectFolder.name
@@ -76,8 +76,8 @@ subprojects.files.each { File f ->
     }
 }
 
-subprojects = fileTree("$gradle.oshOakridgeModules/services").include('**/build.gradle')
-subprojects.files.each { File f ->
+FileTree service_submodules = fileTree("$gradle.oshOakridgeModules/services").include('**/build.gradle')
+service_submodules.files.each { File f ->
     File projectFolder = f.parentFile
     if (projectFolder != rootDir) {
         String projectName = ':' + projectFolder.name
@@ -86,8 +86,8 @@ subprojects.files.each { File f ->
     }
 }
 
-subprojects = fileTree("$gradle.oshOakridgeModules/tools").include('**/build.gradle')
-subprojects.files.each { File f ->
+FileTree tools_submodules = fileTree("$gradle.oshOakridgeModules/tools").include('**/build.gradle')
+tools_submodules subprojects.files.each { File f ->
     File projectFolder = f.parentFile
     if (projectFolder != rootDir) {
         String projectName = ':' + projectFolder.name
