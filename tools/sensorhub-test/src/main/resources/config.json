@@ -192,25 +192,23 @@
     "positionConfig": {
       "objClass": "org.sensorhub.api.sensor.PositionConfig"
     },
-    "laneName": "Virtual Lane",
     "laneID": 0,
-    "EMLConfig": {
+    "setupGammaConfig": {
+      "objClass": "com.botts.impl.sensor.rapiscan.SetupGammaConfig",
+      "intervals": 5,
+      "occupancyHoldin": 10,
+      "nsigma": 7.0
+    },
+    "emlConfig": {
       "objClass": "com.botts.impl.sensor.rapiscan.EMLConfig",
+      "emlEnabled": false,
       "isCollimated": false,
-      "supplementalAlgorithm": false,
-      "laneWidth": 0.0,
-      "gammaSetupConfig": {
-        "objClass": "com.botts.impl.sensor.rapiscan.GammaSetupConfig",
-        "intervals": 5,
-        "occupancyHoldin": 10,
-        "algorithm": "1010",
-        "nsigma": 6.0
-      }
+      "laneWidth": 0.0
     },
     "lastUpdated": "2024-07-29T16:05:37.184-0500",
     "id": "78bccd30-268c-4711-b033-e92488fb292a",
     "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
     "name": "New Rapiscan Sensor Driver",
-    "autoStart": false
+    "autoStart": true
   }
 ]
