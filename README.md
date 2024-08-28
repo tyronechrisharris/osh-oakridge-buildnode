@@ -3,11 +3,11 @@ This repo brings in all the OSH modules and dependencies to deploy a OSH node se
 
 ## Clone and build
 
-###Clone this repository and update all submodules recursively:
-git clone git@github.com:Botts-Innovative-Research/osh-oakridge-buildnode.git --recursive
+### Clone this repository and update all submodules recursively
+`git clone git@github.com:Botts-Innovative-Research/osh-oakridge-buildnode.git --recursive`
 
 ### Build a deployment of the OSH Node from the top directory in the project run:
-./gradlew build -x test
+`./gradlew build -x test`
 
 The resulting build can be found in build/distributions/
 
