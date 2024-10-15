@@ -7,3 +7,6 @@
 [submodule "include/osh-addons"]
 	path = include/osh-addons
 	url = git@github.com:opensensorhub/osh-addons.git
+[submodule "web/oscar-viewer"]
+	path = web/oscar-viewer
+	url = https://github.com/Botts-Innovative-Research/oscar-viewer.git
