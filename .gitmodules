@@ -4,6 +4,7 @@
 [submodule "include/osh-core"]
 	path = include/osh-core
 	url = https://github.com/earocorn/osh-core
+	branch = ORNL
 [submodule "include/osh-addons"]
 	path = include/osh-addons
 	url = git@github.com:opensensorhub/osh-addons.git
