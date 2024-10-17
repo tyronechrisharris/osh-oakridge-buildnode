@@ -2,8 +2,8 @@
 
 cd web/oscar-viewer || exit
 
-#npm install
-#npm run build
+npm install
+npm run build
 
 cd ../.. || exit
 
