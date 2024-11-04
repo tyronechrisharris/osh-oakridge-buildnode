@@ -1,0 +1,23 @@
+description = "Container Security Utilities"
+ext.details = "Classes that help with some of the container hardening issues required by deployment in DoD environments."
+version = '1.0.0-SNAPSHOT'
+
+dependencies {
+    implementation 'org.sensorhub:sensorhub-core:' + oshCoreVersion
+}
+
+test {
+    useJUnit()
+}
+
+// add info to maven pom
+ext.pom >>= {
+    developers {
+        developer {
+            id 'csdillard'
+            name 'Christopher Dillard'
+            organization 'Botts Innovative Research, Inc.'
+            organizationUrl 'http://www.botts-inc.com/'
+        }
+    }
+}
