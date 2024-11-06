@@ -1,10 +1,10 @@
 @echo off
 
-cd web/oscar-viewer
+call cd web/oscar-viewer
 
-npm install
-npm run build
+call npm install
+call npm run build
 
-cd ..\..
+call cd ..\..
 
 call gradlew build -x test
