@@ -4,6 +4,14 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 "$SCRIPT_DIR/load_trusted_certs.sh"
 
+ export KEYSTORE="./osh-keystore.p12"
+ export KEYSTORE_TYPE=PKCS12
+ export KEYSTORE_PASSWORD="atakatak"
+
+  export TRUSTSTORE="./truststore.jks"
+  export TRUSTSTORE_TYPE=JKS
+  export TRUSTSTORE_PASSWORD="changeit"
+
 # After copying the default configuration file, also look to see if they
 # specified what they want the initial admin user's password to be, either
 # as a secret file or by providing it as an environment variable.
