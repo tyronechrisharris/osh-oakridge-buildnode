@@ -38,6 +38,8 @@ dependencies {
     implementation project(':sensorhub-driver-kromek-d5')
     
     implementation project(':sensorhub-process-rapiscan')
+
+    implementation project(':security-utils')
 }
 
 configurations {

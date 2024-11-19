@@ -4,6 +4,26 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 "$SCRIPT_DIR/load_trusted_certs.sh"
 
+ export KEYSTORE="./osh-keystore.p12"
+ export KEYSTORE_TYPE=PKCS12
+ export KEYSTORE_PASSWORD="atakatak"
+
+  export TRUSTSTORE="./truststore.jks"
+  export TRUSTSTORE_TYPE=JKS
+  export TRUSTSTORE_PASSWORD="changeit"
+  export INITIAL_ADMIN_PASSWORD_FILE="./.s"
+
+
+# After copying the default configuration file, also look to see if they
+# specified what they want the initial admin user's password to be, either
+# as a secret file or by providing it as an environment variable.
+if [ -z "$INITIAL_ADMIN_PASSWORD_FILE" ] && [ -z "$INITIAL_ADMIN_PASSWORD" ]; then
+  export INITIAL_ADMIN_PASSWORD=admin
+fi
+"$SCRIPT_DIR/set-initial-admin-password.sh"
+
+
+
 # Start the node
 java -Xmx2g \
 	-Dlogback.configurationFile=./logback.xml \
@@ -13,4 +33,4 @@ java -Xmx2g \
 	-Djavax.net.ssl.keyStorePassword="atakatak" \
 	-Djavax.net.ssl.trustStore="$SCRIPT_DIR/trustStore.jks" \
 	-Djavax.net.ssl.trustStorePassword="changeit" \
-	org.sensorhub.impl.SensorHub ./config.json ./db
+	com.botts.impl.security.SensorHubWrapper ./config.json ./db
