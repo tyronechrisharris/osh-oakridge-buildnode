@@ -6,6 +6,7 @@ REM Define the directories
 set CONFIG_DIR=.
 set LIB_DIR=.\lib
 
+
 REM Check if INITIAL_ADMIN_PASSWORD_FILE is set and handle accordingly
 if not "%INITIAL_ADMIN_PASSWORD_FILE%"=="" (
     REM If INITIAL_ADMIN_PASSWORD_FILE is provided, encode it using the PBKDF2CredentialProvider

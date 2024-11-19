@@ -11,6 +11,8 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
   export TRUSTSTORE="./truststore.jks"
   export TRUSTSTORE_TYPE=JKS
   export TRUSTSTORE_PASSWORD="changeit"
+  export INITIAL_ADMIN_PASSWORD_FILE="./.s"
+
 
 # After copying the default configuration file, also look to see if they
 # specified what they want the initial admin user's password to be, either

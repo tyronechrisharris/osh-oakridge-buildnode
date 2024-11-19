@@ -12,7 +12,6 @@
 
 CONFIG_DIR="."
 LIB_DIR="./lib"
-INITIAL_ADMIN_PASSWORD="changeit"
 
 if [ ! -z "$INITIAL_ADMIN_PASSWORD_FILE" ]; then
   ENCODED_PASSWORD=$( java -classpath "$LIB_DIR/*" com.botts.impl.security.PBKDF2CredentialProvider < "$INITIAL_ADMIN_PASSWORD_FILE" | tail -1 )
