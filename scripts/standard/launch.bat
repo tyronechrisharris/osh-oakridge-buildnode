@@ -5,6 +5,14 @@ setlocal enabledelayedexpansion
 REM Make sure all the necessary certificates are trusted by the system.
 CALL %~dp0load_trusted_certs.bat
 
+set KEYSTORE=.\osh-keystore.p12
+set KEYSTORE_TYPE=PKCS12
+set KEYSTORE_PASSWORD=atakatak
+
+set TRUSTSTORE=.\truststore.jks
+set TRUSTSTORE_TYPE=JKS
+set TRUSTSTORE_PASSWORD=changeit
+
 set INITIAL_ADMIN_PASSWORD_FILE=.\.s
 
 
