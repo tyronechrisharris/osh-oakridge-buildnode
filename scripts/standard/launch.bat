@@ -26,7 +26,7 @@ REM Call the next batch script to handle setting the initial admin password
 CALL "%SCRIPT_DIR%set-initial-admin-password.bat"
 
 REM Start the node
-java -Xmx2g ^
+java -Xmx8g ^
     -Dlogback.configurationFile=./logback.xml ^
     -cp "lib/*" ^
     -Djava.system.class.loader="org.sensorhub.utils.NativeClassLoader" ^
