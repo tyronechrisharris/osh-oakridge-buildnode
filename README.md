@@ -1,6 +1,6 @@
 # OSH OAKRIDGE BUILDNODE
 
-This repository combines all the OSH modules and dependencies to deploy and OSH server and client for ORNL.
+This repository combines all the OSH modules and dependencies to deploy the OSH server and client for ORNL.
 
 ## Requirements
 - [Java 21](https://www.oracle.com/java/technologies/downloads/#java21)
