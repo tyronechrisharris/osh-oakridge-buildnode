@@ -54,7 +54,7 @@ After the build completes, it can be located in `build/distributions/`
     1. Navigate to `path/to/osh-oakridge-buildnode/build/distributions/`
     2. Right-click `osh-node-oscas-1.0.zip`.
     3. Select **Extract All..**
-    4. Choose your restination (or leave the default) and extract.
+    4. Choose your destination, (or leave the default) and extract.
 1. Launch the OSH node:
    Run the launch script, "launch.sh" for linux/mac and "launch.bat" for windows.
 2. Access the OSH Node
