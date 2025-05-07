@@ -23,7 +23,7 @@
         "objClass": "org.sensorhub.impl.security.BasicSecurityRealmConfig$UserConfig",
         "id": "admin",
         "name": "Administrator",
-        "password": "oscar",
+        "password": "__INITIAL_ADMIN_PASSWORD__",
         "roles": [
           "admin"
         ],
