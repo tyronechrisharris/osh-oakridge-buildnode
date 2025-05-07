@@ -54,7 +54,7 @@ configurations {
 
 distributions{
     rel {
-        distributionBaseName = 'osh-node-oscas'
+        distributionBaseName = 'osh-node-oscar'
         contents {
             from 'scripts/standard'
             from 'scripts/keystores'

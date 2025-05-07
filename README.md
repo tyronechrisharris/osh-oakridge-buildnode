@@ -43,16 +43,16 @@ After the build completes, it can be located in `build/distributions/`
 
     Option 1: Command Line
     ```bash
-    unzip build/distributions/osh-node-oscas-1.0.zip
-    cd osh-node-oscas-1.0/osh-node-oscas-1.0
+    unzip build/distributions/osh-node-oscar-1.0.zip
+    cd osh-node-oscar-1.0/osh-node-oscar-1.0
     ```
    ```bash
-    tar -xf build/distributions/osh-node-oscas-1.0.zip
-    cd osh-node-oscas-1.0/osh-node-oscas-1.0
+    tar -xf build/distributions/osh-node-oscar-1.0.zip
+    cd osh-node-oscar-1.0/osh-node-oscar-1.0
     ```
    Option 2: Use File Explorer
     1. Navigate to `path/to/osh-oakridge-buildnode/build/distributions/`
-    2. Right-click `osh-node-oscas-1.0.zip`.
+    2. Right-click `osh-node-oscar-1.0.zip`.
     3. Select **Extract All..**
     4. Choose your destination, (or leave the default) and extract.
 1. Launch the OSH node:
