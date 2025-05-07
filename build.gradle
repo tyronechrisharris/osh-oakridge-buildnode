@@ -30,13 +30,18 @@ dependencies {
 //    implementation project(':sensorhub-driver-sony-vb600')
 
     // FROM OSH-OAKRIDGE-MODULES
+    // Drivers
     implementation project(':sensorhub-driver-kromek-d3s')
     implementation project(':sensorhub-driver-rs350')
     implementation project(':sensorhub-driver-rapiscan')
     implementation project(':sensorhub-driver-aspect')
     implementation project(':sensorhub-driver-kromek-d5')
-    
-    implementation project(':sensorhub-process-rapiscan')
+
+    // Processes
+    implementation project(':sensorhub-process-occupancy')
+
+    // Additional Modules
+    implementation project(':sensorhub-system-lane')
 
     implementation project(':security-utils')
 }

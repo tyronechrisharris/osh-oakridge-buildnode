@@ -10,7 +10,27 @@ dependencies {
 //  implementation 'org.sensorhub:sensorhub-service-sweapi:' + oshCoreVersion
   implementation 'org.sensorhub:sensorhub-service-consys'
 
+  // FROM OSH-ADDONS
+  implementation project(':sensorhub-driver-videocam')
+  implementation project(':sensorhub-driver-rtpcam')
+  implementation project(':sensorhub-driver-ffmpeg')
+  implementation project(':sensorhub-process-ffmpeg')
+  implementation project(':sensorhub-service-video')
+  implementation project(':sensorhub-driver-dahua')
+  implementation project(':sensorhub-driver-axis')
+//    implementation project(':sensorhub-driver-sony-vb600')
+
+  // FROM OSH-OAKRIDGE-MODULES
+  // Drivers
+  implementation project(':sensorhub-driver-kromek-d3s')
+  implementation project(':sensorhub-driver-rs350')
   implementation project(':sensorhub-driver-rapiscan')
   implementation project(':sensorhub-driver-aspect')
-  implementation project(':sensorhub-process-rapiscan')
+  implementation project(':sensorhub-driver-kromek-d5')
+
+  // Processes
+  implementation project(':sensorhub-process-occupancy')
+
+  // Additional Modules
+  implementation project(':sensorhub-system-lane')
 }
