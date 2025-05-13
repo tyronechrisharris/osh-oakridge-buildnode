@@ -186,11 +186,21 @@
       "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
     },
     "systemUIDs": [],
-    "autoPurgeConfig": [],
+    "autoPurgeConfig": [
+      {
+        "objClass": "org.sensorhub.impl.database.system.MaxAgeAutoPurgeConfig",
+        "maxRecordAge": 604800.0,
+        "enabled": true,
+        "purgePeriod": 3600.0,
+        "systemUIDs": [
+          "*"
+        ]
+      }
+    ],
     "minCommitPeriod": 10000,
     "databaseNum": 3,
     "id": "75b9edfc-68e9-4de4-ab3e-430b465d5d81",
-    "description": "Database to store data pushed from SOS-T Client",
+    "description": "Database to store data pushed from OSH Android",
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
     "name": "SOS Database"
@@ -229,7 +239,6 @@
   },
   {
     "objClass": "org.sensorhub.impl.service.consys.ConSysApiServiceConfig",
-    "databaseID": "65e0cdb5-25ca-4c37-9690-18ab98398e8d",
     "customFormats": [],
     "security": {
       "objClass": "org.sensorhub.api.security.SecurityConfig",
@@ -290,7 +299,7 @@
     "dbConfig": {
       "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
       "indexObsLocation": false,
-      "storagePath": "lanes.db",
+      "storagePath": "akfalefjk",
       "memoryCacheSize": 5120,
       "autoCommitBufferSize": 1024,
       "autoCommitPeriod": 10,
@@ -299,53 +308,74 @@
       "useCompression": false,
       "readOnly": false,
       "compactOnClose": false,
-      "id": "4e77b885-5cdb-4a0a-9fbe-7e1ff4dd7c95",
+      "id": "f1d073dd-606a-450c-854b-5cfaa3e41727",
       "autoStart": false,
       "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
     },
     "systemUIDs": [
-      "urn:osh:process:occupancy:*",
-      "urn:osh:system:lane:*"
+      "urn:osh:system:fsdlkfjasdf"
     ],
-    "autoPurgeConfig": [
-      {
-        "objClass": "org.sensorhub.impl.database.system.MaxAgeAutoPurgeConfig",
-        "maxRecordAge": 300.0,
-        "enabled": true,
-        "purgePeriod": 300.0,
-        "systemUIDs": [
-          "urn:osh:sensor:ffmpeg:*"
-        ]
-      }
-    ],
+    "autoPurgeConfig": [],
     "minCommitPeriod": 10000,
     "databaseNum": 5,
-    "id": "3daf4141-25f7-4f1e-abb2-4eb27300b0dd",
+    "id": "e51b4292-8964-4450-9c7d-05ffc391235f",
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "Lanes Database"
-  },
-  {
-    "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
-    "indexObsLocation": false,
-    "storagePath": "clientconfig.db",
-    "memoryCacheSize": 5120,
-    "autoCommitBufferSize": 1024,
-    "autoCommitPeriod": 10,
-    "autoCompactFillRate": 40,
-    "idProviderType": "SEQUENTIAL",
-    "useCompression": false,
-    "readOnly": false,
-    "compactOnClose": false,
-    "databaseNum": 6,
-    "id": "65e0cdb5-25ca-4c37-9690-18ab98398e8d",
-    "autoStart": true,
-    "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
-    "name": "OSCAR Client Config Database"
+    "name": "New System Driver Database"
   },
   {
     "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig",
-    "uniqueID": "lane:lane1",
+    "uniqueID": "fsdlkfjasdf",
+    "subsystems": [
+      {
+        "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
+        "config": {
+          "objClass": "com.botts.impl.sensor.aspect.AspectConfig",
+          "serialNumber": "sensor001",
+          "commSettings": {
+            "objClass": "com.botts.impl.sensor.aspect.comm.ModbusTCPCommProviderConfig",
+            "connection": {
+              "objClass": "org.sensorhub.impl.comm.RobustIPConnectionConfig",
+              "checkReachability": true,
+              "connectTimeout": 3000,
+              "reconnectPeriod": 10000,
+              "reconnectAttempts": 10000
+            },
+            "protocol": {
+              "objClass": "com.botts.impl.sensor.aspect.comm.ModbusTCPConfig",
+              "remoteHost": "localhost",
+              "remotePort": 502,
+              "addressRange": {
+                "objClass": "com.botts.impl.sensor.aspect.comm.ModbusTCPConfig$AddressRange",
+                "from": 1,
+                "to": 32
+              }
+            },
+            "id": "064afb42-bb2b-4942-a6cc-d98f562c1180",
+            "autoStart": false,
+            "moduleClass": "com.botts.impl.sensor.aspect.comm.ModbusTCPCommProvider"
+          },
+          "positionConfig": {
+            "objClass": "org.sensorhub.api.sensor.PositionConfig"
+          },
+          "laneId": 0,
+          "lastUpdated": "2025-04-29T09:37:49.713-0500",
+          "id": "69c3abed-218a-482f-8e96-1223f4eab2d7",
+          "autoStart": true,
+          "moduleClass": "com.botts.impl.sensor.aspect.AspectSensor",
+          "name": "New AspectSensor"
+        }
+      }
+    ],
+    "lastUpdated": "2025-04-03T18:38:54.159-0500",
+    "id": "cb5bab46-a732-402a-ba7a-553f8267b6c8",
+    "autoStart": true,
+    "moduleClass": "org.sensorhub.impl.sensor.SensorSystem",
+    "name": "New Sensor System"
+  },
+  {
+    "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig",
+    "uniqueID": "lane2",
     "subsystems": [
       {
         "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
@@ -357,9 +387,9 @@
             "connection": {
               "objClass": "org.sensorhub.impl.comm.RobustIPConnectionConfig",
               "checkReachability": true,
-              "connectTimeout": 5000,
+              "connectTimeout": 3000,
               "reconnectPeriod": 10000,
-              "reconnectAttempts": 100
+              "reconnectAttempts": 10000
             },
             "protocol": {
               "objClass": "org.sensorhub.impl.comm.TCPConfig",
@@ -368,7 +398,7 @@
               "remoteHost": "localhost",
               "localAddress": "AUTO"
             },
-            "id": "0a483406-6e0d-4c78-b35c-ce49c4f219e9",
+            "id": "891ce988-4af8-4247-95f7-f16c57925cbb",
             "autoStart": false,
             "moduleClass": "org.sensorhub.impl.comm.TCPCommProvider"
           },
@@ -388,8 +418,8 @@
             "isCollimated": false,
             "laneWidth": 4.820000171661377
           },
-          "lastUpdated": "2025-05-08T08:24:01.798-0500",
-          "id": "6f3be7f5-6915-4568-924d-24fbe9eb8916",
+          "lastUpdated": "2025-04-29T10:01:41.719-0500",
+          "id": "f8cdc8cd-53d8-4e8c-bdfd-1315c35e07aa",
           "autoStart": true,
           "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
           "name": "New Rapiscan Sensor Driver"
@@ -415,146 +445,20 @@
             "objClass": "org.sensorhub.impl.module.RobustConnectionConfig",
             "connectTimeout": 5000,
             "reconnectPeriod": 10000,
-            "reconnectAttempts": 1000
-          },
-          "lastUpdated": "2025-05-08T08:24:33.742-0500",
-          "id": "153f82f4-44a2-49ea-9641-23c9c12cf93e",
-          "autoStart": true,
-          "moduleClass": "org.sensorhub.impl.sensor.ffmpeg.FFMPEGSensor",
-          "name": "New FFMPEG VIDEO DRIVER"
-        }
-      }
-    ],
-    "lastUpdated": "2025-05-08T08:23:49.785-0500",
-    "id": "54c9fa39-5429-4854-9327-e047c357a5d6",
-    "autoStart": true,
-    "moduleClass": "org.sensorhub.impl.sensor.SensorSystem",
-    "name": "lane1"
-  },
-  {
-    "objClass": "com.botts.impl.process.occupancy.OccupancyProcessConfig",
-    "serialNumber": "process001",
-    "systemUID": "urn:osh:system:lane:lane1",
-    "id": "8f019ef7-ade8-43bd-af07-e2d65d7f5d86",
-    "autoStart": true,
-    "moduleClass": "com.botts.impl.process.occupancy.OccupancyProcessModule",
-    "name": "New Occupancy Data Process"
-  },
-  {
-    "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig",
-    "uniqueID": "lane3",
-    "subsystems": [
-      {
-        "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
-        "config": {
-          "objClass": "com.botts.impl.sensor.rapiscan.RapiscanConfig",
-          "serialNumber": "lane3",
-          "commSettings": {
-            "objClass": "org.sensorhub.impl.comm.TCPCommProviderConfig",
-            "connection": {
-              "objClass": "org.sensorhub.impl.comm.RobustIPConnectionConfig",
-              "checkReachability": true,
-              "connectTimeout": 5000,
-              "reconnectPeriod": 10000,
-              "reconnectAttempts": 1000
-            },
-            "protocol": {
-              "objClass": "org.sensorhub.impl.comm.TCPConfig",
-              "remotePort": 1613,
-              "enableTLS": false,
-              "remoteHost": "localhost",
-              "localAddress": "AUTO"
-            },
-            "id": "0a488d51-62f9-4ebc-ab69-12c936662f45",
-            "autoStart": false,
-            "moduleClass": "org.sensorhub.impl.comm.TCPCommProvider"
-          },
-          "positionConfig": {
-            "objClass": "org.sensorhub.api.sensor.PositionConfig"
-          },
-          "laneID": 0,
-          "setupGammaConfig": {
-            "objClass": "com.botts.impl.sensor.rapiscan.SetupGammaConfig",
-            "intervals": 5,
-            "occupancyHoldin": 10,
-            "nsigma": 7.0
-          },
-          "emlConfig": {
-            "objClass": "com.botts.impl.sensor.rapiscan.EMLConfig",
-            "emlEnabled": false,
-            "isCollimated": false,
-            "laneWidth": 4.820000171661377
-          },
-          "lastUpdated": "2025-05-08T20:22:41.853-0500",
-          "id": "d0c0011c-6bbf-4cc7-8203-133fcb0f46e6",
-          "autoStart": true,
-          "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
-          "name": "New Rapiscan Sensor Driver"
-        }
-      },
-      {
-        "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
-        "config": {
-          "objClass": "org.sensorhub.impl.sensor.ffmpeg.config.FFMPEGConfig",
-          "serialNumber": "video00333",
-          "connection": {
-            "objClass": "org.sensorhub.impl.sensor.ffmpeg.config.Connection",
-            "fps": 60,
-            "loop": false,
-            "connectionString": "http://settest:AZD95ta8KmXpLuZ@192.168.8.111/axis-cgi/mjpg/video.cgi?resolution=640x480&fps=10",
-            "isMJPEG": true,
-            "ignoreDataTimestamps": true
-          },
-          "positionConfig": {
-            "objClass": "org.sensorhub.api.sensor.PositionConfig"
-          },
-          "connectionConfig": {
-            "objClass": "org.sensorhub.impl.module.RobustConnectionConfig",
-            "connectTimeout": 5000,
-            "reconnectPeriod": 10000,
             "reconnectAttempts": 0
           },
-          "lastUpdated": "2025-05-08T20:23:04.466-0500",
-          "id": "c19ced98-9a3c-424e-8a83-44afde376b33",
+          "lastUpdated": "2025-05-07T15:45:28.335-0500",
+          "id": "288d1a02-0b9b-4979-905a-dfbb97c135af",
           "autoStart": true,
           "moduleClass": "org.sensorhub.impl.sensor.ffmpeg.FFMPEGSensor",
           "name": "New FFMPEG VIDEO DRIVER"
         }
       }
     ],
-    "lastUpdated": "2025-05-08T20:22:31.740-0500",
-    "id": "aa4d2e97-5233-43bf-b494-ceb844151f0b",
+    "lastUpdated": "2025-04-29T10:01:34.135-0500",
+    "id": "c4982549-8fc9-42e4-9665-38fe38993ce6",
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.sensor.SensorSystem",
-    "name": "lane3"
-  },
-  {
-    "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
-    "dbConfig": {
-      "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
-      "indexObsLocation": false,
-      "storagePath": "lane3.db",
-      "memoryCacheSize": 5120,
-      "autoCommitBufferSize": 1024,
-      "autoCommitPeriod": 10,
-      "autoCompactFillRate": 40,
-      "idProviderType": "SEQUENTIAL",
-      "useCompression": false,
-      "readOnly": false,
-      "compactOnClose": false,
-      "id": "f3402b79-0af9-42df-86bd-abaf56fd6931",
-      "autoStart": false,
-      "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
-    },
-    "systemUIDs": [
-      "urn:osh:system:lane3"
-    ],
-    "autoPurgeConfig": [],
-    "minCommitPeriod": 10000,
-    "databaseNum": 7,
-    "id": "e8f222f7-3856-451e-9df6-2f52bf77ad40",
-    "autoStart": true,
-    "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "lane3"
+    "name": "New Sensor System"
   }
 ]
