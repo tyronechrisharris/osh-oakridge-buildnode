@@ -117,7 +117,7 @@
     "maxFois": 10,
     "defaultLiveTimeout": 600.0,
     "templateTimeout": 600,
-    "databaseID": "75b9edfc-68e9-4de4-ab3e-430b465d5d81",
+    "databaseID": "06c57133-3f57-46fd-a806-927158d90dd4",
     "security": {
       "objClass": "org.sensorhub.api.security.SecurityConfig",
       "enableAccessControl": false,
@@ -169,35 +169,8 @@
     "name": "SOS Service"
   },
   {
-    "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
-    "dbConfig": {
-      "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
-      "indexObsLocation": false,
-      "storagePath": "sos.db",
-      "memoryCacheSize": 5120,
-      "autoCommitBufferSize": 1024,
-      "autoCommitPeriod": 10,
-      "autoCompactFillRate": 40,
-      "idProviderType": "SEQUENTIAL",
-      "useCompression": false,
-      "readOnly": false,
-      "compactOnClose": false,
-      "autoStart": false,
-      "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
-    },
-    "systemUIDs": [],
-    "autoPurgeConfig": [],
-    "minCommitPeriod": 10000,
-    "databaseNum": 3,
-    "id": "75b9edfc-68e9-4de4-ab3e-430b465d5d81",
-    "description": "Database to store data pushed from SOS-T Client",
-    "autoStart": true,
-    "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "SOS Database"
-  },
-  {
     "objClass": "org.sensorhub.impl.service.consys.ConSysApiServiceConfig",
-    "databaseID": "c5fef937-ac3e-48b7-a233-749d8fb4f02f",
+    "databaseID": "95474004-ffee-4c32-af32-4c5739dc53f4",
     "customFormats": [],
     "security": {
       "objClass": "org.sensorhub.api.security.SecurityConfig",
@@ -264,32 +237,6 @@
     "dbConfig": {
       "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
       "indexObsLocation": false,
-      "storagePath": "consys.db",
-      "memoryCacheSize": 5120,
-      "autoCommitBufferSize": 1024,
-      "autoCommitPeriod": 10,
-      "autoCompactFillRate": 40,
-      "idProviderType": "SEQUENTIAL",
-      "useCompression": false,
-      "readOnly": false,
-      "compactOnClose": false,
-      "autoStart": false,
-      "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
-    },
-    "systemUIDs": [],
-    "autoPurgeConfig": [],
-    "minCommitPeriod": 10000,
-    "databaseNum": 4,
-    "id": "c5fef937-ac3e-48b7-a233-749d8fb4f02f",
-    "autoStart": true,
-    "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "Connected Systems Database"
-  },
-  {
-    "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
-    "dbConfig": {
-      "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
-      "indexObsLocation": false,
       "storagePath": "lanes.db",
       "memoryCacheSize": 5120,
       "autoCommitBufferSize": 1024,
@@ -342,5 +289,43 @@
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
     "name": "OSCAR Client Config Database"
+  },
+  {
+    "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
+    "indexObsLocation": false,
+    "storagePath": "sos.db",
+    "memoryCacheSize": 5120,
+    "autoCommitBufferSize": 1024,
+    "autoCommitPeriod": 10,
+    "autoCompactFillRate": 40,
+    "idProviderType": "SEQUENTIAL",
+    "useCompression": false,
+    "readOnly": false,
+    "compactOnClose": false,
+    "databaseNum": 3,
+    "id": "06c57133-3f57-46fd-a806-927158d90dd4",
+    "description": "Database to store data pushed via SOS-T",
+    "autoStart": true,
+    "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
+    "name": "SOS Database"
+  },
+  {
+    "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
+    "indexObsLocation": false,
+    "storagePath": "consys.db",
+    "memoryCacheSize": 5120,
+    "autoCommitBufferSize": 1024,
+    "autoCommitPeriod": 10,
+    "autoCompactFillRate": 40,
+    "idProviderType": "SEQUENTIAL",
+    "useCompression": false,
+    "readOnly": false,
+    "compactOnClose": false,
+    "databaseNum": 4,
+    "id": "95474004-ffee-4c32-af32-4c5739dc53f4",
+    "description": "Database to store data pushed via Connected Systems API clients",
+    "autoStart": true,
+    "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
+    "name": "Connected Systems API Database"
   }
 ]
