@@ -1,0 +1,1 @@
+taskkill /im java.exe /f /t
