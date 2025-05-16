@@ -91,7 +91,13 @@
     "widgetSet": "org.sensorhub.ui.SensorHubWidgetSet",
     "bundleRepoUrls": [],
     "customPanels": [],
-    "customForms": [],
+    "customForms": [
+      {
+        "objClass": "org.sensorhub.ui.CustomUIConfig",
+        "configClass": "com.botts.impl.system.lane.config.LaneOptionsConfig",
+        "uiClass": "com.botts.ui.oscar.forms.LaneConfigForm"
+      }
+    ],
     "id": "5cb05c9c-9123-4fa1-8731-ffaa51489678",
     "autoStart": true,
     "moduleClass": "org.sensorhub.ui.AdminUIModule",
