@@ -25,7 +25,7 @@ fi
 
 
 # Start the node
-java -Xmx8g \
+java -Xmx12g \
 	-Dlogback.configurationFile=./logback.xml \
 	-cp "lib/*" \
 	-Djava.system.class.loader="org.sensorhub.utils.NativeClassLoader" \
