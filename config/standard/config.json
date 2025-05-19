@@ -263,9 +263,9 @@
     "autoPurgeConfig": [
       {
         "objClass": "org.sensorhub.impl.database.system.MaxAgeAutoPurgeConfig",
-        "maxRecordAge": 300.0,
+        "maxRecordAge": 120.0,
         "enabled": true,
-        "purgePeriod": 300.0,
+        "purgePeriod": 120.0,
         "systemUIDs": [
           "urn:osh:sensor:ffmpeg:*"
         ]
