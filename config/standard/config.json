@@ -96,6 +96,11 @@
         "objClass": "org.sensorhub.ui.CustomUIConfig",
         "configClass": "com.botts.impl.system.lane.config.LaneOptionsConfig",
         "uiClass": "com.botts.ui.oscar.forms.LaneConfigForm"
+      },
+      {
+        "objClass": "org.sensorhub.ui.CustomUIConfig",
+        "configClass": "com.botts.impl.system.lane.config.LaneConfig",
+        "uiClass": "com.botts.ui.oscar.forms.LaneModuleConfigForm"
       }
     ],
     "id": "5cb05c9c-9123-4fa1-8731-ffaa51489678",
@@ -239,46 +244,6 @@
     "name": "Config API Service"
   },
   {
-    "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
-    "dbConfig": {
-      "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
-      "indexObsLocation": false,
-      "storagePath": "lanes.db",
-      "memoryCacheSize": 5120,
-      "autoCommitBufferSize": 1024,
-      "autoCommitPeriod": 10,
-      "autoCompactFillRate": 40,
-      "idProviderType": "SEQUENTIAL",
-      "useCompression": false,
-      "readOnly": false,
-      "compactOnClose": false,
-      "id": "4e77b885-5cdb-4a0a-9fbe-7e1ff4dd7c95",
-      "autoStart": false,
-      "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
-    },
-    "systemUIDs": [
-      "urn:osh:process:occupancy:*",
-      "urn:osh:system:lane:*"
-    ],
-    "autoPurgeConfig": [
-      {
-        "objClass": "org.sensorhub.impl.database.system.MaxAgeAutoPurgeConfig",
-        "maxRecordAge": 120.0,
-        "enabled": true,
-        "purgePeriod": 120.0,
-        "systemUIDs": [
-          "urn:osh:sensor:ffmpeg:*"
-        ]
-      }
-    ],
-    "minCommitPeriod": 10000,
-    "databaseNum": 5,
-    "id": "3daf4141-25f7-4f1e-abb2-4eb27300b0dd",
-    "autoStart": true,
-    "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "Lanes Database"
-  },
-  {
     "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
     "indexObsLocation": false,
     "storagePath": "clientconfig.db",
@@ -290,7 +255,7 @@
     "useCompression": false,
     "readOnly": false,
     "compactOnClose": false,
-    "databaseNum": 6,
+    "databaseNum": 1,
     "id": "65e0cdb5-25ca-4c37-9690-18ab98398e8d",
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
@@ -308,7 +273,7 @@
     "useCompression": false,
     "readOnly": false,
     "compactOnClose": false,
-    "databaseNum": 3,
+    "databaseNum": 2,
     "id": "06c57133-3f57-46fd-a806-927158d90dd4",
     "description": "Database to store data pushed via SOS-T",
     "autoStart": true,
@@ -327,11 +292,40 @@
     "useCompression": false,
     "readOnly": false,
     "compactOnClose": false,
-    "databaseNum": 4,
+    "databaseNum": 3,
     "id": "95474004-ffee-4c32-af32-4c5739dc53f4",
     "description": "Database to store data pushed via Connected Systems API clients",
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
     "name": "Connected Systems API Database"
+  },
+  {
+    "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
+    "dbConfig": {
+      "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
+      "indexObsLocation": false,
+      "storagePath": "video.db",
+      "memoryCacheSize": 5120,
+      "autoCommitBufferSize": 1024,
+      "autoCommitPeriod": 10,
+      "autoCompactFillRate": 40,
+      "idProviderType": "SEQUENTIAL",
+      "useCompression": false,
+      "readOnly": false,
+      "compactOnClose": false,
+      "id": "b2777676-2644-48a8-9d51-98a31aa8475b",
+      "autoStart": false,
+      "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
+    },
+    "systemUIDs": [
+      "urn:osh:process:occupancy:*"
+    ],
+    "autoPurgeConfig": [],
+    "minCommitPeriod": 10000,
+    "databaseNum": 4,
+    "id": "44f318e4-71e1-46fc-a15f-826b661008b4",
+    "autoStart": true,
+    "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
+    "name": "Persistent Video Database"
   }
 ]
