@@ -96,6 +96,11 @@
         "objClass": "org.sensorhub.ui.CustomUIConfig",
         "configClass": "com.botts.impl.system.lane.config.LaneOptionsConfig",
         "uiClass": "com.botts.ui.oscar.forms.LaneConfigForm"
+      },
+      {
+        "objClass": "org.sensorhub.ui.CustomUIConfig",
+        "configClass": "com.botts.impl.system.lane.config.LaneConfig",
+        "uiClass": "com.botts.ui.oscar.forms.LaneModuleConfigForm"
       }
     ],
     "id": "5cb05c9c-9123-4fa1-8731-ffaa51489678",
