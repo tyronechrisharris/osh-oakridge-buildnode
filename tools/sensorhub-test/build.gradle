@@ -34,4 +34,5 @@ dependencies {
   // Additional Modules
   implementation project(':sensorhub-system-lane')
   implementation project(':sensorhub-webui-oscar')
+  implementation project(':sensorhub-database-purge')
 }

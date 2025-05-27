@@ -101,6 +101,11 @@
         "objClass": "org.sensorhub.ui.CustomUIConfig",
         "configClass": "com.botts.impl.system.lane.config.LaneConfig",
         "uiClass": "com.botts.ui.oscar.forms.LaneModuleConfigForm"
+      },
+      {
+        "objClass": "org.sensorhub.ui.CustomUIConfig",
+        "configClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
+        "uiClass": "com.botts.ui.oscar.forms.OccupancyVideoPurgeConfigForm"
       }
     ],
     "id": "5cb05c9c-9123-4fa1-8731-ffaa51489678",
@@ -300,11 +305,118 @@
     "name": "Connected Systems API Database"
   },
   {
+    "objClass": "com.botts.impl.system.lane.config.LaneConfig",
+    "laneOptionsConfig": {
+      "objClass": "com.botts.impl.system.lane.config.LaneOptionsConfig",
+      "createProcess": false,
+      "rpmConfig": {
+        "objClass": "com.botts.impl.system.lane.config.RPMConfig",
+        "remotePort": 1601,
+        "remoteHost": "localhost"
+      },
+      "ffmpegConfig": [
+        {
+          "objClass": "com.botts.impl.system.lane.config.AxisCameraConfig",
+          "streamPath": "MJPEG",
+          "username": "settest",
+          "password": "AZD95ta8KmXpLuZ",
+          "remoteHost": "192.168.8.111"
+        }
+      ]
+    },
+    "autoDelete": true,
+    "groupID": 0,
+    "uniqueID": "lane1",
+    "subsystems": [
+      {
+        "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
+        "config": {
+          "objClass": "com.botts.impl.sensor.rapiscan.RapiscanConfig",
+          "serialNumber": "lane1",
+          "commSettings": {
+            "objClass": "org.sensorhub.impl.comm.TCPCommProviderConfig",
+            "connection": {
+              "objClass": "org.sensorhub.impl.comm.RobustIPConnectionConfig",
+              "checkReachability": true,
+              "connectTimeout": 5000,
+              "reconnectPeriod": 10000,
+              "reconnectAttempts": 10
+            },
+            "protocol": {
+              "objClass": "org.sensorhub.impl.comm.TCPConfig",
+              "remotePort": 1601,
+              "enableTLS": false,
+              "remoteHost": "localhost",
+              "localAddress": "AUTO"
+            },
+            "autoStart": false,
+            "moduleClass": "org.sensorhub.impl.comm.TCPCommProvider"
+          },
+          "positionConfig": {
+            "objClass": "org.sensorhub.api.sensor.PositionConfig"
+          },
+          "laneID": 0,
+          "setupGammaConfig": {
+            "objClass": "com.botts.impl.sensor.rapiscan.SetupGammaConfig",
+            "intervals": 5,
+            "occupancyHoldin": 10,
+            "nsigma": 7.0
+          },
+          "emlConfig": {
+            "objClass": "com.botts.impl.sensor.rapiscan.EMLConfig",
+            "emlEnabled": false,
+            "isCollimated": false,
+            "laneWidth": 4.820000171661377
+          },
+          "lastUpdated": "2025-05-27T14:35:51.806-0500",
+          "id": "c5fb891a-cf05-4cca-9473-b3d38b5f6260",
+          "autoStart": true,
+          "moduleClass": "com.botts.impl.sensor.rapiscan.RapiscanSensor",
+          "name": "lane1 - RPM"
+        }
+      },
+      {
+        "objClass": "org.sensorhub.impl.sensor.SensorSystemConfig$SystemMember",
+        "config": {
+          "objClass": "org.sensorhub.impl.sensor.ffmpeg.config.FFMPEGConfig",
+          "serialNumber": "lane:lane1:0",
+          "connection": {
+            "objClass": "org.sensorhub.impl.sensor.ffmpeg.config.Connection",
+            "fps": 24,
+            "loop": false,
+            "connectionString": "rtsp://settest:AZD95ta8KmXpLuZ@192.168.8.111/axis-media/media.amp?adjustablelivestream=1&resolution=640x480&videocodec=jpeg",
+            "ignoreDataTimestamps": true,
+            "useTCP": true
+          },
+          "positionConfig": {
+            "objClass": "org.sensorhub.api.sensor.PositionConfig"
+          },
+          "connectionConfig": {
+            "objClass": "org.sensorhub.impl.module.RobustConnectionConfig",
+            "connectTimeout": 5000,
+            "reconnectPeriod": 10000,
+            "reconnectAttempts": 10
+          },
+          "lastUpdated": "2025-05-27T14:35:51.815-0500",
+          "id": "3c76beff-238b-48bc-9090-b9abf9fa475a",
+          "autoStart": true,
+          "moduleClass": "org.sensorhub.impl.sensor.ffmpeg.FFMPEGSensor",
+          "name": "lane1 - Camera 0"
+        }
+      }
+    ],
+    "lastUpdated": "2025-05-27T14:35:03.013-0500",
+    "id": "e178a444-8a32-4bf0-918d-51737f225a09",
+    "autoStart": true,
+    "moduleClass": "com.botts.impl.system.lane.LaneSystem",
+    "name": "lane1"
+  },
+  {
     "objClass": "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
     "dbConfig": {
       "objClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabaseConfig",
       "indexObsLocation": false,
-      "storagePath": "video.db",
+      "storagePath": "group0lanes.db",
       "memoryCacheSize": 5120,
       "autoCommitBufferSize": 1024,
       "autoCommitPeriod": 10,
@@ -313,19 +425,27 @@
       "useCompression": false,
       "readOnly": false,
       "compactOnClose": false,
-      "id": "b2777676-2644-48a8-9d51-98a31aa8475b",
       "autoStart": false,
       "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase"
     },
     "systemUIDs": [
-      "urn:osh:process:occupancy:*"
+      "urn:osh:system:group:0:*"
     ],
-    "autoPurgeConfig": [],
+    "autoPurgeConfig": [
+      {
+        "objClass": "com.botts.impl.system.database.OccupancyVideoPurgePolicyConfig",
+        "enabled": true,
+        "purgePeriod": 90.0,
+        "systemUIDs": [
+          "*"
+        ]
+      }
+    ],
     "minCommitPeriod": 10000,
     "databaseNum": 4,
-    "id": "44f318e4-71e1-46fc-a15f-826b661008b4",
+    "id": "17cab95b-704a-4ac5-bc9e-79f729ef7089",
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.database.system.SystemDriverDatabase",
-    "name": "Persistent Video Database"
+    "name": "Group 0 Lanes"
   }
 ]
