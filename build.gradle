@@ -13,7 +13,7 @@ dependencies {
     // FROM OSH-CORE
     implementation 'org.sensorhub:sensorhub-core:' + oshCoreVersion
     implementation 'org.sensorhub:sensorhub-core-osgi:' + oshCoreVersion
-    implementation 'org.sensorhub:sensorhub-datastore-h2:' + oshCoreVersion
+    implementation 'org.postgresql:postgresql:42.7.1'
     implementation 'org.sensorhub:sensorhub-service-swe:' + oshCoreVersion
     implementation 'org.sensorhub:sensorhub-webui-core:' + oshCoreVersion
     // Connected Systems
