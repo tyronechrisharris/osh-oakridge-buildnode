@@ -2,7 +2,7 @@ apply from: gradle.oshCoreDir + '/common.gradle'
 description = ''
 
 allprojects {
-    version = "1.3.3"
+    version = "1.3.4"
 }
 
 subprojects {
@@ -28,6 +28,10 @@ dependencies {
     implementation project(':sensorhub-driver-dahua')
     implementation project(':sensorhub-driver-axis')
 //    implementation project(':sensorhub-driver-sony-vb600')
+
+    // For MQTT
+    implementation project(':sensorhub-service-consys-mqtt')
+    implementation project(':sensorhub-service-mqtt-hivemq')
 
     // FROM OSH-OAKRIDGE-MODULES
     // Drivers

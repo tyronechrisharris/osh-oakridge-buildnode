@@ -23,7 +23,7 @@
         "objClass": "org.sensorhub.impl.security.BasicSecurityRealmConfig$UserConfig",
         "id": "admin",
         "name": "Administrator",
-        "password": "__INITIAL_ADMIN_PASSWORD__",
+        "password": "admin",
         "roles": [
           "admin"
         ],
@@ -303,5 +303,24 @@
     "autoStart": true,
     "moduleClass": "org.sensorhub.impl.datastore.h2.MVObsSystemDatabase",
     "name": "Connected Systems API Database"
+  },
+  {
+    "objClass": "org.sensorhub.impl.service.hivemq.MqttServerConfig",
+    "configFolder": "hivemq-config",
+    "dataFolder": "hivemq-data",
+    "webSocketProxyEndpoint": "/mqtt",
+    "enableWebSocketProxy": true,
+    "requireAuth": true,
+    "id": "36b5ad18-7c0e-49bb-8b82-ff0d937b40fb",
+    "autoStart": true,
+    "moduleClass": "org.sensorhub.impl.service.hivemq.MqttServer",
+    "name": "MQTT Server (HiveMQ)"
+  },
+  {
+    "objClass": "org.sensorhub.impl.service.consys.mqtt.ConSysApiMqttServiceConfig",
+    "id": "0ca5035c-4420-445f-b46f-b617307074cd",
+    "autoStart": true,
+    "moduleClass": "org.sensorhub.impl.service.consys.mqtt.ConSysApiMqttService",
+    "name": "Connected Systems API MQTT Extension"
   }
 ]
