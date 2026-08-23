@@ -2,10 +2,10 @@
 
 ## Windows 11
 
-1. Install and start Docker Desktop, or use the Windows offline package that includes the approved installers.
+1. Choose `offline-full` when Docker Desktop or WSL may need installation. Choose `offline-images` when compatible Docker Desktop, WSL 2, and Docker Compose are already installed and running.
 2. Extract the OSCAR ZIP to a local NTFS directory.
-3. Open PowerShell as Administrator in that directory.
-4. Run:
+3. Double-click `oscar.bat`, approve the Windows administrator prompt, and enter `init` at the `oscar>` prompt.
+4. Alternatively, for scripted or terminal-based setup, run:
 
 ```powershell
 .\oscar.bat init
@@ -23,6 +23,8 @@ For offline media, verify it before initialization:
 .\oscar.bat init
 ```
 
+Verification is remembered for the current bundle manifest, so `init` does not hash the large image archive again. You can also run `oscar.bat verify` at any time. For the images-only artifact, use `oscar.bat init -Prerequisites existing` to guarantee setup will not launch prerequisite installers.
+
 If a prerequisite installer requires a Windows restart, restart and run `oscar.bat init` again.
 
 ## Ubuntu Server 24.04
@@ -32,6 +34,8 @@ Install Docker Engine and the Docker Compose plugin, extract the connected relea
 ```sh
 sudo bash oscar.sh init
 ```
+
+On a graphical Ubuntu installation, double-click the executable `oscar.sh` launcher to open the same interactive menu. Ubuntu Server administrators use the command above because the server has no desktop environment.
 
 ## Apple Silicon macOS
 
@@ -43,7 +47,11 @@ sudo bash oscar.sh init
 
 The pinned PostGIS image runs under AMD64 emulation.
 
+On macOS, opening executable `oscar.sh` in Terminal with no arguments displays the interactive menu. Terminal commands remain available for environments whose file association does not execute shell scripts.
+
 ## Routine administration
+
+Double-click/open `oscar.bat` or `oscar.sh` with no arguments to keep an administration window open. Enter commands such as `status`, `start`, `stop`, `restart`, `logs -Service oscar` (Windows), or `logs --service oscar` (Ubuntu/macOS). Enter `exit` to close it. Passing arguments directly continues to work for scripts and experienced administrators:
 
 Windows:
 

@@ -131,6 +131,30 @@ jobs:
       - name: Build connected release
         run: ./build-all.sh
 
+      - name: Build Windows offline release artifacts
+        shell: pwsh
+        run: |
+          ./tools/offline/build-offline-bundle.ps1 `
+            -BundleProfile Both `
+            -SkipConnectedBuild `
+            -CreateArchive
+
+      - name: Validate offline release artifacts
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for profile in full images; do
+            archive="build/offline/oscar-${version}-windows-x86_64-offline-${profile}.zip"
+            checksum="${archive}.sha256"
+            test -s "$archive"
+            test -s "$checksum"
+            if [ "$(stat -c '%s' "$archive")" -ge 2147483648 ]; then
+              echo "::error::Release asset exceeds GitHub's 2 GiB per-file limit: $archive"
+              exit 1
+            fi
+            (cd "$(dirname "$archive")" && sha256sum --check "$(basename "$checksum")")
+          done
+
       - name: Stage source archive
         run: cp "${{ steps.source.outputs.archive }}" "${DIST_DIR}/"
 
@@ -143,3 +167,5 @@ jobs:
           files: |
             ${{ env.DIST_DIR }}/oscar-*.zip
             ${{ env.DIST_DIR }}/*-source.zip
+            build/offline/oscar-*-windows-x86_64-offline-*.zip
+            build/offline/oscar-*-windows-x86_64-offline-*.zip.sha256

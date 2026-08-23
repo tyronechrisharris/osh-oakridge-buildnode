@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('init', 'check', 'start', 'stop', 'restart', 'status', 'logs', 'upgrade', 'help')]
+    [ValidateSet('init', 'check', 'verify', 'start', 'stop', 'restart', 'status', 'logs', 'upgrade', 'help')]
     [string]$Command = 'help',
     [string]$Hostname,
     [ValidateRange(1, 65535)]
@@ -13,6 +13,8 @@ param(
     [switch]$SkipHostsEntry,
     [switch]$NonInteractive,
     [switch]$SkipStart,
+    [ValidateSet('auto', 'existing', 'bundled')]
+    [string]$Prerequisites = 'auto',
     [ValidateSet('all', 'oscar', 'postgres', 'gateway')]
     [string]$Service = 'all',
     [ValidateRange(1, 10000)]
@@ -41,14 +43,38 @@ function Assert-Administrator {
     }
 }
 
-function Assert-OfflineBundleIntegrity {
+function Get-OfflineBundleManifestHash {
     $checksumPath = Join-Path $ScriptRoot 'SHA256SUMS'
-    if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) { return }
+    if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) { return $null }
+    return (Get-FileHash -LiteralPath $checksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-OfflineBundleVerificationStatus {
+    $manifestHash = Get-OfflineBundleManifestHash
+    if (-not $manifestHash) { return 'not an offline bundle' }
+    $receiptPath = Join-Path $ScriptRoot '.bundle-verified'
+    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { return 'not verified' }
+    $verifiedHash = [IO.File]::ReadAllText($receiptPath).Trim().ToLowerInvariant()
+    if ($verifiedHash -ceq $manifestHash) { return 'verified' }
+    return 'verification required (bundle changed)'
+}
+
+function Assert-OfflineBundleIntegrity([switch]$Force) {
+    $manifestHash = Get-OfflineBundleManifestHash
+    if (-not $manifestHash) { return }
+    $receiptPath = Join-Path $ScriptRoot '.bundle-verified'
+    if (-not $Force -and (Get-OfflineBundleVerificationStatus) -eq 'verified') {
+        Write-Host 'Offline bundle integrity: previously verified; manifest unchanged.' -ForegroundColor Green
+        return
+    }
     Write-Heading 'Offline bundle integrity'
     $verifier = Join-Path $ScriptRoot 'verify-bundle.ps1'
     if (-not (Test-Path -LiteralPath $verifier -PathType Leaf)) { throw 'The offline bundle verifier is missing.' }
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $verifier
     if ($LASTEXITCODE -ne 0) { throw 'Offline bundle integrity verification failed.' }
+    $temporaryReceipt = "$receiptPath.tmp"
+    [IO.File]::WriteAllText($temporaryReceipt, "$manifestHash`n", $Utf8NoBom)
+    Move-Item -LiteralPath $temporaryReceipt -Destination $receiptPath -Force
 }
 
 function Invoke-External([string]$Program, [string[]]$Arguments) {
@@ -130,7 +156,11 @@ function Install-BundledPrerequisites {
 }
 
 function Assert-Docker {
-    if (-not (Test-DockerReady)) { Install-BundledPrerequisites }
+    if (Test-DockerReady) { return }
+    if ($Prerequisites -eq 'existing') {
+        throw "The existing Docker installation is unavailable or not ready. Start Docker and ensure 'docker compose' works, or rerun init with -Prerequisites auto."
+    }
+    Install-BundledPrerequisites
     if (-not (Test-DockerReady)) { throw 'Docker Engine and Docker Compose are required.' }
 }
 
@@ -333,11 +363,13 @@ OSCAR deployment administration
   .\oscar.bat init [-Hostname oscar.local] [-Port 443]
       [-TlsMode self-signed|import] [-CertificatePath FILE -PrivateKeyPath FILE]
       [-AddHostsEntry] [-SkipHostsEntry] [-SkipStart]
-  .\oscar.bat check|start|stop|restart|status|upgrade
+      [-Prerequisites auto|existing|bundled]
+  .\oscar.bat check|verify|start|stop|restart|status|upgrade
   .\oscar.bat logs [-Service all|oscar|postgres|gateway] [-Tail 200] [-Follow]
 
-Run mutating commands from an Administrator PowerShell window. For automated setup,
-use -NonInteractive and provide OSCAR_SETUP_ADMIN_PASSWORD in the process environment.
+Double-click oscar.bat with no arguments for the elevated interactive menu.
+Direct mutating commands require an Administrator PowerShell window. For automated
+setup, use -NonInteractive and provide OSCAR_SETUP_ADMIN_PASSWORD in the environment.
 '@ | Write-Host
 }
 
@@ -351,8 +383,14 @@ try {
             Write-Host "Docker ready: $(Test-DockerReady)"
             Write-Host "WSL ready: $(Test-WslReady)"
             Write-Host "Offline bundle: $(Test-Path -LiteralPath (Join-Path $ScriptRoot 'offline-images.tar') -PathType Leaf)"
+            Write-Host "Bundle verification: $(Get-OfflineBundleVerificationStatus)"
             Write-Host "Configured: $(try { Assert-Configured; $true } catch { $false })"
             # TODO(offline-maps): add MBTiles validation/import after deployment requirements are defined.
+        }
+        'verify' {
+            Assert-Administrator
+            if (-not (Get-OfflineBundleManifestHash)) { throw 'SHA256SUMS is missing. This is not a complete offline bundle.' }
+            Assert-OfflineBundleIntegrity -Force
         }
         'init' {
             Assert-Administrator
@@ -412,7 +450,9 @@ try {
             Invoke-Compose $logArguments
         }
         'upgrade' {
-            Assert-Administrator; Assert-Docker; Assert-Configured
+            Assert-Administrator
+            Assert-OfflineBundleIntegrity
+            Assert-Docker; Assert-Configured
             Write-Heading 'Upgrade preflight'
             Invoke-Compose @('config', '--quiet')
             Prepare-DeploymentImages

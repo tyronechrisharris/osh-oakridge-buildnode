@@ -14,10 +14,15 @@ Start with [QUICKSTART.md](QUICKSTART.md) for installation. This guide documents
 
 Use `oscar.bat` on Windows and `oscar.sh` on Ubuntu or macOS.
 
+Opening either launcher with no arguments starts a persistent `oscar>` administration menu. On Windows, double-clicking `oscar.bat` requests UAC elevation automatically; an Administrator PowerShell window does not need to be opened first. On graphical Linux, opening the executable `oscar.sh` starts the menu in a terminal. On macOS, open the executable script in Terminal. Desktop file-execution policy varies, so direct terminal commands remain the supported fallback. Ubuntu Server has no graphical launcher and is administered from its terminal.
+
+The menu accepts the same command and options shown below. For example, enter `init`, `status`, `logs -Service postgres -Follow` on Windows, or `logs --service postgres --follow` on Ubuntu/macOS. Enter `exit` to close the menu. Supplying arguments directly bypasses the menu, preserving automation compatibility.
+
 | Action | Windows | Ubuntu/macOS |
 | --- | --- | --- |
 | Initialize | `oscar.bat init` | `sudo bash oscar.sh init` |
 | Check prerequisites | `oscar.bat check` | `sudo bash oscar.sh check` |
+| Verify offline media | `oscar.bat verify` | `sudo bash oscar.sh verify` |
 | Start | `oscar.bat start` | `sudo bash oscar.sh start` |
 | Stop | `oscar.bat stop` | `sudo bash oscar.sh stop` |
 | Restart | `oscar.bat restart` | `sudo bash oscar.sh restart` |
@@ -25,9 +30,16 @@ Use `oscar.bat` on Windows and `oscar.sh` on Ubuntu or macOS.
 | Logs | `oscar.bat logs` | `sudo bash oscar.sh logs` |
 | Upgrade | `oscar.bat upgrade` | `sudo bash oscar.sh upgrade` |
 
-Mutating commands require an elevated Administrator PowerShell window on Windows or root privileges on Ubuntu/macOS.
+Directly invoked mutating commands require an elevated Administrator PowerShell window on Windows or root privileges on Ubuntu/macOS. The Windows menu obtains elevation through UAC, and the Unix menu invokes `sudo` when a selected command requires it.
 
 `start`, `stop`, and `restart` never build or download images. `init` and `upgrade` may prepare missing images for a connected release. If `offline-images.tar` is present, image preparation uses only that archive and fails if any required image remains unavailable.
+
+Offline releases are published in two Windows x86-64 profiles:
+
+- `offline-full` contains OSCAR images plus the approved Docker Desktop and WSL installers.
+- `offline-images` contains OSCAR images only and requires Docker Desktop, WSL 2, and Docker Compose to be installed and running already.
+
+Initialization defaults to `-Prerequisites auto`, which uses a working existing Docker installation and only launches bundled installers when Docker is unavailable. Use `-Prerequisites existing` to prohibit prerequisite installation, or `-Prerequisites bundled` to explicitly permit the bundled fallback. The Unix equivalents are `--prerequisites auto|existing|bundled`.
 
 ## Initial setup options
 
@@ -66,7 +78,15 @@ Extract the offline ZIP into a local NTFS directory. From an Administrator Power
 .\oscar.bat init
 ```
 
-The verifier checks every file against `SHA256SUMS`. If WSL or Docker Desktop is missing, OSCAR launches the bundled official installer and resumes after it exits. If Windows requires a restart, restart and run `oscar.bat init` again.
+The equivalent CLI command is `oscar.bat verify`. After successful verification, OSCAR records the hash of `SHA256SUMS`. Later `init` and `upgrade` operations skip the expensive full-file pass while that manifest remains unchanged. A replacement bundle with a different manifest invalidates the receipt and is verified again automatically. Routine commands do not perform full bundle verification; run `verify` explicitly whenever post-installation tampering is suspected.
+
+The full artifact can launch the bundled official installers when WSL or Docker Desktop is missing. The images-only artifact must be initialized with a working existing runtime:
+
+```powershell
+.\oscar.bat init -Prerequisites existing
+```
+
+If an installer requires a restart, restart Windows and run `oscar.bat init` again.
 
 The offline CLI does not contact package repositories or container registries. Docker Desktop licensing must be reviewed independently by the deploying organization.
 

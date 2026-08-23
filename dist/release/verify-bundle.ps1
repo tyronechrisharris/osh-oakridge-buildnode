@@ -9,6 +9,7 @@ if (-not (Test-Path -LiteralPath $checksumFile -PathType Leaf)) {
     Write-Error 'SHA256SUMS is missing. This is not a complete offline bundle.'
     exit 1
 }
+$manifestHash = (Get-FileHash -LiteralPath $checksumFile -Algorithm SHA256).Hash.ToLowerInvariant()
 
 $verified = 0
 foreach ($line in [IO.File]::ReadAllLines($checksumFile)) {
@@ -24,4 +25,8 @@ foreach ($line in [IO.File]::ReadAllLines($checksumFile)) {
     $verified++
 }
 
+$receiptPath = Join-Path $root '.bundle-verified'
+$temporaryReceipt = "$receiptPath.tmp"
+[IO.File]::WriteAllText($temporaryReceipt, "$manifestHash`n", (New-Object System.Text.UTF8Encoding($false)))
+Move-Item -LiteralPath $temporaryReceipt -Destination $receiptPath -Force
 Write-Host "Bundle integrity verified: $verified files." -ForegroundColor Green

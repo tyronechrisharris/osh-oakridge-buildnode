@@ -15,6 +15,7 @@ private_key_path=''
 add_hosts=true
 non_interactive=false
 skip_start=false
+prerequisites_mode=auto
 log_service=all
 log_tail=200
 log_follow=false
@@ -26,9 +27,11 @@ OSCAR deployment administration
   sudo ./oscar.sh init [--hostname oscar.local] [--port 443]
       [--tls-mode self-signed|import] [--certificate FILE --private-key FILE]
       [--add-hosts-entry] [--skip-hosts-entry] [--skip-start]
-  sudo ./oscar.sh check|start|stop|restart|status|upgrade
+      [--prerequisites auto|existing|bundled]
+  sudo ./oscar.sh check|verify|start|stop|restart|status|upgrade
   sudo ./oscar.sh logs [--service all|oscar|postgres|gateway] [--tail 200] [--follow]
 
+Open oscar.sh with no arguments for the interactive administration menu.
 For automated setup, use --non-interactive and provide
 OSCAR_SETUP_ADMIN_PASSWORD in the process environment.
 EOF
@@ -48,6 +51,7 @@ while (($#)); do
         --skip-hosts-entry) add_hosts=false; shift ;;
         --non-interactive) non_interactive=true; shift ;;
         --skip-start) skip_start=true; shift ;;
+        --prerequisites) prerequisites_mode=${2:?missing prerequisite mode}; shift 2 ;;
         --service) log_service=${2:?missing service}; shift 2 ;;
         --tail) log_tail=${2:?missing tail count}; shift 2 ;;
         --follow) log_follow=true; shift ;;
@@ -56,15 +60,49 @@ while (($#)); do
     esac
 done
 
+[[ $prerequisites_mode =~ ^(auto|existing|bundled)$ ]] || fail '--prerequisites must be auto, existing, or bundled.'
+
 require_admin() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || fail 'Run this command as root (for example, with sudo).'
 }
 
+offline_manifest_hash() {
+    [[ -f $script_dir/SHA256SUMS ]] || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$script_dir/SHA256SUMS" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum --algorithm 256 "$script_dir/SHA256SUMS" | awk '{print $1}'
+    else
+        fail 'sha256sum or shasum is required to verify an offline bundle.'
+    fi
+}
+
+offline_verification_status() {
+    local manifest_hash verified_hash
+    manifest_hash=$(offline_manifest_hash) || { printf 'not an offline bundle'; return; }
+    [[ -f $script_dir/.bundle-verified ]] || { printf 'not verified'; return; }
+    IFS= read -r verified_hash <"$script_dir/.bundle-verified" || true
+    if [[ $verified_hash == "$manifest_hash" ]]; then
+        printf 'verified'
+    else
+        printf 'verification required (bundle changed)'
+    fi
+}
+
 assert_offline_bundle_integrity() {
-    [[ -f $script_dir/SHA256SUMS ]] || return 0
+    local force=${1:-false} manifest_hash temporary_receipt
+    manifest_hash=$(offline_manifest_hash) || return 0
+    if [[ $force != true && $(offline_verification_status) == verified ]]; then
+        printf 'Offline bundle integrity: previously verified; manifest unchanged.\n'
+        return
+    fi
     heading 'Offline bundle integrity'
     [[ -f $script_dir/verify-bundle.sh ]] || fail 'The offline bundle verifier is missing.'
     bash "$script_dir/verify-bundle.sh" || fail 'Offline bundle integrity verification failed.'
+    temporary_receipt="$script_dir/.bundle-verified.tmp"
+    printf '%s\n' "$manifest_hash" >"$temporary_receipt"
+    chmod 644 "$temporary_receipt"
+    mv -f "$temporary_receipt" "$script_dir/.bundle-verified"
 }
 
 docker_ready() {
@@ -103,7 +141,11 @@ install_bundled_prerequisites() {
 }
 
 require_docker() {
-    docker_ready || install_bundled_prerequisites
+    docker_ready && return
+    if [[ $prerequisites_mode == existing ]]; then
+        fail "The existing Docker installation is unavailable or not ready. Start Docker and ensure 'docker compose' works, or rerun init with --prerequisites auto."
+    fi
+    install_bundled_prerequisites
     docker_ready || fail 'Docker Engine and Docker Compose are required.'
 }
 
@@ -283,8 +325,14 @@ case "$command_name" in
         printf 'Docker CLI: %s\n' "$(command -v docker >/dev/null 2>&1 && echo true || echo false)"
         printf 'Docker ready: %s\n' "$(docker_ready && echo true || echo false)"
         printf 'Offline bundle: %s\n' "$([[ -f $script_dir/offline-images.tar ]] && echo true || echo false)"
+        printf 'Bundle verification: %s\n' "$(offline_verification_status)"
         printf 'Configured: %s\n' "$(configured && echo true || echo false)"
         # TODO(offline-maps): add MBTiles validation/import after deployment requirements are defined.
+        ;;
+    verify)
+        require_admin
+        [[ -f $script_dir/SHA256SUMS ]] || fail 'SHA256SUMS is missing. This is not a complete offline bundle.'
+        assert_offline_bundle_integrity true
         ;;
     init)
         require_admin
@@ -347,7 +395,9 @@ case "$command_name" in
         compose "${log_args[@]}"
         ;;
     upgrade)
-        require_admin; require_docker; configured || fail 'This release directory has not been initialized.'
+        require_admin
+        assert_offline_bundle_integrity
+        require_docker; configured || fail 'This release directory has not been initialized.'
         heading 'Upgrade preflight'
         compose config --quiet
         prepare_deployment_images
