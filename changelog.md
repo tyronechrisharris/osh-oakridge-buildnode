@@ -1,5 +1,16 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.7.0 2026-08-22
+## Changes
+- Add cookie based session authentication as default so we dont store credentials in browser storage.
+- Fix OSCAR viewer map to auto-fly to sitemap, even when offline.
+- Add loading icon for unloaded client data.
+- Fix dashboard lane tamper status to persist across refresh.
+- MQTT fixes on client and server
+- Make OSCAR CLI clickable
+- Edit GH Actions workflow to generate offline builds
+- Add "verify" to CLI and some flags to offline builder
+
 ## 3.6.2 2026-08-20
 ## Changes
 - Fixed minor issue where GitHub actions workflow releases source containing node_modules, making source unnecessarily large
