@@ -227,11 +227,43 @@ function Write-SecretFile([string]$Path, [string]$Value) {
     [IO.File]::WriteAllText($Path, $Value, $Utf8NoBom)
 }
 
-function Protect-DeploymentFiles {
+function Test-DockerUsersGroup {
+    return (Invoke-ExternalProbe { net.exe localgroup docker-users })
+}
+
+function Set-DeploymentDirectoryAccess([string]$DockerUsersPermission) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     foreach ($directory in @((Join-Path $ScriptRoot 'secrets'), (Join-Path $ScriptRoot 'tls'))) {
-        Invoke-External 'icacls.exe' @($directory, '/inheritance:r', '/grant:r', "${identity}:(OI)(CI)F", 'SYSTEM:(OI)(CI)F', '/Q')
+        $grants = @($directory, '/inheritance:r', '/grant:r', "${identity}:(OI)(CI)F", 'SYSTEM:(OI)(CI)F')
+        if (Test-DockerUsersGroup) {
+            # Docker Desktop may run as the signed-in user even when OSCAR setup
+            # was elevated with a different administrator account. Members of
+            # docker-users already control Docker, so this does not grant Docker
+            # capability to an otherwise unprivileged account.
+            $grants += "docker-users:(OI)(CI)$DockerUsersPermission"
+        }
+        $grants += '/Q'
+        Invoke-External 'icacls.exe' $grants
     }
+}
+
+function Enable-SetupDockerFileAccess {
+    # Certificate generation writes through a Docker bind mount. Allow the
+    # Docker Desktop group to write only while the administrator runs setup;
+    # Protect-DeploymentFiles reduces this to read/execute before startup.
+    Set-DeploymentDirectoryAccess 'F'
+}
+
+function Protect-DeploymentFiles {
+    Set-DeploymentDirectoryAccess 'RX'
+}
+
+function Get-ReleaseVersion {
+    $templatePath = Join-Path $ScriptRoot '.env.example'
+    if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) { throw 'The release version file .env.example is missing.' }
+    $match = [IO.File]::ReadAllLines($templatePath) | Where-Object { $_ -match '^OSCAR_VERSION=' } | Select-Object -First 1
+    if (-not $match -or -not $match.Substring('OSCAR_VERSION='.Length).Trim()) { throw 'OSCAR_VERSION is missing from .env.example.' }
+    return $match.Substring('OSCAR_VERSION='.Length).Trim()
 }
 
 function Get-OscarImage {
@@ -412,6 +444,7 @@ try {
             if (-not (Test-Path -LiteralPath $adminSecretPath)) { Write-SecretFile $adminSecretPath (Read-AdminPassword) }
             if (-not (Test-Path -LiteralPath $databaseSecretPath)) { Write-SecretFile $databaseSecretPath (New-RandomPassword) }
             if (-not (Test-Path -LiteralPath $bootstrapSecretPath)) { Write-SecretFile $bootstrapSecretPath (New-RandomPassword) }
+            Enable-SetupDockerFileAccess
             Prepare-DeploymentImages
             Initialize-Tls $Hostname
             Protect-DeploymentFiles
@@ -454,7 +487,11 @@ try {
             Assert-OfflineBundleIntegrity
             Assert-Docker; Assert-Configured
             Write-Heading 'Upgrade preflight'
+            Protect-DeploymentFiles
             Invoke-Compose @('config', '--quiet')
+            $releaseVersion = Get-ReleaseVersion
+            Set-EnvValue 'OSCAR_VERSION' $releaseVersion
+            Write-Host "Preparing OSCAR $releaseVersion"
             Prepare-DeploymentImages
             Invoke-Compose @('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')
             Write-Host 'Upgrade deployment completed. Persistent OSCAR and PostgreSQL volumes were retained.' -ForegroundColor Green

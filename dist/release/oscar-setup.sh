@@ -233,6 +233,14 @@ oscar_image() {
     printf 'oscar:%s' "$version"
 }
 
+release_version() {
+    local version
+    [[ -f $script_dir/.env.example ]] || fail 'The release version file .env.example is missing.'
+    version=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }' "$script_dir/.env.example")
+    [[ -n $version ]] || fail 'OSCAR_VERSION is missing from .env.example.'
+    printf '%s' "$version"
+}
+
 container_image_exists() { docker image inspect "$1" >/dev/null 2>&1; }
 
 required_images() {
@@ -400,6 +408,9 @@ case "$command_name" in
         require_docker; configured || fail 'This release directory has not been initialized.'
         heading 'Upgrade preflight'
         compose config --quiet
+        target_version=$(release_version)
+        set_env_value OSCAR_VERSION "$target_version"
+        printf 'Preparing OSCAR %s\n' "$target_version"
         prepare_deployment_images
         compose up --detach --no-build --pull never --wait --wait-timeout 240
         printf 'Upgrade deployment completed. Persistent OSCAR and PostgreSQL volumes were retained.\n'

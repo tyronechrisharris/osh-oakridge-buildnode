@@ -103,6 +103,9 @@ distributions{
                 exclude 'secrets/**'
                 exclude 'tls/**'
                 exclude '.env'
+                filesMatching('.env.example') {
+                    filter { line -> line.startsWith('OSCAR_VERSION=') ? "OSCAR_VERSION=${project.version}" : line }
+                }
                 filesMatching('**/*.sh') {
                     // Preserve desktop/terminal launchability in the release ZIP,
                     // even when the archive is assembled on Windows.

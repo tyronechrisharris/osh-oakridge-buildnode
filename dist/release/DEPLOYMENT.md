@@ -142,7 +142,7 @@ Every reported privilege flag for `oscar_app` must be false. A host scan must sh
 
 ## Upgrade
 
-Place the new release files in the deployment directory while preserving `.env`, `secrets/`, and `tls/`, then run:
+Back up the deployment first. Extract the new release over the existing deployment directory while preserving `.env`, `secrets/`, and `tls/`. Release archives do not contain those runtime files. Then run:
 
 ```powershell
 .\oscar.bat upgrade
@@ -152,7 +152,9 @@ Place the new release files in the deployment directory while preserving `.env`,
 sudo bash oscar.sh upgrade
 ```
 
-The command validates Compose, prepares the versioned images, recreates changed services, waits for health checks, and retains the fixed `oscar_state` and `postgres_data` volumes. It never removes volumes.
+The command reads the target version from the new release, updates only `OSCAR_VERSION` in the preserved `.env`, validates Compose, prepares the versioned images, recreates changed services, waits for health checks, and retains the fixed `oscar_state` and `postgres_data` volumes. It never removes volumes. Confirm the result with `oscar.bat status` (Windows) or `sudo bash oscar.sh status` (Ubuntu).
+
+On Windows, OSCAR grants the local `docker-users` group read-only access to the protected `secrets` and `tls` directories so Docker Desktop can mount them. This is required when setup is elevated with a different administrator account than the signed-in account running Docker Desktop. The group receives temporary write access only while `init` generates or imports the certificate.
 
 Database backup/restore, certificate renewal, rollback automation, and version-specific configuration migration are planned administrator operations and must be completed before upgrades are declared production-ready.
 
