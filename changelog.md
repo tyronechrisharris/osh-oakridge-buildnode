@@ -1,5 +1,13 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.7.2 2026-08-28
+## Changes
+- FFmpeg usage improvements
+
+## 3.7.1 2026-08-27
+## Changes
+- Added configurable CORS whitelist to Jetty HTTP server
+
 ## 3.7.0 2026-08-22
 ## Changes
 - Add cookie based session authentication as default so we dont store credentials in browser storage.
