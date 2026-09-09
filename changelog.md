@@ -1,5 +1,10 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.7.3 2026-09-09
+## Changes
+- Allow installation when Docker has different permission set than administrator running setup command
+- Fix minor bug in UI where lane UIDs could not have extensions (e.g. "...:lane:north:1")
+
 ## 3.7.2 2026-08-28
 ## Changes
 - FFmpeg usage improvements
