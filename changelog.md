@@ -1,5 +1,15 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.7.5 2026-09-18
+## Changes
+- Add manual tamper clear action
+- Fix charts that were only showing threshold and not counts
+- Increase opacity of sitemap overlay and fit map to sitemap bounds
+
+## 3.7.4 2026-09-16
+## Changes
+- Fix Leaflet blocking OSM tiles
+
 ## 3.7.3 2026-09-09
 ## Changes
 - Allow installation when Docker has different permission set than administrator running setup command
