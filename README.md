@@ -43,6 +43,10 @@ build/distributions/oscar-<version>.zip
 
 Hardware-dependent tests remain outside these packaging scripts and must be run in an appropriately equipped test environment.
 
+## Developer documentation
+
+The [translation system guide](docs/TRANSLATION_SYSTEM.md) documents language selection and persistence, admin and viewer resource lookup, sensor and Lane System form metadata, localized README help, and the complete procedure and validation checklist for adding or restoring a supported language.
+
 ## Build Windows offline media
 
 On a connected Windows x86-64 build workstation with Docker available:
