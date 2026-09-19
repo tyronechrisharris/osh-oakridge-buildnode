@@ -1,5 +1,9 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.8.0 2026-09-19
+## Changes
+- Full support for internationalization (i18n) in frontend viewer and administrative interface
+
 ## 3.7.5 2026-09-18
 ## Changes
 - Add manual tamper clear action
