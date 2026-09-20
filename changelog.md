@@ -1,5 +1,12 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.8.1 2026-09-20
+## Changes
+- Fix OSM + site diagram layers
+- Fix lane marker location discovery
+- Fix camera stream resilience in backend & viewer
+- Fix site diagram upload failures
+
 ## 3.8.0 2026-09-19
 ## Changes
 - Full support for internationalization (i18n) in frontend viewer and administrative interface

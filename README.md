@@ -67,12 +67,10 @@ The offline deployment CLI performs no downloads.
 
 Before tagging a release:
 
-1. Update the version in `build.gradle`.
-2. Set `deploymentName` in `dist/config/standard/config.json` to `OSCAR <version>`.
-3. Set `OSCAR_VERSION` in `dist/release/.env.example` to the same version.
-4. Confirm `dist/release/postgis/pgdata` does not exist.
-5. Run the appropriate canonical build script.
-6. Run hardware and platform validation in their designated environments.
+1. Run `node tools/update-version.js <version>` to update `build.gradle`, the deployment name in `dist/config/standard/config.json`, and `OSCAR_VERSION` in `dist/release/.env.example`.
+2. Confirm `dist/release/postgis/pgdata` does not exist.
+3. Run the appropriate canonical build script.
+4. Run hardware and platform validation in their designated environments.
 
 Tags matching `v*` trigger the release workflow. The workflow validates the tag and version metadata, invokes `build-all.sh`, and publishes the connected release ZIP and source archive.
 
