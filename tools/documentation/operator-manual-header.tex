@@ -1,0 +1,32 @@
+\usepackage{booktabs}
+\usepackage{fancyhdr}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{xurl}
+
+\definecolor{OSCARBlue}{HTML}{155EA8}
+\definecolor{OSCARDark}{HTML}{263238}
+\definecolor{OSCARLight}{HTML}{EAF2F8}
+
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{3}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt plus 1pt minus 1pt}
+\setlength{\emergencystretch}{3em}
+\renewcommand{\arraystretch}{1.15}
+\floatplacement{figure}{H}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{OSCARDark}OSCAR}
+\fancyhead[R]{\small\color{OSCARDark}\nouppercase{\leftmark}}
+\fancyfoot[C]{\small\color{OSCARDark}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\maxheight{\ifdim\Gin@nat@height>0.70\textheight 0.70\textheight\else\Gin@nat@height\fi}
+\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+\makeatother

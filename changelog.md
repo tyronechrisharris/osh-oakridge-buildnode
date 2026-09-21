@@ -3,12 +3,15 @@ All notable changes to this project will be documented in this file.
 ## 3.8.3 IN PROGRESS
 ## Changes
 - Remove Sentry.io
+- Handle browser autoplay rejection without breaking live video or alarm audio
+- Allow vehicle ID entry during dashboard alarm adjudication
+- Add complete English, Spanish, French, and Greek administrator/operator manuals
+- Publish validated, screenshot-complete PDF manuals with each GitHub release
 ## TODO
 - Add daily file changes (for accurate timezone)
 - Verify manual tamper close
 - Extended occupancy handling
 - Set default reconnect attempts to infinity
-- Update docs
 
 ## 3.8.2 2026-09-21
 ## Changes

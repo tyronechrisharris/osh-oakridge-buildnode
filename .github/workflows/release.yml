@@ -10,6 +10,7 @@ env:
   NODE_VERSION: '22'
   OSCAR_DIR: 'web/oscar-viewer'
   DIST_DIR: 'build/distributions'
+  DOCS_DIR: 'build/documentation'
 
 jobs:
   validate:
@@ -118,6 +119,21 @@ jobs:
           cache: npm
           cache-dependency-path: ${{ env.OSCAR_DIR }}/package-lock.json
 
+      - name: Install PDF documentation tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            fonts-noto-core \
+            fonts-noto-mono \
+            pandoc \
+            poppler-utils \
+            texlive-fonts-recommended \
+            texlive-latex-extra \
+            texlive-xetex
+
+      - name: Build and validate localized operator manuals
+        run: tools/documentation/build-operator-manual-pdfs.sh "${GITHUB_REF_NAME#v}" "${DOCS_DIR}"
+
       - name: Package source with submodules
         id: source
         run: |
@@ -188,5 +204,6 @@ jobs:
           files: |
             ${{ env.DIST_DIR }}/oscar-*.zip
             ${{ env.DIST_DIR }}/*-source.zip
+            ${{ env.DOCS_DIR }}/OSCAR-*-Administrator-Operator-Manual-*.pdf
             build/offline/oscar-*-windows-x86_64-offline-*.zip
             build/offline/oscar-*-windows-x86_64-offline-*.zip.sha256

@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 <release-version> [output-directory]" >&2
+    exit 2
+}
+
+[[ $# -ge 1 && $# -le 2 ]] || usage
+
+version=${1#v}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/../.." && pwd)
+manual_dir="$repo_root/include/osh-oakridge-modules/services/sensorhub-service-oscar/src/main/resources/com/botts/impl/service/oscar/i18n"
+image_dir="$repo_root/include/osh-oakridge-modules/docs/oscar-operator-manual/images"
+output_dir=${2:-"$repo_root/build/documentation"}
+header_file="$script_dir/operator-manual-header.tex"
+
+for command_name in pandoc xelatex pdfinfo pdftotext pdftoppm python3; do
+    command -v "$command_name" >/dev/null 2>&1 || {
+        echo "Required documentation tool is unavailable: $command_name" >&2
+        exit 1
+    }
+done
+
+[[ -d "$manual_dir" ]] || {
+    echo "Manual source directory is missing: $manual_dir" >&2
+    exit 1
+}
+[[ -d "$image_dir" ]] || {
+    echo "Manual image directory is missing: $image_dir" >&2
+    exit 1
+}
+[[ -f "$header_file" ]] || {
+    echo "PDF style header is missing: $header_file" >&2
+    exit 1
+}
+
+mkdir -p "$output_dir"
+temp_dir=$(mktemp -d)
+trap 'rm -rf "$temp_dir"' EXIT
+
+locales=(en es fr el)
+sources=(README.md README_es.md README_fr.md README_el.md)
+titles=(
+    "OSCAR Administrator and Operator Manual"
+    "Manual de administración y operación de OSCAR"
+    "Manuel d'administration et d'exploitation d'OSCAR"
+    "Εγχειρίδιο διαχείρισης και λειτουργίας OSCAR"
+)
+language_names=(English Español Français Ελληνικά)
+toc_titles=(Contents Índice "Table des matières" Περιεχόμενα)
+expected_text=(
+    "administrator and operator manual"
+    "administración y operación"
+    "administration et d'exploitation"
+    "διαχείρισης και λειτουργίας"
+)
+
+raw_image_prefix="https://raw.githubusercontent.com/Botts-Innovative-Research/osh-oakridge-modules/main/docs/oscar-operator-manual/images/"
+
+for index in "${!locales[@]}"; do
+    locale=${locales[$index]}
+    source_file="$manual_dir/${sources[$index]}"
+    prepared_file="$temp_dir/manual-$locale.md"
+    output_file="$output_dir/OSCAR-$version-Administrator-Operator-Manual-$locale.pdf"
+
+    [[ -f "$source_file" ]] || {
+        echo "Localized manual is missing: $source_file" >&2
+        exit 1
+    }
+
+    python3 - "$source_file" "$prepared_file" "$raw_image_prefix" "$image_dir" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+raw_prefix = sys.argv[3]
+image_dir = Path(sys.argv[4]).resolve()
+
+text = source.read_text(encoding="utf-8")
+lines = text.splitlines()
+if lines and lines[0].startswith("# "):
+    lines = lines[1:]
+
+# The Markdown manual uses H1 for its title and H2 for top-level sections.
+# The title moves into PDF metadata, so promote the remaining headings to keep
+# PDF section numbers at 1, 1.1, 1.1.1 instead of 0.1, 0.1.1, 0.1.1.1.
+in_fence = False
+for index, line in enumerate(lines):
+    if line.lstrip().startswith("```"):
+        in_fence = not in_fence
+    elif not in_fence and line.startswith("##"):
+        lines[index] = line[1:]
+
+text = "\n".join(lines).lstrip()
+text = text.replace(raw_prefix, image_dir.as_uri() + "/")
+destination.write_text(text, encoding="utf-8")
+PY
+
+    pandoc "$prepared_file" \
+        --from=gfm \
+        --standalone \
+        --toc \
+        --toc-depth=3 \
+        --number-sections \
+        --pdf-engine=xelatex \
+        --include-in-header="$header_file" \
+        --metadata="title:${titles[$index]}" \
+        --metadata="subtitle:OSCAR $version - ${language_names[$index]}" \
+        --metadata="toc-title:${toc_titles[$index]}" \
+        --metadata="author:Botts Innovative Research" \
+        --metadata="lang:$locale" \
+        --variable="mainfont:Noto Sans" \
+        --variable="sansfont:Noto Sans" \
+        --variable="monofont:Noto Sans Mono" \
+        --variable="fontsize:10pt" \
+        --variable="geometry:letterpaper,margin=0.72in,headheight=16pt" \
+        --variable="colorlinks:true" \
+        --variable="linkcolor:OSCARBlue" \
+        --variable="urlcolor:OSCARBlue" \
+        --output="$output_file"
+
+    [[ -s "$output_file" ]] || {
+        echo "PDF was not created: $output_file" >&2
+        exit 1
+    }
+
+    page_count=$(pdfinfo "$output_file" | awk '/^Pages:/ {print $2}')
+    [[ "$page_count" =~ ^[0-9]+$ && "$page_count" -ge 20 ]] || {
+        echo "PDF has an unexpected page count ($page_count): $output_file" >&2
+        exit 1
+    }
+
+    extracted_text="$temp_dir/manual-$locale.txt"
+    pdftotext "$output_file" "$extracted_text"
+    grep -Fqi "${expected_text[$index]}" "$extracted_text" || {
+        echo "Localized text validation failed: $output_file" >&2
+        exit 1
+    }
+    grep -Fq "OSCAR $version" "$extracted_text" || {
+        echo "Release-version validation failed: $output_file" >&2
+        exit 1
+    }
+
+    pdftoppm -f 1 -singlefile -png -r 96 "$output_file" "$temp_dir/render-$locale" >/dev/null 2>&1
+    [[ -s "$temp_dir/render-$locale.png" ]] || {
+        echo "PDF rendering validation failed: $output_file" >&2
+        exit 1
+    }
+
+    echo "Created $(basename "$output_file") ($page_count pages)"
+done
