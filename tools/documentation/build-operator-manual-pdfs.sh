@@ -73,6 +73,7 @@ for index in "${!locales[@]}"; do
 
     python3 - "$source_file" "$prepared_file" "$raw_image_prefix" "$image_dir" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 source = Path(sys.argv[1])
@@ -85,6 +86,19 @@ lines = text.splitlines()
 if lines and lines[0].startswith("# "):
     lines = lines[1:]
 
+# The PDF receives a generated, page-numbered table of contents. Remove the
+# hand-authored Markdown contents block from the temporary copy so it does not
+# become a numbered section or offset every real section by one.
+contents_headings = {"## Contents", "## Contenido", "## Sommaire", "## Περιεχόμενα"}
+for start, line in enumerate(lines):
+    if line.strip() not in contents_headings:
+        continue
+    end = start + 1
+    while end < len(lines) and not lines[end].startswith("## "):
+        end += 1
+    del lines[start:end]
+    break
+
 # The Markdown manual uses H1 for its title and H2 for top-level sections.
 # The title moves into PDF metadata, so promote the remaining headings to keep
 # PDF section numbers at 1, 1.1, 1.1.1 instead of 0.1, 0.1.1, 0.1.1.1.
@@ -93,9 +107,21 @@ for index, line in enumerate(lines):
     if line.lstrip().startswith("```"):
         in_fence = not in_fence
     elif not in_fence and line.startswith("##"):
-        lines[index] = line[1:]
+        promoted = line[1:]
+        # Markdown headings already carry operator-facing section numbers.
+        # Pandoc supplies PDF numbering, so remove the literal prefix from the
+        # prepared copy to avoid headings such as "9.2 8.2 Event Details".
+        lines[index] = re.sub(
+            r"^(#{1,6})\s+\d+(?:\.\d+)*\.?\s+",
+            r"\1 ",
+            promoted,
+        )
 
 text = "\n".join(lines).lstrip()
+# Keep the hand-authored Contents links valid after removing the numeric
+# heading prefixes in the PDF-only copy (for example #8-operate... becomes
+# #operate...). The generated Pandoc table of contents uses the same targets.
+text = re.sub(r"\]\(#\d+-", "](#", text)
 text = text.replace(raw_prefix, image_dir.as_uri() + "/")
 destination.write_text(text, encoding="utf-8")
 PY
