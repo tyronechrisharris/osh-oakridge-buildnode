@@ -16,6 +16,7 @@ manual_dir="$repo_root/include/osh-oakridge-modules/services/sensorhub-service-o
 image_dir="$repo_root/include/osh-oakridge-modules/docs/oscar-operator-manual/images"
 output_dir=${2:-"$repo_root/build/documentation"}
 header_file="$script_dir/operator-manual-header.tex"
+table_filter="$script_dir/operator-manual-tables.lua"
 
 for command_name in pandoc xelatex pdfinfo pdftotext pdftoppm python3; do
     command -v "$command_name" >/dev/null 2>&1 || {
@@ -34,6 +35,10 @@ done
 }
 [[ -f "$header_file" ]] || {
     echo "PDF style header is missing: $header_file" >&2
+    exit 1
+}
+[[ -f "$table_filter" ]] || {
+    echo "PDF table filter is missing: $table_filter" >&2
     exit 1
 }
 
@@ -133,6 +138,7 @@ PY
         --toc-depth=3 \
         --number-sections \
         --pdf-engine=xelatex \
+        --lua-filter="$table_filter" \
         --include-in-header="$header_file" \
         --metadata="title:${titles[$index]}" \
         --metadata="subtitle:OSCAR $version - ${language_names[$index]}" \
@@ -170,6 +176,36 @@ PY
         echo "Release-version validation failed: $output_file" >&2
         exit 1
     }
+
+    # Reject any text whose rendered bounding box enters the page-edge safety
+    # area. This guards against clipped tables and unbroken CSV records.
+    bbox_file="$temp_dir/manual-$locale-bbox.html"
+    pdftotext -bbox-layout "$output_file" "$bbox_file"
+    python3 - "$bbox_file" "$output_file" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+bbox_path, pdf_path = sys.argv[1:]
+root = ET.parse(bbox_path).getroot()
+violations = []
+for page_number, page in enumerate(root.iter("{http://www.w3.org/1999/xhtml}page"), 1):
+    width = float(page.attrib["width"])
+    for word in page.iter("{http://www.w3.org/1999/xhtml}word"):
+        x_min = float(word.attrib["xMin"])
+        x_max = float(word.attrib["xMax"])
+        # Keep glyphs inside a 2/3-inch safe area. The PDF uses 0.72-inch
+        # margins; the small tolerance permits normal glyph overhang while
+        # still detecting prose that leaks into the non-printable edge.
+        safe_inset = 47.0
+        if x_min < safe_inset or x_max > width - safe_inset:
+            violations.append((page_number, x_min, x_max, "".join(word.itertext())))
+
+if violations:
+    print(f"Text crosses a page boundary in {pdf_path}:", file=sys.stderr)
+    for item in violations[:20]:
+        print(f"  page {item[0]}: x={item[1]:.2f}..{item[2]:.2f} {item[3]!r}", file=sys.stderr)
+    sys.exit(1)
+PY
 
     pdftoppm -f 1 -singlefile -png -r 96 "$output_file" "$temp_dir/render-$locale" >/dev/null 2>&1
     [[ -s "$temp_dir/render-$locale.png" ]] || {
