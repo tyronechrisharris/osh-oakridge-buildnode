@@ -1,5 +1,9 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.8.3 IN PROGRESS
+## Changes
+- Remove Sentry.io
+
 ## 3.8.2 2026-09-21
 ## Changes
 - Load lanes independently on viewer. Fixes issue that caused failure across all lanes when one lane was unreachable/unhealthy

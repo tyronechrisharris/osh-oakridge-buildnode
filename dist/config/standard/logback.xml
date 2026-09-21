@@ -23,11 +23,8 @@
         </encoder>
     </appender>
 
-    <appender name="Sentry" class="io.sentry.logback.SentryAppender"/>
-
     <root level="info">
         <appender-ref ref="STDOUT" />
-        <appender-ref ref="Sentry" />
     </root>
     <logger name="org.sensorhub" level="info">
         <appender-ref ref="MODULE_FILE" />
