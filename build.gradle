@@ -2,7 +2,7 @@ apply from: gradle.oshCoreDir + '/common.gradle'
 description = ''
 
 allprojects {
-    version = "3.8.1"
+    version = "3.8.2"
 }
 
 subprojects {
