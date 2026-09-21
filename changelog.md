@@ -1,6 +1,6 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
-## 3.8.3 IN PROGRESS
+## 3.8.3 2026-09-21
 ## Changes
 - Remove Sentry.io
 - Handle browser autoplay rejection without breaking live video or alarm audio
