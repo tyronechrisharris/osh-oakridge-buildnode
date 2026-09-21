@@ -1,6 +1,12 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
-## 3.8.3 IN PROGRESS
+## 3.8.4 2026-09-21
+## Changes
+- Add nested AND/OR alarm filtering on the dashboard and Events page
+- Add inclusive numeric filters for occupancy ID, maximum gamma, and maximum neutron values
+- Add individual, cross-page, and all-filtered alarm selection with bulk adjudication
+
+## 3.8.3 2026-09-21
 ## Changes
 - Remove Sentry.io
 - Handle browser autoplay rejection without breaking live video or alarm audio
