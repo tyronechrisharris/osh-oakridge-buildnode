@@ -129,6 +129,9 @@ jobs:
             pandoc \
             poppler-utils \
             texlive-fonts-recommended \
+            texlive-lang-french \
+            texlive-lang-greek \
+            texlive-lang-spanish \
             texlive-latex-extra \
             texlive-xetex
 

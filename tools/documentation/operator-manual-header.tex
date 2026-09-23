@@ -13,7 +13,9 @@
 \setcounter{tocdepth}{3}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{5pt plus 1pt minus 1pt}
-\setlength{\emergencystretch}{3em}
+% Allow short, difficult paragraphs (including localized list items) to use
+% looser spacing as a last resort instead of running into the page margin.
+\setlength{\emergencystretch}{\linewidth}
 \renewcommand{\arraystretch}{1.15}
 \floatplacement{figure}{H}
 
