@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Publish a canonical lane occupancy-status stream so extended occupancy works consistently with Rapiscan, Aspect, and RS350 RPMs
 - Publish FFmpeg camera connection-state telemetry for current health monitoring
 - Produce valid FFmpeg MP4/HLS recordings from H.264 cameras by requiring discovered video dimensions and preserving packet PTS, DTS, duration, stream index, and time base during remuxing
+- Keep MP4 packet delivery ordered with recording close so healthy occupancy clips cannot finalize before queued video packets are written
 - Reject and remove incomplete video recordings instead of retaining zero-byte or unfinalized clips, with live-camera recording/HLS coverage plus reconnect and failure-cleanup regression tests
 - Make video-retention compaction fail-safe by validating a decoded frame and durably replacing the original only after the compacted clip is complete, while preserving the source clip on every failure path
 - Refresh Status of Health with one batched latest-observation request per configured node on entry and every 30 seconds, replacing per-stream real-time MQTT feeds to bound CPU and server load at large sites
