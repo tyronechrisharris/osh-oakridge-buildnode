@@ -9,7 +9,10 @@ All notable changes to this project will be documented in this file.
 - Add a localized Status of Health page showing every visible lane, RPM and camera connectivity, gamma high/low, neutron high, tamper, and configurable extended-occupancy faults
 - Publish a canonical lane occupancy-status stream so extended occupancy works consistently with Rapiscan, Aspect, and RS350 RPMs
 - Publish FFmpeg camera connection-state telemetry for current health monitoring
+- Produce valid FFmpeg MP4/HLS recordings from H.264 cameras by requiring discovered video dimensions and preserving packet PTS, DTS, duration, stream index, and time base during remuxing
+- Reject and remove incomplete video recordings instead of retaining zero-byte or unfinalized clips, with live-camera recording/HLS coverage plus reconnect and failure-cleanup regression tests
 - Refresh Status of Health with one batched latest-observation request per configured node on entry and every 30 seconds, replacing per-stream real-time MQTT feeds to bound CPU and server load at large sites
+- Keep Rapiscan tamper status Unknown until an explicit `TT` or `TC` transition is observed; an online RPM connection is not treated as proof of tamper clear
 - Apply event filters across the full database result set and add PostgreSQL indexes for OSCAR event-filter queries
 - Add URL-scoped operational views so one OSCAR deployment can present different lane groups to different workstations
 - Scope viewer subscriptions, statistics, reports, navigation, health monitoring, and alarm notifications to the active operational view
