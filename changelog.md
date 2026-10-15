@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
 - Add complete English, Spanish, French, and Greek interface and operator-manual coverage for alarm transfer
 - Package the maintained release guides and all four localized operator manuals in the connected ZIP while excluding legacy pre-4.0 manuals
 - Validate changelog, deployment, and localized manual version labels against the release tag
+- Normalize the persisted SensorHub configuration to owner-only writable permissions (`0600`), repairing overly restrictive copies created by earlier releases
+- Document that CSV imports remain in memory until the global Save action completes and require restart verification before acceptance
 
 ## 3.9.0 2026-09-23
 ## Changes

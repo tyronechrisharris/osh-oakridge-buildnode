@@ -135,7 +135,7 @@ distributions{
             }
             into("osh-node-oscar/") {
                 from 'README.md'
-                from 'osh-node-oscar/changelog.md'
+                from 'changelog.md'
             }
             into("osh-node-oscar/lib") {
                 from 'third-party-drivers'
