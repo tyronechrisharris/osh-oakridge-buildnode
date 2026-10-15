@@ -61,6 +61,8 @@ The [operational views guide](docs/OPERATIONAL_VIEWS.md) explains how to assign 
 
 The [Status of Health guide](docs/STATUS_OF_HEALTH.md) documents lane-level RPM and camera connectivity, detector and tamper faults, extended occupancy, operational-view scoping, and the acceptance checklist.
 
+The [live-video guide](docs/LIVE_VIDEO.md) documents keyframe requirements, the Viewer's preparing and recovery states, emulator expectations, troubleshooting, and end-to-end playback acceptance tests.
+
 ## Build Windows offline media
 
 On a connected Windows x86-64 build workstation with Docker available:

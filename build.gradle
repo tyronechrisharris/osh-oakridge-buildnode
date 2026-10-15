@@ -90,6 +90,7 @@ distributions{
                     include 'DEPLOYMENT.md'
                 }
                 from('docs') {
+                    include 'LIVE_VIDEO.md'
                     include 'OPERATIONAL_VIEWS.md'
                     include 'STATUS_OF_HEALTH.md'
                     include 'TRANSLATION_SYSTEM.md'
@@ -112,6 +113,7 @@ distributions{
                     include 'DEPLOYMENT.md'
                 }
                 from('docs') {
+                    include 'LIVE_VIDEO.md'
                     include 'OPERATIONAL_VIEWS.md'
                     include 'STATUS_OF_HEALTH.md'
                     include 'TRANSLATION_SYSTEM.md'

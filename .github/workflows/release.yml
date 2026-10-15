@@ -184,8 +184,10 @@ jobs:
           for expected in \
             documentation/QUICKSTART.md \
             documentation/DEPLOYMENT.md \
+            documentation/LIVE_VIDEO.md \
             documentation/OPERATIONAL_VIEWS.md \
             documentation/STATUS_OF_HEALTH.md \
+            documentation/TRANSLATION_SYSTEM.md \
             documentation/operator-manual/README.md \
             documentation/operator-manual/README_es.md \
             documentation/operator-manual/README_fr.md \
@@ -234,8 +236,10 @@ jobs:
             for expected in \
               documentation/QUICKSTART.md \
               documentation/DEPLOYMENT.md \
+              documentation/LIVE_VIDEO.md \
               documentation/OPERATIONAL_VIEWS.md \
               documentation/STATUS_OF_HEALTH.md \
+              documentation/TRANSLATION_SYSTEM.md \
               documentation/operator-manual/README.md \
               documentation/operator-manual/README_es.md \
               documentation/operator-manual/README_fr.md \

@@ -1,6 +1,6 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
-## 4.0.0 2026-09-24
+## 4.0.0
 ## Upgrade notes
 - This major release changes operator-facing navigation and adds operational-view URL scoping; train operators and validate workstation URLs before production rollout
 - Build or import the versioned `oscar:4.0.0` image and run `oscar upgrade`; `oscar restart` alone continues to use the previously installed image
@@ -10,8 +10,12 @@ All notable changes to this project will be documented in this file.
 - Publish a canonical lane occupancy-status stream so extended occupancy works consistently with Rapiscan, Aspect, and RS350 RPMs
 - Publish FFmpeg camera connection-state telemetry for current health monitoring
 - Produce valid FFmpeg MP4/HLS recordings from H.264 cameras by requiring discovered video dimensions and preserving packet PTS, DTS, duration, stream index, and time base during remuxing
+- Make FFmpeg transcoder queues thread-safe and blocking, preserve native packet ownership and delayed-output flushing, surface worker failures, and prevent overlapping pipeline generations during stop, restart, or reinitialization
 - Keep MP4 packet delivery ordered with recording close so healthy occupancy clips cannot finalize before queued video packets are written
 - Reject and remove incomplete video recordings instead of retaining zero-byte or unfinalized clips, with live-camera recording/HLS coverage plus reconnect and failure-cleanup regression tests
+- Start live HLS output on the first decodable H.264 keyframe and withhold unavailable playlists instead of serving an empty manifest or a segment that begins mid-GOP
+- Show localized live-video preparation, terminal failure, and retry states in the Viewer, with bounded recovery for transient playlist, network, and media errors
+- Document a one-to-two-second camera keyframe interval and provide a one-second closed-GOP preparation path for the 50-camera emulator while retaining low-CPU stream-copy publishing
 - Make video-retention compaction fail-safe by validating a decoded frame and durably replacing the original only after the compacted clip is complete, while preserving the source clip on every failure path
 - Refresh Status of Health with one batched latest-observation request per configured node on entry and every 30 seconds, replacing per-stream real-time MQTT feeds to bound CPU and server load at large sites
 - Keep Rapiscan tamper status Unknown until an explicit `TT` or `TC` transition is observed; an online RPM connection is not treated as proof of tamper clear

@@ -130,10 +130,17 @@ requireMatch(
     version,
     'Status of Health guide version',
 );
+requireMatch(
+    'docs/LIVE_VIDEO.md',
+    /OSCAR (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?) starts Lane Details video/,
+    version,
+    'live-video guide version',
+);
 
 for (const relativePath of [
     'README.md',
     'dist/release/DEPLOYMENT.md',
+    'docs/LIVE_VIDEO.md',
     'docs/STATUS_OF_HEALTH.md',
     'include/osh-oakridge-modules/README.md',
     'include/osh-oakridge-modules/docs/oscar-operator-manual/README.md',
