@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Validate changelog, deployment, and localized manual version labels against the release tag
 - Normalize the persisted SensorHub configuration to owner-only writable permissions (`0600`), repairing overly restrictive copies created by earlier releases
 - Document that CSV imports remain in memory until the global Save action completes and require restart verification before acceptance
+- Stamp and validate the OSCAR semantic version in the container image's OCI metadata instead of inheriting the base operating-system version label
 
 ## 3.9.0 2026-09-23
 ## Changes

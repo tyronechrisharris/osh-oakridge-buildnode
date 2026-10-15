@@ -50,6 +50,24 @@ requireMatch(
     'deployment version',
 );
 requireMatch('dist/release/.env.example', /^OSCAR_VERSION=(.+)$/m, version, 'OSCAR_VERSION');
+requireMatch(
+    'dist/release/compose.yaml',
+    /^\s+OSCAR_VERSION:\s*"\$\{OSCAR_VERSION:-([^}]+)\}"\s*$/m,
+    'local',
+    'OSCAR image-version build argument fallback',
+);
+requireMatch(
+    'dist/release/docker/oscar/Dockerfile',
+    /^ARG OSCAR_VERSION=(.+)$/m,
+    'local',
+    'OSCAR image-version argument fallback',
+);
+requireMatch(
+    'dist/release/docker/oscar/Dockerfile',
+    /^\s*org\.opencontainers\.image\.version="([^"\n]+)"\s*$/m,
+    '${OSCAR_VERSION}',
+    'OCI image-version label source',
+);
 requireMatch('changelog.md', /^##\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\s|$)/m, version, 'current changelog version');
 requireMatch(
     'web/oscar-viewer/changelog.md',
