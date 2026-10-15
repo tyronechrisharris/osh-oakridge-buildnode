@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Add a localized Status of Health page showing every visible lane, RPM and camera connectivity, gamma high/low, neutron high, tamper, and configurable extended-occupancy faults
 - Publish a canonical lane occupancy-status stream so extended occupancy works consistently with Rapiscan, Aspect, and RS350 RPMs
 - Publish FFmpeg camera connection-state telemetry for live health monitoring
+- Reconcile Status of Health current values in bounded batches per configured node while keeping live subscriptions active, preventing repeated per-stream query bursts and excessive CPU use at large sites
 - Apply event filters across the full database result set and add PostgreSQL indexes for OSCAR event-filter queries
 - Add URL-scoped operational views so one OSCAR deployment can present different lane groups to different workstations
 - Scope viewer subscriptions, statistics, reports, navigation, health monitoring, and alarm notifications to the active operational view

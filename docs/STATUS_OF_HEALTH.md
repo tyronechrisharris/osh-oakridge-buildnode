@@ -24,6 +24,10 @@ Operational views are a presentation boundary, not an authorization mechanism. S
 
 Unknown or waiting connection or fault telemetry is intentionally not counted as healthy. A lane is healthy only when every expected RPM and camera has an explicit online value and each expected fault source has explicitly reported clear.
 
+## Current values and live updates
+
+When the page opens, the Viewer reconciles the current connection and fault values in bounded batches for each configured node. Live subscriptions remain active after that reconciliation and supply subsequent changes. The page does not continuously run a separate latest-value query for every health stream, so large lane deployments should not produce repeating per-stream query bursts during normal operation.
+
 ## Extended-occupancy threshold
 
 The default threshold is one minute. Enter a value from 1 through 1440 minutes in **Extended occupancy threshold**. The Viewer saves the value in that browser, so different authorized workstations can use different operational thresholds without changing server configuration.
@@ -40,6 +44,7 @@ Changing the threshold re-evaluates occupancies already in progress. It does not
 6. Set the extended-occupancy threshold to one minute, run a controlled occupancy beyond one minute on each installed RPM model, and verify the elapsed timer and fault indicator use the canonical lane occupancy status.
 7. Reload the browser and verify the threshold persists and live updates resume.
 8. Confirm that an unavailable node or missing telemetry is shown as waiting/offline rather than healthy.
+9. After the initial current-value batch settles, leave the page open for at least two minutes while watching server logs and container CPU. Confirm there are no repeating bursts of one latest-observation query per health stream, CPU returns to the site's normal steady state, and a controlled status change still appears through the live subscription.
 
 Hardware fault tests must follow the site's approved procedures. Do not create an uncontrolled radiation, tamper, or traffic condition solely to exercise the interface.
 
@@ -55,3 +60,4 @@ Hardware fault tests must follow the site's approved procedures. Do not create a
 | Fault never clears | Inspect the latest detector/tamper observations and confirm the source published the corresponding cleared state. |
 | Occupancy duration is missing or unexpected | Verify system clocks, confirm the Lane System publishes `occupancyStatus`, and check that the RPM's daily-file/status input reports both occupancy entry and exit. |
 | Page is empty in a scoped URL | Confirm at least one lane carries that operational-view key. Empty and invalid views intentionally fail closed. |
+| CPU remains high while the page is open | Allow the initial bounded current-value batch to finish, then check server logs for repeating latest-observation queries. If the same per-stream burst repeats without a page reload, confirm the deployed Viewer image contains the OSCAR 4.0.0 Status of Health performance correction. |
