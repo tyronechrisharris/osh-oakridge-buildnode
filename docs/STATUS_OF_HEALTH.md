@@ -4,8 +4,8 @@ The OSCAR 4.0.0 Status of Health page gives operators one current-status row for
 
 ## Lane scope
 
-- `/health` lists every lane discovered from the configured nodes.
-- `/health?view=<key>` lists every lane assigned to that operational view.
+- `/health/` lists every lane discovered from the configured nodes.
+- `/health/?view=<key>` lists every lane assigned to that operational view.
 - Invalid operational-view keys and views with no assigned lanes fail closed and show no lane telemetry.
 
 Operational views are a presentation boundary, not an authorization mechanism. See [OPERATIONAL_VIEWS.md](OPERATIONAL_VIEWS.md) for configuration and security guidance.
@@ -44,7 +44,7 @@ Changing the threshold re-evaluates occupancies already in progress. It does not
 
 ## Acceptance test
 
-1. Open the unscoped `/health` page and confirm every expected lane is present.
+1. Open the unscoped `/health/` page and confirm every expected lane is present.
 2. Open each required operational-view URL and confirm that only its assigned lanes are present.
 3. Confirm the RPM and every configured camera become **Online** within one refresh interval after their modules start.
 4. Stop and restart a test camera stream; verify **Offline** is reported during failure and **Online** returns within one refresh interval after reconnection.

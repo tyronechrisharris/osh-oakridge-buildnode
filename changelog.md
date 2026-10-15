@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Keep MP4 packet delivery ordered with recording close so healthy occupancy clips cannot finalize before queued video packets are written
 - Reject and remove incomplete video recordings instead of retaining zero-byte or unfinalized clips, with live-camera recording/HLS coverage plus reconnect and failure-cleanup regression tests
 - Start live HLS output on the first decodable H.264 keyframe and withhold unavailable playlists instead of serving an empty manifest or a segment that begins mid-GOP
+- Treat rapid lane switches before the first HLS keyframe as successful cancellations while preventing queued packets from leaking into a restart and preserving real write or cleanup failures
 - Show localized live-video preparation, terminal failure, and retry states in the Viewer, with bounded recovery for transient playlist, network, and media errors
 - Document a one-to-two-second camera keyframe interval and provide a one-second closed-GOP preparation path for the 50-camera emulator while retaining low-CPU stream-copy publishing
 - Make video-retention compaction fail-safe by validating a decoded frame and durably replacing the original only after the compacted clip is complete, while preserving the source clip on every failure path

@@ -36,7 +36,7 @@ The live-video panel has three explicit states:
 | Playing | The browser loaded the playlist and is advancing decoded video. |
 | Live video could not be played | Preparation or playback exhausted its bounded recovery attempts. Select **Retry** after checking the camera and network. |
 
-The Viewer retries transient playlist and media failures without repeatedly issuing start commands. After a terminal failure, selecting **Retry** waits for the old start attempt to settle, sends one stop command, and then issues one fresh start command. Leaving Lane Details, changing lanes, or unmounting the player still sends the normal stop command and clears retry timers.
+The Viewer retries transient playlist and media failures without repeatedly issuing start commands. After a terminal failure, selecting **Retry** waits for the old start attempt to settle, sends one stop command, and then issues one fresh start command. Leaving Lane Details, changing lanes, or unmounting the player still sends the normal stop command and clears retry timers. Stopping while OSCAR is still waiting for the first keyframe is treated as a successful cancellation: native resources are finalized, incomplete HLS artifacts are removed, and queued packets cannot leak into a later restart. Actual packet-write or cleanup failures are still reported.
 
 ## Acceptance test
 
