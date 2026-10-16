@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 - Build or import the versioned `oscar:4.0.0` image and run `oscar upgrade`; `oscar restart` alone continues to use the previously installed image
 - The upgrade retains the existing `oscar_state` and `postgres_data` volumes and does not require a database reset
 ## Changes
+- Add exact Event UUID lookup from the Events page and durable, node-qualified Event Details links that retain operational-view scope and fail closed for inaccessible lanes
+- Show the canonical occupancy observation identifier in Event Details and browser-generated PDFs, and include/display it in compact QR and portable alarm transfers while retaining legacy version-1 import compatibility
 - Add a localized Status of Health page showing every visible lane, RPM and camera connectivity, gamma high/low, neutron high, tamper, and configurable extended-occupancy faults
 - Publish a canonical lane occupancy-status stream so extended occupancy works consistently with Rapiscan, Aspect, and RS350 RPMs
 - Publish FFmpeg camera connection-state telemetry on lifecycle transitions and every 30 seconds, keeping healthy camera state current through hourly database cleanup while allowing a stopped publisher's stale value to age out

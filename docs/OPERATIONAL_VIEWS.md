@@ -25,6 +25,8 @@ https://oscar.example/view/north-gate
 
 The gateway redirects the second form to the first. OSCAR keeps the view parameter while navigating, opening event details, using the map, and handling alarm notifications.
 
+Event UUID searches and copied Event Details links also retain the active view. A canonical link includes the encoded observation ID and source node, for example `event-details?eventId=<id>&nodeId=<node>&view=north-gate`. The Viewer resolves that ID only against occupancy streams belonging to lanes visible in the active view; a UUID from another view fails closed instead of revealing the event.
+
 The normal root URL remains the unscoped administrative/legacy view and loads every lane:
 
 ```text
