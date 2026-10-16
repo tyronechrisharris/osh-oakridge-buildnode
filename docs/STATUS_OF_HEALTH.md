@@ -32,7 +32,7 @@ A test RPM emulator may establish a deterministic initial state by sending the p
 
 ## Current values and refresh interval
 
-When the page opens, the Viewer sends one batched latest-observation request to each configured node. It repeats that per-node refresh every 30 seconds instead of opening a real-time MQTT feed for every health stream. This bounds health-page load by the number of configured nodes rather than by the number of lanes, cameras, and fault streams.
+When the page opens, the Viewer fetches the latest observations in batches of at most 50 health streams and repeats the refresh every 30 seconds instead of opening a real-time MQTT feed for every health stream. No more than two health requests run at once across all configured nodes, and batches are scheduled round-robin so a large node does not delay another node's first snapshot. A failed batch remains **Waiting** and does not prevent successful batches from updating. This avoids oversized URLs and bounds concurrent database work at large sites.
 
 The FFmpeg driver also republishes each camera's unchanged connection state every 30 seconds. Connection-status observations older than one hour are removed by the normal database-retention job, so the heartbeat keeps a healthy running camera current without weakening stale-data detection. If the driver stops publishing, its last value ages out and the Viewer returns to **Waiting** rather than displaying an indefinitely stale **Online** state.
 
@@ -54,7 +54,7 @@ Changing the threshold re-evaluates occupancies already in progress. It does not
 6. Set the extended-occupancy threshold to one minute, run a controlled occupancy beyond one minute on each installed RPM model, and verify the elapsed timer and fault indicator use the canonical lane occupancy status.
 7. Reload the browser and verify the threshold persists and periodic status updates resume.
 8. Confirm that an unavailable node or missing telemetry is shown as waiting/offline rather than healthy.
-9. Leave the page open for at least two minutes while watching server logs and container CPU. Expect approximately one batched latest-observation request per configured node every 30 seconds; confirm there are no per-stream latest-observation bursts or health-page MQTT feeds, CPU returns to the site's normal steady state, and a controlled status change appears within one refresh interval.
+9. Leave the page open for at least two minutes while watching server logs and container CPU. Expect requests containing no more than 50 health stream IDs, with no more than two health requests in flight, on entry and approximately every 30 seconds; confirm there are no per-stream latest-observation bursts or health-page MQTT feeds, CPU returns to the site's normal steady state, and a controlled status change appears within one refresh interval.
 10. For release validation, confirm a healthy camera's latest connection-status timestamp advances at least once within 60 seconds and remains queryable after the hourly retention job. Confirm a stopped driver does not publish a heartbeat and its stale value can still age out.
 
 Hardware fault tests must follow the site's approved procedures. Do not create an uncontrolled radiation, tamper, or traffic condition solely to exercise the interface.
@@ -73,4 +73,4 @@ Hardware fault tests must follow the site's approved procedures. Do not create a
 | A recent change is not shown immediately | Wait for the next 30-second refresh. Health status can lag the source by up to one refresh interval. |
 | Occupancy duration is missing or unexpected | Verify system clocks, confirm the Lane System publishes `occupancyStatus`, and check that the RPM's daily-file/status input reports both occupancy entry and exit. |
 | Page is empty in a scoped URL | Confirm at least one lane carries that operational-view key. Empty and invalid views intentionally fail closed. |
-| CPU remains high while the page is open | Check server logs for one batch per configured node approximately every 30 seconds. If the Viewer issues per-stream latest-observation requests or opens per-stream health MQTT feeds, confirm the deployed image contains the OSCAR 4.0.0 Status of Health performance correction. |
+| CPU remains high while the page is open | Check server logs for latest-observation batches of at most 50 stream IDs, no more than two concurrent health requests, and a refresh approximately every 30 seconds. If the Viewer sends oversized or per-stream latest-observation requests or opens per-stream health MQTT feeds, confirm the deployed image contains the OSCAR 4.0.0 Status of Health performance correction. |

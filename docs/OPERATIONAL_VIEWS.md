@@ -35,6 +35,6 @@ https://oscar.example/
 
 Invalid keys and valid keys with no assigned lanes fail closed and load no lane data. Scoped dashboards, events, maps, national statistics, generated reports, alarm transfer, and Status of Health use only the lanes in the active view.
 
-The Viewer preserves `?view=<key>` when the operator selects the Status of Health icon. Consequently, `/health/` shows all discovered lanes, while `/health/?view=north-gate` shows every lane assigned to `north-gate`. Connection, fault, and occupancy status is refreshed for only those visible lanes with one batched latest-observation request per configured node on entry and every 30 seconds.
+The Viewer preserves `?view=<key>` when the operator selects the Status of Health icon. Consequently, `/health/` shows all discovered lanes, while `/health/?view=north-gate` shows every lane assigned to `north-gate`. Connection, fault, and occupancy status is refreshed for only those visible lanes on entry and every 30 seconds. Requests contain at most 50 health streams, and the Viewer allows no more than two health requests in flight across all configured nodes.
 
 Operational views are a workstation presentation boundary, not an authorization boundary. Anyone authorized to use the unscoped root URL can still see all lanes. Use network controls and OSCAR authentication if view URLs must be restricted to particular workstations or users.
