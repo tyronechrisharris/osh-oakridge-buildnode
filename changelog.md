@@ -32,6 +32,8 @@ All notable changes to this project will be documented in this file.
 - Add complete English, Spanish, French, and Greek interface and operator-manual coverage for alarm transfer
 - Package the maintained release guides and all four localized operator manuals in the connected ZIP while excluding legacy pre-4.0 manuals
 - Validate changelog, deployment, and localized manual version labels against the release tag
+- Remove deprecated Viewer install dependencies, apply safely compatible dependency patches, and reject future deprecated lockfile entries during builds
+- Update the Bnd and Java build configuration so Gradle 8.5 emits no Gradle feature deprecations and remains compatible with the Gradle 9 migration path
 - Normalize the persisted SensorHub configuration to owner-only writable permissions (`0600`), repairing overly restrictive copies created by earlier releases
 - Document that CSV imports remain in memory until the global Save action completes and require restart verification before acceptance
 - Stamp and validate the OSCAR semantic version in the container image's OCI metadata instead of inheriting the base operating-system version label
