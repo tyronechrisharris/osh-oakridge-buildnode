@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 ## Changes
 - Add a localized Status of Health page showing every visible lane, RPM and camera connectivity, gamma high/low, neutron high, tamper, and configurable extended-occupancy faults
 - Publish a canonical lane occupancy-status stream so extended occupancy works consistently with Rapiscan, Aspect, and RS350 RPMs
-- Publish FFmpeg camera connection-state telemetry for current health monitoring
+- Publish FFmpeg camera connection-state telemetry on lifecycle transitions and every 30 seconds, keeping healthy camera state current through hourly database cleanup while allowing a stopped publisher's stale value to age out
 - Produce valid FFmpeg MP4/HLS recordings from H.264 cameras by requiring discovered video dimensions and preserving packet PTS, DTS, duration, stream index, and time base during remuxing
 - Make FFmpeg transcoder queues thread-safe and blocking, preserve native packet ownership and delayed-output flushing, surface worker failures, and prevent overlapping pipeline generations during stop, restart, or reinitialization
 - Keep MP4 packet delivery ordered with recording close so healthy occupancy clips cannot finalize before queued video packets are written

@@ -15,7 +15,7 @@ Operational views are a presentation boundary, not an authorization mechanism. S
 | Group | Meaning |
 | --- | --- |
 | RPM connection | **Online** or **Offline** from the RPM connection-status stream. **Waiting** means that the Viewer has not received a usable current value. |
-| Camera connections | One indicator per configured FFmpeg camera. OSCAR 4.0.0 publishes an explicit connection value after stream startup, reconnection failure, and shutdown. |
+| Camera connections | One indicator per configured FFmpeg camera. OSCAR 4.0.0 publishes an explicit connection value after stream startup, reconnection failure, and shutdown, then republishes the current value every 30 seconds while the driver is running. |
 | Gamma high / gamma low / neutron high | **Fault**, **Clear**, or **Unknown** from the corresponding detector alarm-state telemetry. Missing or failed telemetry remains Unknown rather than appearing clear. |
 | Tamper | **Fault**, **Clear**, or **Unknown** from the lane's tamper telemetry. |
 | Extended occupancy | Active when the lane's canonical `occupancyStatus` remains occupied longer than the configured threshold. This status is model-independent across Rapiscan, Aspect, and RS350 RPMs. |
@@ -33,6 +33,8 @@ A test RPM emulator may establish a deterministic initial state by sending the p
 ## Current values and refresh interval
 
 When the page opens, the Viewer sends one batched latest-observation request to each configured node. It repeats that per-node refresh every 30 seconds instead of opening a real-time MQTT feed for every health stream. This bounds health-page load by the number of configured nodes rather than by the number of lanes, cameras, and fault streams.
+
+The FFmpeg driver also republishes each camera's unchanged connection state every 30 seconds. Connection-status observations older than one hour are removed by the normal database-retention job, so the heartbeat keeps a healthy running camera current without weakening stale-data detection. If the driver stops publishing, its last value ages out and the Viewer returns to **Waiting** rather than displaying an indefinitely stale **Online** state.
 
 Connection, fault, and occupancy changes can therefore take up to one 30-second refresh interval to appear. Once an active occupancy has been observed, its elapsed-time display continues to advance between refreshes.
 
@@ -53,6 +55,7 @@ Changing the threshold re-evaluates occupancies already in progress. It does not
 7. Reload the browser and verify the threshold persists and periodic status updates resume.
 8. Confirm that an unavailable node or missing telemetry is shown as waiting/offline rather than healthy.
 9. Leave the page open for at least two minutes while watching server logs and container CPU. Expect approximately one batched latest-observation request per configured node every 30 seconds; confirm there are no per-stream latest-observation bursts or health-page MQTT feeds, CPU returns to the site's normal steady state, and a controlled status change appears within one refresh interval.
+10. For release validation, confirm a healthy camera's latest connection-status timestamp advances at least once within 60 seconds and remains queryable after the hourly retention job. Confirm a stopped driver does not publish a heartbeat and its stale value can still age out.
 
 Hardware fault tests must follow the site's approved procedures. Do not create an uncontrolled radiation, tamper, or traffic condition solely to exercise the interface.
 
@@ -62,7 +65,7 @@ Hardware fault tests must follow the site's approved procedures. Do not create a
 | --- | --- |
 | Lane is missing | Check node reachability, lane discovery, operational-view assignment, and the exact `?view=` key. |
 | RPM remains Waiting | Verify the RPM driver exposes `connectionStatus`, the stream is reachable, and the Viewer can query its latest observation. |
-| Camera remains Waiting | Confirm the lane generated the FFmpeg child, the child is running OSCAR 4.0.0 code, and its connection-status datastream was discovered. |
+| Camera remains Waiting | Confirm the lane generated the FFmpeg child, the child is running OSCAR 4.0.0 code with the 30-second connection heartbeat, and its connection-status datastream was discovered. Query the latest observation twice at least 30 seconds apart; its timestamp should advance while the driver is running. If it does not, inspect the FFmpeg reconnect/heartbeat logs and deployed image. |
 | Camera shows Offline | Verify RTSP host, port, credentials, codec/path, network reachability, and FFmpeg reconnect logs. |
 | Fault remains Unknown | Confirm the expected detector or tamper datastream exists, its latest observation is readable, and the next per-node refresh completes. Unknown is deliberately not treated as Clear. |
 | Rapiscan tamper remains Unknown while other values update | This can be correct after a fresh database or driver connection: Rapiscan sends `TT` and `TC` on transitions rather than periodically. Confirm the RPM has emitted an explicit tamper or tamper-clear event. A test emulator with a known-clear modeled state should emit `TC` when the client connects. Do not treat connection success as tamper clear. |
