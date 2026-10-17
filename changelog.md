@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Document a one-to-two-second camera keyframe interval and provide a one-second closed-GOP preparation path for the 50-camera emulator while retaining low-CPU stream-copy publishing
 - Make video-retention compaction fail-safe by validating a decoded frame and durably replacing the original only after the compacted clip is complete, while preserving the source clip on every failure path
 - Refresh Status of Health in globally limited batches of at most 50 streams on entry and every 30 seconds, with 10-second request deadlines, replacing per-stream real-time MQTT feeds while avoiding oversized requests, recovering from stalled nodes, and bounding CPU and server load at large sites
+- Resolve each eligible batched latest-health read with one indexed PostgreSQL lookup per stream so query cost does not grow with retained observation history
 - Keep Rapiscan tamper status Unknown until an explicit `TT` or `TC` transition is observed; an online RPM connection is not treated as proof of tamper clear
 - Apply event filters across the full database result set and add PostgreSQL indexes for OSCAR event-filter queries
 - Add URL-scoped operational views so one OSCAR deployment can present different lane groups to different workstations

@@ -125,6 +125,8 @@ Docker Compose mounts secrets read-only. On Ubuntu, the setup CLI makes `secrets
 
 The application configuration is copied into the `oscar_state` volume on first startup. Runtime configuration saves update only that persistent copy. Application libraries and viewer assets remain read-only in the image. PostgreSQL data is stored in the `postgres_data` volume.
 
+The gateway gives content-hashed Viewer files under `/_next/static/` a private, one-year immutable browser cache policy, while `/sw.js` is always revalidated. This prevents repeated full-route navigations from downloading the same application bundles again without allowing a shared proxy to cache an authenticated response. HTML and API responses keep their normal revalidation behavior.
+
 `oscar stop` retains containers and both data volumes. Never run `docker compose down --volumes` unless permanent deletion of all OSCAR and PostgreSQL data is explicitly intended.
 
 WebID is disabled by default. Failure to reach an optional configured WebID endpoint must not prevent OSCAR from starting.
