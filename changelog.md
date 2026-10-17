@@ -23,7 +23,10 @@ All notable changes to this project will be documented in this file.
 - Make video-retention compaction fail-safe by validating a decoded frame and durably replacing the original only after the compacted clip is complete, while preserving the source clip on every failure path
 - Refresh Status of Health in globally limited batches of at most 50 streams on entry and every 30 seconds, with 10-second request deadlines, replacing per-stream real-time MQTT feeds while avoiding oversized requests, recovering from stalled nodes, and bounding CPU and server load at large sites
 - Resolve each eligible batched latest-health read with one indexed PostgreSQL lookup per stream so query cost does not grow with retained observation history
-- Keep Rapiscan tamper status Unknown until an explicit `TT` or `TC` transition is observed; an online RPM connection is not treated as proof of tamper clear
+- Publish a Clear tamper baseline whenever the Rapiscan driver establishes or re-establishes an RPM connection, before processing later `TT` and `TC` transitions
+- Replace orphan-prone Rapiscan reader threads with one close-aware pooled reader per connection, stop and join the old reader before reconnecting, exit cleanly at end-of-stream, and preserve concurrent input for all 50 lanes
+- Accept an RPM occupancy summary immediately after a mid-occupancy connection by recording a zero neutron maximum when no neutron sample has arrived yet, instead of terminating the message reader
+- Keep Dashboard-to-Lane Details gamma and neutron streams connected through route handoff, bind them by datastream ID, and release subscriptions cleanly so live plots do not open as threshold-only or empty
 - Apply event filters across the full database result set and add PostgreSQL indexes for OSCAR event-filter queries
 - Add URL-scoped operational views so one OSCAR deployment can present different lane groups to different workstations
 - Scope viewer subscriptions, statistics, reports, navigation, health monitoring, and alarm notifications to the active operational view
