@@ -35,7 +35,7 @@ build-all.bat
 ./build-all.sh
 ```
 
-Both scripts use the locked Node.js dependency set, build the OSCAR viewer, compile the Java modules, and create:
+Both scripts use the locked Node.js dependency set, reject any npm advisory before building the OSCAR Viewer, compile the Java modules, and create:
 
 ```text
 build/distributions/oscar-<version>.zip
@@ -51,7 +51,7 @@ For a full-system test, extract the newly built release into a clean directory a
 
 Do not reuse a published version number for different production images. During connected pre-release iteration under the same version, explicitly rebuild the intended tag before `upgrade`: on Ubuntu or macOS, use `OSCAR_VERSION=3.9.1 docker compose build oscar`; in PowerShell, set `$env:OSCAR_VERSION = '3.9.1'` before running `docker compose build oscar`. Building without the explicit override before `upgrade` can reuse the previous version from `.env` and produce the wrong tag. If an image must be removed instead, first run `docker compose down` without `--volumes`, then run `docker image rm oscar:3.9.1`; a running or stopped Compose container can otherwise keep the image referenced.
 
-For isolated Viewer development, `cd web/oscar-viewer`, run `npm ci`, and then run `npm run dev`. This is useful for UI iteration against reachable OSCAR nodes, but it does not validate the packaged Viewer, FFmpeg camera telemetry, PostgreSQL filtering, container configuration, or the upgrade path. Use the release ZIP for final system testing.
+Viewer builds require Node.js 22.12 or newer on a supported even-numbered release line (22, 24, or 26). For isolated Viewer development, `cd web/oscar-viewer`, run `npm ci`, `npm run audit:dependencies`, and then `npm run dev`. This is useful for UI iteration against reachable OSCAR nodes, but it does not validate the packaged Viewer, FFmpeg camera telemetry, PostgreSQL filtering, container configuration, or the upgrade path. Use the release ZIP for final system testing.
 
 ## Developer documentation
 

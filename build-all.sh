@@ -14,6 +14,7 @@ node tools/validate-release-metadata.js
 (
     cd web/oscar-viewer
     npm ci
+    npm run audit:dependencies
     npm run build
 )
 

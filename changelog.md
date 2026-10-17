@@ -32,7 +32,7 @@ All notable changes to this project will be documented in this file.
 - Add complete English, Spanish, French, and Greek interface and operator-manual coverage for alarm transfer
 - Package the maintained release guides and all four localized operator manuals in the connected ZIP while excluding obsolete legacy manuals
 - Validate changelog, deployment, and localized manual version labels against the release tag
-- Remove deprecated Viewer install dependencies, apply safely compatible dependency patches, and reject future deprecated lockfile entries during builds
+- Migrate the Viewer to Next.js 16, React 19, Cypress 16, and Vite 8; remove obsolete vulnerable tooling, eliminate all known npm audit advisories and deprecated locked packages, and enforce both checks in release builds
 - Update the Bnd and Java build configuration so Gradle 8.5 emits no Gradle feature deprecations and remains compatible with the Gradle 9 migration path
 - Normalize the persisted SensorHub configuration to owner-only writable permissions (`0600`), repairing overly restrictive copies created by earlier releases
 - Document that CSV imports remain in memory until the global Save action completes and require restart verification before acceptance
