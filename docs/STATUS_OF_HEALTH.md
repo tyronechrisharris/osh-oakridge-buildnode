@@ -24,6 +24,20 @@ Operational views are a presentation boundary, not an authorization mechanism. S
 
 Unknown or waiting connection or fault telemetry is intentionally not counted as healthy. A lane is healthy only when every expected RPM and camera has an explicit online value and each expected fault source has explicitly reported clear.
 
+## Dashboard indicators
+
+The dashboard shows a compact version of the same health snapshot beside every lane name:
+
+| Indicator | Meaning |
+| --- | --- |
+| Antenna | RPM connection. Green is Online, red with a slash is Offline, and gray is Unknown. |
+| Video camera | One icon for each configured camera, in camera-name order. Green is Online, red with a slash is Offline, and gray is Unknown. |
+| `γ↑` / `γ↓` / `n↑` | Gamma-high, gamma-low, and neutron-high state. Red means active and gray means the current state is Unknown. Clear radiation faults are hidden to keep the lane card compact. |
+| Warning triangle | Tamper state. Red means active and gray means Unknown. An active tamper also shows the existing clear-tamper action. |
+| Timer | Extended occupancy. Red means the configured threshold has been exceeded and gray means occupancy telemetry is Unknown. |
+
+Hover over a lane name or indicator for its label; assistive technology receives the same labels directly. The icons use both shapes and colors so color alone is not required. Selecting the card still opens Lane Details; keyboard users can select it with Enter or Space.
+
 ### Rapiscan tamper startup state
 
 Rapiscan tamper messages are transition events, not a periodically repeated snapshot. A unit sends `TT` when a monitored door or power condition enters tamper and `TC` when that condition clears. The [DOE/PNNL Rapiscan maintenance guide](https://d5.pnnl.gov/sites/default/files/2023-02/RPM_Maint_Guide_Drawings.pdf) specifies that each is sent only once for the corresponding power or cabinet-door transition; it does not require `TC` merely because OSCAR connected while the cabinet was already closed. Therefore a new OSCAR database can correctly show **Tamper: Unknown** until the RPM reports either transition. OSCAR does not infer **Clear** from an active TCP connection, because doing so would display an unobserved safety state as healthy.
@@ -32,7 +46,9 @@ A test RPM emulator may establish a deterministic initial state by sending the p
 
 ## Current values and refresh interval
 
-When the page opens, the Viewer fetches the latest observations in batches of at most 50 health streams and repeats the refresh every 30 seconds instead of opening a real-time MQTT feed for every health stream. No more than two health requests run at once across all configured nodes, and batches are scheduled round-robin so a large node does not delay another node's first snapshot. A failed batch remains **Waiting** and does not prevent successful batches from updating. This avoids oversized URLs and bounds concurrent database work at large sites.
+After lane discovery completes, the Status of Health page or dashboard fetches the latest observations in batches of at most 50 health streams and repeats the refresh every 30 seconds instead of opening a real-time MQTT feed for every health stream. The two routes share one implementation and only the visible route mounts it, so opening the dashboard does not duplicate the Status of Health polling loop. No more than two health requests run at once across all configured nodes, and batches are scheduled round-robin so a large node does not delay another node's first snapshot. Each batch has a 10-second deadline; the production browser request is cancelled at that deadline so a stalled node cannot freeze later refreshes. A failed batch or a successful response missing an expected current observation changes that status to **Waiting** and does not prevent successful batches from updating. Observations older than the last accepted timestamp cannot restore a stale state after it becomes Waiting. This avoids oversized URLs and bounds concurrent database work at large sites.
+
+The dashboard retains only the existing gamma and neutron real-time listeners needed to sound new-alarm audio; those listeners are removed when the dashboard unmounts. Connection, camera, tamper, and occupancy icons do not create additional MQTT subscriptions. The icon rendering itself is lightweight SVG. Extended occupancy schedules only the next exact lane threshold crossing and then schedules the following one, rather than rerendering every lane once per second. Clearing tamper queues one immediate post-command health refresh, even when a periodic refresh is already running. At a typical 50-lane site with two cameras per lane, the health snapshot is approximately seven small latest-state requests every 30 seconds per node (the exact number depends on installed streams), with at most two requests in flight.
 
 The FFmpeg driver also republishes each camera's unchanged connection state every 30 seconds. Connection-status observations older than one hour are removed by the normal database-retention job, so the heartbeat keeps a healthy running camera current without weakening stale-data detection. If the driver stops publishing, its last value ages out and the Viewer returns to **Waiting** rather than displaying an indefinitely stale **Online** state.
 
@@ -54,8 +70,9 @@ Changing the threshold re-evaluates occupancies already in progress. It does not
 6. Set the extended-occupancy threshold to one minute, run a controlled occupancy beyond one minute on each installed RPM model, and verify the elapsed timer and fault indicator use the canonical lane occupancy status.
 7. Reload the browser and verify the threshold persists and periodic status updates resume.
 8. Confirm that an unavailable node or missing telemetry is shown as waiting/offline rather than healthy.
-9. Leave the page open for at least two minutes while watching server logs and container CPU. Expect requests containing no more than 50 health stream IDs, with no more than two health requests in flight, on entry and approximately every 30 seconds; confirm there are no per-stream latest-observation bursts or health-page MQTT feeds, CPU returns to the site's normal steady state, and a controlled status change appears within one refresh interval.
-10. For release validation, confirm a healthy camera's latest connection-status timestamp advances at least once within 60 seconds and remains queryable after the hourly retention job. Confirm a stopped driver does not publish a heartbeat and its stale value can still age out.
+9. Repeat steps 3 through 8 using the compact indicators beside each lane on the dashboard. Confirm every expected camera has its own icon, clear fault icons remain hidden, active and Unknown states are distinguishable, and the lane card still opens Lane Details.
+10. Leave the dashboard and then the Status of Health page open for at least two minutes each while watching server logs and container CPU. Expect requests containing no more than 50 health stream IDs, with no more than two health requests in flight, on entry and approximately every 30 seconds; confirm there are no per-stream latest-observation bursts or health-page MQTT feeds, no health listeners accumulate after navigating between pages, CPU returns to the site's normal steady state, and a controlled status change appears within one refresh interval.
+11. For release validation, confirm a healthy camera's latest connection-status timestamp advances at least once within 60 seconds and remains queryable after the hourly retention job. Confirm a stopped driver does not publish a heartbeat and its stale value can still age out.
 
 Hardware fault tests must follow the site's approved procedures. Do not create an uncontrolled radiation, tamper, or traffic condition solely to exercise the interface.
 
@@ -73,4 +90,4 @@ Hardware fault tests must follow the site's approved procedures. Do not create a
 | A recent change is not shown immediately | Wait for the next 30-second refresh. Health status can lag the source by up to one refresh interval. |
 | Occupancy duration is missing or unexpected | Verify system clocks, confirm the Lane System publishes `occupancyStatus`, and check that the RPM's daily-file/status input reports both occupancy entry and exit. |
 | Page is empty in a scoped URL | Confirm at least one lane carries that operational-view key. Empty and invalid views intentionally fail closed. |
-| CPU remains high while the page is open | Check server logs for latest-observation batches of at most 50 stream IDs, no more than two concurrent health requests, and a refresh approximately every 30 seconds. If the Viewer sends oversized or per-stream latest-observation requests or opens per-stream health MQTT feeds, confirm the deployed image contains the OSCAR 3.9.1 Status of Health performance correction. |
+| CPU remains high while the page is open | Check server logs for latest-observation batches of at most 50 stream IDs, no more than two concurrent health requests, a 10-second deadline for a stalled batch, and a refresh approximately every 30 seconds. If the Viewer sends oversized or per-stream latest-observation requests or opens per-stream health MQTT feeds, confirm the deployed image contains the OSCAR 3.9.1 Status of Health performance correction. |
