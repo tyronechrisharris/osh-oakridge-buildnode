@@ -2,7 +2,7 @@ apply from: gradle.oshCoreDir + '/common.gradle'
 description = ''
 
 allprojects {
-    version = "4.0.0"
+    version = "3.9.1"
 }
 
 subprojects {
@@ -83,7 +83,7 @@ distributions{
             }
             into("osh-node-oscar/documentation") {
                 // The files formerly copied from dist/documentation describe a
-                // pre-4.0 Admin UI and launch workflow. Package the maintained
+                // legacy Admin UI and launch workflow. Package the maintained
                 // release and feature guides instead of relabeling legacy docs.
                 from('dist/release') {
                     include 'QUICKSTART.md'

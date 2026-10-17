@@ -1,6 +1,6 @@
 # Live Video
 
-OSCAR 4.0.0 starts Lane Details video only after the HLS stream has received a decodable H.264 keyframe. Until that point, the Viewer shows **Preparing live video** instead of presenting an empty player. If preparation or playback cannot recover within the bounded retry period, the Viewer shows a localized error and a **Retry** action.
+OSCAR 3.9.1 starts Lane Details video only after the HLS stream has received a decodable H.264 keyframe. Until that point, the Viewer shows **Preparing live video** instead of presenting an empty player. If preparation or playback cannot recover within the bounded retry period, the Viewer shows a localized error and a **Retry** action.
 
 ## Camera requirements
 
@@ -54,6 +54,6 @@ The Viewer retries transient playlist and media failures without repeatedly issu
 | --- | --- |
 | Preparing lasts longer than expected | Check camera connectivity, confirm the stream is H.264, and measure the source keyframe interval. A long GOP directly increases worst-case startup time. |
 | Live video could not be played | Restore camera/network reachability, inspect FFmpeg reconnect logs, and select **Retry**. |
-| Player remains at `0:00` | Confirm the deployed OSCAR 4.0.0 image includes the keyframe-gated HLS and Viewer recovery fixes; inspect the first segment for a leading keyframe and valid H.264 parameter sets. |
+| Player remains at `0:00` | Confirm the deployed OSCAR 3.9.1 image includes the keyframe-gated HLS and Viewer recovery fixes; inspect the first segment for a leading keyframe and valid H.264 parameter sets. |
 | Emulator playback is slow to start | Run the emulator asset-preparation and validation scripts, then recreate the publisher containers. Runtime publishing should continue to use stream copy rather than live transcoding. |
 | Recordings fail after a live-video change | Treat this as a regression. Live HLS and MP4 share camera input but have separate output rules; run the recording acceptance test before release. |

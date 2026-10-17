@@ -1,6 +1,6 @@
 # Legacy documentation
 
-The files in this directory describe administration and launch workflows from OSCAR releases before 4.0.0. They are retained as historical source material and are intentionally excluded from connected and offline release packages.
+The files in this directory describe obsolete administration and launch workflows from earlier OSCAR releases. They are retained as historical source material and are intentionally excluded from connected and offline release packages.
 
 Current release documentation is maintained in:
 

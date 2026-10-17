@@ -204,7 +204,7 @@ jobs:
           done
 
           if grep -Eq 'OSCAR_System_Documentation_Manual_3\.5\.md|Node Administration\.pdf' "$listing"; then
-            echo "::error::Connected release contains legacy pre-4.0 documentation"
+            echo "::error::Connected release contains obsolete legacy documentation"
             exit 1
           fi
 
@@ -256,7 +256,7 @@ jobs:
             done
 
             if grep -Eq 'OSCAR_System_Documentation_Manual_3\.5\.md|Node Administration\.pdf' "$listing"; then
-              echo "::error::Offline $profile bundle contains legacy pre-4.0 documentation"
+              echo "::error::Offline $profile bundle contains obsolete legacy documentation"
               exit 1
             fi
           done
