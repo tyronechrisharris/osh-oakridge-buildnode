@@ -221,6 +221,15 @@ command still fails, services are resumed, automatic backup/WAL pruning is skipp
 unconfirmed lane/day becomes segment-deletion eligible. Correct the journal inconsistency or let a
 later successful backup establish the missing protection rather than fabricating a receipt.
 
+The confirmation bridge does not relax the backup root's administrator-only protection. It first
+revalidates the exact authenticated `oscar-state.tar.gz` member inventory in a networkless,
+read-only, capability-free container. A separate one-shot extractor can read only that root-owned
+archive and a new private snapshot directory; it cannot see the backup root. On Ubuntu, the
+capability-free extractor is followed by an administrator-side ownership handoff. On Windows, the
+extractor receives only the `CHOWN` capability needed for the same handoff. The Java confirmation
+then runs as OSCAR UID/GID `10001:10001` with the snapshot mounted read-only. The snapshot is always
+removed and previously running application services are resumed on success or failure.
+
 ## Verify or re-verify a backup
 
 `backup` performs this verification automatically. Use `backup-verify` to re-check a backup before
