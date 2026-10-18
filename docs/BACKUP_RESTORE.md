@@ -189,7 +189,8 @@ Expected stages are:
 
 1. gateway/OSCAR quiesce if they were running;
 2. active archive-object checksum verification and catalog/filesystem reconciliation while writers
-   remain quiesced;
+   remain quiesced (the already-authenticated root-level `.oscar-storage-root` is host metadata and
+   is excluded from the archive-object inventory);
 3. PostgreSQL LSN and WAL switch;
 4. streamed `pg_basebackup`;
 5. PostgreSQL stop followed by application-state, archive, and stable WAL snapshots;

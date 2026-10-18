@@ -867,16 +867,20 @@ function Test-ArchiveFilesystemRegistration([switch]$RejectPartials) {
                 $failures++
                 continue
             }
-            if (-not (Test-RelativeObjectPath $relative)) {
-                Write-Error "Unsafe archive filesystem path: $relative" -ErrorAction Continue
-                $failures++
-                continue
-            }
+            # The administrator-owned root identity is host metadata, not an
+            # archive object. The command dispatcher authenticates it before
+            # every live archive operation; only its exact root-level name is
+            # exempt from the intentionally narrower object-path grammar.
             if ($relative -ceq '.oscar-storage-root') {
                 if ($item.PSIsContainer -or $item -isnot [IO.FileInfo]) {
                     Write-Error "Archive root identity marker is not a regular file: $relative" -ErrorAction Continue
                     $failures++
                 }
+                continue
+            }
+            if (-not (Test-RelativeObjectPath $relative)) {
+                Write-Error "Unsafe archive filesystem path: $relative" -ErrorAction Continue
+                $failures++
                 continue
             }
             $validDirectory = $relative -ceq 'datasets' -or $relative -ceq 'datasets/observations' -or

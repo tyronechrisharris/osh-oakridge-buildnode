@@ -910,11 +910,10 @@ audit_archive_filesystem() (
             continue
         fi
         relative=${entry#"$root_real"/}
-        valid_relative_path "$relative" || {
-            printf 'Unsafe archive filesystem path: %s\n' "$entry" >&2
-            failures=$((failures + 1))
-            continue
-        }
+        # The administrator-owned root identity is host metadata, not an
+        # archive object. The command dispatcher authenticates it before any
+        # live archive operation; recognize only this exact root-level name
+        # here before applying the deliberately narrower object-path grammar.
         if [[ $relative == .oscar-storage-root ]]; then
             [[ -f $entry ]] || {
                 printf 'Archive root identity marker is not a regular file: %s\n' "$entry" >&2
@@ -922,6 +921,11 @@ audit_archive_filesystem() (
             }
             continue
         fi
+        valid_relative_path "$relative" || {
+            printf 'Unsafe archive filesystem path: %s\n' "$entry" >&2
+            failures=$((failures + 1))
+            continue
+        }
         if [[ -d $entry ]]; then
             valid_archive_directory_path "$relative" || {
                 printf 'Archive directory is outside the approved datasets layout: %s\n' "$relative" >&2

@@ -1469,6 +1469,7 @@ bash -c '
 }
 
 mkdir -p "$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED"
+printf 'authenticated separately by the storage-root identity gate\n' >"$test_root/reconcile-ok/.oscar-storage-root"
 printf 'registered' >"$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet"
 printf 'writing' >"$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-22222222-2222-4222-8222-222222222222.parquet.partial"
 printf 'helper writing' >"$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-44444444-4444-4444-8444-444444444444.parquet.partial.a1b2c3"
@@ -1506,6 +1507,19 @@ if bash -c '
     audit_archive_filesystem true
 ' _ "$shell_script" "$test_root/reconcile-partial-link" >/dev/null 2>&1; then
     printf 'Bash quiesced archive audit accepted a symlinked partial suffix variant.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/reconcile-nested-marker/datasets"
+printf 'not a root identity\n' >"$test_root/reconcile-nested-marker/datasets/.oscar-storage-root"
+if bash -c '
+    storage_script=$1; test_archive=$2
+    set -- help; source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    psql_admin() { :; }
+    audit_archive_filesystem
+' _ "$shell_script" "$test_root/reconcile-nested-marker" >/dev/null 2>&1; then
+    printf 'Bash archive reconciliation exempted a nested storage-root marker.\n' >&2
     exit 1
 fi
 
@@ -1876,6 +1890,13 @@ if command -v pwsh >/dev/null 2>&1; then
                 throw "PowerShell quiesced archive audit accepted a symlinked partial suffix variant"
             } catch {
                 if ($_.Exception.Message -eq "PowerShell quiesced archive audit accepted a symlinked partial suffix variant") { throw }
+            }
+            $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "reconcile-nested-marker"
+            try {
+                Test-ArchiveFilesystemRegistration
+                throw "PowerShell archive reconciliation exempted a nested storage-root marker"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell archive reconciliation exempted a nested storage-root marker") { throw }
             }
             $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "reconcile-ok"
             $orphan = Join-Path $ArchiveDirectory "datasets/observations/generation-orphan.parquet"

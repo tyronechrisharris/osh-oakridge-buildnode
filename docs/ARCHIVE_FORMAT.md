@@ -30,8 +30,10 @@ The `date=` and `profile=` directories are Hive-style partitions. The date is th
 generation window start. The standard profile name is `RAW_GATED`.
 
 `.oscar-storage-root` is host-local administrator metadata, not an archive object. It is validated
-separately, excluded from catalog orphan reconciliation and coordinated backup tar payloads, and
-preserved across restore. It must never be copied from a source deployment to claim a target root.
+and authenticated before live archive commands, then recognized only at that exact root-level name
+so catalog orphan reconciliation can exclude it. It is also excluded from coordinated backup tar
+payloads and preserved across restore. It must never be copied from a source deployment to claim a
+target root; nested or similarly named files receive no exemption from archive-layout validation.
 
 Do not infer query authorization from directory names or a file's presence. OSCAR reads only
 objects whose generation is `ACTIVE` or `SEALED` in PostgreSQL and whose resolved path stays under
