@@ -167,11 +167,11 @@ networks:
 
 volumes:
   oscar_state:
-    labels:
-      com.botts.oscar.deployment-id: "${OSCAR_DEPLOYMENT_ID:-uninitialized}"
+    external: true
+    name: oscar_oscar_state
   postgres_data:
-    labels:
-      com.botts.oscar.deployment-id: "${OSCAR_DEPLOYMENT_ID:-uninitialized}"
+    external: true
+    name: oscar_postgres_data
 
 secrets:
   oscar_admin_password:

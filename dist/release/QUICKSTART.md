@@ -141,7 +141,9 @@ requires.
 If a deliberately retained pre-label deployment uses unlabelled Docker volumes, follow the
 one-time `-AdoptLegacyVolumes` (Windows) or `--adopt-legacy-volumes` (Ubuntu) procedure in the
 Administrator Guide. Preserve its `.oscar-volume-adoption` receipt with `.env`, `secrets`, and
-`tls` during later clean-directory upgrades; never use adoption to join unrelated volumes.
+`tls` during later clean-directory upgrades; never use adoption to join unrelated volumes. Run
+upgrades through `oscar.bat` or `oscar.sh`, not a direct `docker compose up`: setup validates the
+exact external named volumes before Compose attaches them.
 If verified pre-3.9.2 archive/WAL/backup roots are nonempty and have no root marker, the upgrade
 also requires the separate one-time `-AdoptLegacyStorageRoots` (Windows) or
 `--adopt-legacy-storage-roots` (Ubuntu) switch. It records audited adoption metadata in each

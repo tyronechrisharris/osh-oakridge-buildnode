@@ -47,7 +47,7 @@ All notable changes to this project will be documented in this file.
 - Merge authenticated backup WAL into the append-only live archive without deleting or replacing existing WAL/history; preflight every collision and accept only byte-identical duplicates
 - Reconcile the entire cold-archive root against the catalog and approved `datasets/` shape, including an otherwise empty/missing `datasets` tree, so unexpected top-level objects fail status, verification, and backup before publication
 - Re-verify every payload against the bundle's exact SHA-256 inventory and always load the checksum-verified `offline-images.tar` during offline initialization or upgrade, even when same-version tags already exist locally, so stale development images cannot shadow the selected bundle; the co-packaged unsigned manifest provides integrity but not publisher/origin authentication
-- Label persistent Docker volumes with a deployment UUID, reject missing, foreign, or mixed ownership, and require an explicit audited adoption receipt before reusing unlabelled legacy volumes
+- Create persistent Docker volumes through setup, label new volumes with a deployment UUID, reject missing, foreign, or mixed ownership, and require an explicit audited adoption receipt before reusing unlabelled legacy volumes; declare the exact names external to Compose so upgrades never offer to recreate adopted data while reconciling immutable labels
 - Add explicit-confirmation restore and preservation of pre-restore deployment credentials
 - Add external archive and WAL service bind mounts, an isolated administrator-owned backup root exposed only to scoped one-shot helpers, and size-rotated Docker logs
 - Add archive status and full object-checksum verification commands

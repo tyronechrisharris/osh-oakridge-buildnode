@@ -81,6 +81,9 @@ jobs:
           fi
           echo "No pgdata directory found — check passed"
 
+      - name: Prove adopted Compose volumes are preserved
+        run: ./tools/test-compose-volume-preservation.sh
+
   tiered-storage-postgres:
     name: Tiered Storage / PostgreSQL
     needs: validate

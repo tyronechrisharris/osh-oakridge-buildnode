@@ -7,6 +7,7 @@ shell_script="$repo_root/dist/release/oscar-storage.sh"
 powershell_script="$repo_root/dist/release/oscar-storage.ps1"
 setup_shell_script="$repo_root/dist/release/oscar-setup.sh"
 setup_powershell_script="$repo_root/dist/release/oscar-setup.ps1"
+compose_file="$repo_root/dist/release/compose.yaml"
 archive_validator="$repo_root/dist/release/validate-storage-archive.sh"
 archive_object_helper="$repo_root/dist/release/docker/oscar/archive-object-helper.sh"
 test_root=$(mktemp -d "$repo_root/.storage-script-test.XXXXXX")
@@ -160,6 +161,17 @@ assert_contains 'grep -Fq "\\"objClass\\": \\"com\.botts\.impl\.service\.dailyfi
 assert_not_contains "grep -Fq '\"objClass" "$setup_shell_script"
 assert_contains 'for \(\$attempt = 1; \$attempt -le 30; \$attempt\+\+\)' "$setup_powershell_script"
 assert_contains 'after 30 seconds' "$setup_powershell_script"
+
+# Setup owns the named-volume lifecycle and validates either the immutable
+# deployment label or an exact legacy-adoption receipt before Compose starts.
+# Declaring these volumes external keeps Compose v5 from trying to reconcile
+# an immutable label on an adopted volume and offering to recreate live data.
+compose_volume_block=$(sed -n '/^volumes:$/,/^secrets:$/p' "$compose_file")
+expected_compose_volume_block=$'volumes:\n  oscar_state:\n    external: true\n    name: oscar_oscar_state\n  postgres_data:\n    external: true\n    name: oscar_postgres_data\n\nsecrets:'
+if [[ $compose_volume_block != "$expected_compose_volume_block" ]]; then
+    printf 'Compose named volumes must remain exact external resources owned by setup.\n' >&2
+    exit 1
+fi
 
 # A real pre-3.9.2 deployment does not have the backup-key binding. Upgrade may
 # add only that missing canonical binding; custom, duplicate, and current-release

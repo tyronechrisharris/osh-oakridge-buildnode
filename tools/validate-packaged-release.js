@@ -75,6 +75,20 @@ for (const relative of ['oscar-storage.sh', 'oscar-storage.ps1']) {
     }
 }
 
+const compose = fs.readFileSync(path.join(root, 'compose.yaml'), 'utf8');
+for (const [modelName, externalName] of [
+    ['oscar_state', 'oscar_oscar_state'],
+    ['postgres_data', 'oscar_postgres_data'],
+]) {
+    const definition = new RegExp(`^  ${modelName}:\\r?\\n    external: true\\r?\\n    name: ${externalName}$`, 'm');
+    if (!definition.test(compose)) {
+        fail(`compose.yaml must attach ${externalName} as an exact external volume`);
+    }
+}
+if (compose.includes('com.botts.oscar.deployment-id')) {
+    fail('compose.yaml must not reconcile immutable deployment labels on named volumes');
+}
+
 const expectedStorageDefaults = {
     OSCAR_ARCHIVE_DIR: '../oscar-storage/archive',
     OSCAR_WAL_ARCHIVE_DIR: '../oscar-storage/wal-archive',

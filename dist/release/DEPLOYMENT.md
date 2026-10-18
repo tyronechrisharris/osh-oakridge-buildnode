@@ -153,10 +153,10 @@ The backup key encrypts `.env`, deployment secrets, and TLS private material ins
 The gateway gives content-hashed Viewer files under `/_next/static/` a private, one-year immutable browser cache policy, while `/sw.js` is always revalidated. This prevents repeated full-route navigations from downloading the same application bundles again without allowing a shared proxy to cache an authenticated response. HTML and API responses keep their normal revalidation behavior.
 
 `oscar stop` retains containers, named data volumes, the archive/WAL bind mounts, and the external
-backup root. Never run `docker compose down --volumes` unless permanent deletion of OSCAR/PostgreSQL
-named-volume data is explicitly intended. Removing containers or volumes does not remove the host
-archive, WAL, or backup copies, so follow the records-destruction procedure rather than treating a
-Compose command as complete erasure.
+backup root. Do not use `docker compose down --volumes` as a records-destruction procedure: Compose
+skips OSCAR's external named volumes, and neither that command nor container removal deletes the
+archive, WAL, or backup roots. Authorized permanent destruction therefore requires the documented,
+explicit removal of every retained data location.
 
 WebID is disabled by default. Failure to reach an optional configured WebID endpoint must not prevent OSCAR from starting.
 
@@ -177,7 +177,7 @@ Every reported privilege flag for `oscar_app` must be false. A host scan must sh
 
 ## Upgrade
 
-For a 3.9.2-or-newer same-storage-profile upgrade, create and verify a coordinated backup first. A pre-3.9.2 release does not have that CLI; use that release's supported backup/export procedure and retain the old system read-only until the separately qualified migration is complete. Extract the new release into a clean sibling directory; do not overlay it on the previous release because files removed by the new version would otherwise remain in the image build context. Copy only `.env`, `secrets/`, and `tls/` from the existing deployment into the clean release directory. If the deployment has a `.oscar-volume-adoption` receipt, copy that file too; it is required to keep an intentionally adopted pair of unlabelled legacy volumes bound to the same deployment. Release archives do not contain these runtime files. Preserve the absolute `OSCAR_ARCHIVE_DIR`, `OSCAR_WAL_ARCHIVE_DIR`, and `OSCAR_BACKUP_DIR` values written by initialization; they deliberately point outside the versioned release and must continue to identify the existing storage. Custom relative storage paths are rejected because their meaning would change after relocation. Before starting services, use `docker compose config` to confirm the resolved archive and WAL bind sources, then inspect the single `OSCAR_BACKUP_DIR` entry in `.env` to confirm the external backup root. Compose uses the fixed `oscar` project name, so running the upgrade from this clean directory still addresses the existing containers and named data volumes. Then run:
+For a 3.9.2-or-newer same-storage-profile upgrade, create and verify a coordinated backup first. A pre-3.9.2 release does not have that CLI; use that release's supported backup/export procedure and retain the old system read-only until the separately qualified migration is complete. Extract the new release into a clean sibling directory; do not overlay it on the previous release because files removed by the new version would otherwise remain in the image build context. Copy only `.env`, `secrets/`, and `tls/` from the existing deployment into the clean release directory. If the deployment has a `.oscar-volume-adoption` receipt, copy that file too; it is required to keep an intentionally adopted pair of unlabelled legacy volumes bound to the same deployment. Release archives do not contain these runtime files. Preserve the absolute `OSCAR_ARCHIVE_DIR`, `OSCAR_WAL_ARCHIVE_DIR`, and `OSCAR_BACKUP_DIR` values written by initialization; they deliberately point outside the versioned release and must continue to identify the existing storage. Custom relative storage paths are rejected because their meaning would change after relocation. Before starting services, use `docker compose config` to confirm the resolved archive and WAL bind sources, then inspect the single `OSCAR_BACKUP_DIR` entry in `.env` to confirm the external backup root. Compose uses the fixed `oscar` project name for containers, while `compose.yaml` attaches the exact external volumes `oscar_oscar_state` and `oscar_postgres_data`. Setup, not Compose, owns their creation and validates their deployment identity before start or upgrade. This prevents Compose from attempting to reconcile immutable volume labels or offering to recreate an adopted legacy volume. Then run:
 
 ```powershell
 .\oscar.bat upgrade
@@ -196,8 +196,9 @@ recreates changed services, waits for health checks, and retains the fixed `osca
 `postgres_data` volumes. It never removes volumes. Confirm the result with `oscar.bat status`
 (Windows) or `sudo bash oscar.sh status` (Ubuntu).
 
-Current releases label both named volumes with `OSCAR_DEPLOYMENT_ID` and refuse missing, mixed, or
-foreign ownership. For a pre-label deployment only, first verify from the old release and Docker
+Setup creates both named volumes with an `OSCAR_DEPLOYMENT_ID` label and refuses missing, mixed, or
+foreign ownership. Compose treats those exact names as external resources and never creates or
+relabels them. For a pre-label deployment only, first verify from the old release and Docker
 metadata that **both** `oscar_oscar_state` and `oscar_postgres_data` belong together. Then acknowledge
 that one-time adoption with `oscar.bat upgrade -AdoptLegacyVolumes` or
 `sudo bash oscar.sh upgrade --adopt-legacy-volumes`. Setup records both immutable Docker volume

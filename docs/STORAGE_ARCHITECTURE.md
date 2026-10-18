@@ -63,6 +63,12 @@ service group, so the service can create data but the sticky bit prevents it fro
 root-owned marker. Backup storage is root-only. Backups exclude these host-local identities, and
 restore preserves and revalidates the target identities instead of trusting source markers.
 
+Setup creates the exact named volumes `oscar_oscar_state` and `oscar_postgres_data` and labels new
+volumes with the deployment UUID. The supported administration workflow validates ownership before
+invoking Compose. Compose declares those names as external resources, so it does not create,
+relabel, or offer to recreate them. A deliberately adopted pre-label volume is instead bound by its
+deployment-specific adoption receipt and immutable Docker creation time.
+
 PostgreSQL WAL publication uses a flushed temporary inode and an atomic, no-replace hard link for
 the final name, followed by file and directory fsync. A replay of an existing name succeeds only
 when its bytes compare identical; a mismatch or unsafe existing object fails hard so PostgreSQL

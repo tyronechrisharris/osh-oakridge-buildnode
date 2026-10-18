@@ -71,6 +71,9 @@ jobs:
           cache: npm
           cache-dependency-path: web/oscar-viewer/package-lock.json
 
+      - name: Prove adopted Compose volumes are preserved
+        run: ./tools/test-compose-volume-preservation.sh
+
       - name: Build and test the connected release
         run: ./build-all.sh
 

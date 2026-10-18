@@ -14,8 +14,9 @@ fallback.
 
 ## Safety rules
 
-1. Never use `docker compose down --volumes`, delete a named volume, or remove a cataloged archive
-   object unless permanent data loss is explicitly authorized and a verified backup is retained.
+1. Never treat `docker compose down --volumes` as data destruction; Compose skips OSCAR's external
+   named volumes. Never explicitly delete a named volume or remove a cataloged archive object unless
+   permanent data loss is authorized and a verified backup is retained.
 2. Never edit `.open`/`.seg` journal files, published daily CSVs/manifests, retained-media internals,
    Parquet files, or generation manifests in place.
 3. Run `archive verify` before enabling hot deletion, exporting evidence, or creating a cold purge

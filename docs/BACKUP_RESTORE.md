@@ -374,8 +374,9 @@ directories; custom credential paths are not claimed to work. A backed-up source
 different values from an older deployment, but restore replaces them with the target's validated
 canonical bindings before accepting the staged set.
 
-This merge keeps named-volume ownership labels aligned with `OSCAR_DEPLOYMENT_ID`, keeps Compose
-bound to the target archive and WAL directories, and retains the target's external backup root.
+This merge keeps named-volume ownership evidence (deployment labels or an exact legacy-adoption
+receipt) aligned with `OSCAR_DEPLOYMENT_ID`, keeps Compose bound to the target archive and WAL
+directories, and retains the target's external backup root.
 Restore checks volume ownership again
 after installing the merged environment and before starting services. On a same-host restore, the
 source and target local bindings are normally identical, so behavior is unchanged. On a cross-host
@@ -408,7 +409,8 @@ Also verify:
 
 - login and role enforcement over HTTPS;
 - the target hostname/port and the certificate presented for that endpoint;
-- `OSCAR_DEPLOYMENT_ID` still matches both named-volume labels;
+- `OSCAR_DEPLOYMENT_ID` still matches both named-volume labels, or the exact adoption receipt still
+  matches both deliberately retained pre-label volumes;
 - archive, WAL, backup, secret, TLS, and backup-key bindings still name the intended target paths;
 - SensorHub module/driver status and the expected lane inventory;
 - a recent event lookup by UUID and Event Details rendering;
