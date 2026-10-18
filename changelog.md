@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Make the daily journal a required driver dependency by default so startup or append failures cannot silently bypass source-record capture
 - Frame journal records with timestamp, length, and CRC32C; bound unforced data by time, record count, and byte count; recover only incomplete tails and fail visibly on complete-frame corruption
 - Publish immutable legacy daily CSVs with exact time-zone windows, SHA-256 manifests, atomic commit ordering, and a manifest-gated compatibility-observation cleanup path
+- Retry the bounded daily-file cleanup on every hourly maintenance pass after the midnight attempt, isolate it from unrelated purge failures, and retain all unsealed current-day compatibility rows until manifest-validated publication
 - Batch observation inserts with immediate `DataBlock` snapshots, prepared statements, PostgreSQL batch rewriting, and one statement-level datastream-range update per batch
 - Correct observation natural-key uniqueness for null fields, make exact replays idempotent and same-key corrections last-write-wins under the stable OSH ID, route archived corrections through generation-owned overlays even after hot-row deletion, and fail index creation visibly when a legacy database contains ambiguous duplicates
 - Preserve the sequential observation-ID high-water from every cataloged archive state so a restart cannot reuse public IDs after a cold copy is cataloged and the corresponding hot rows are optionally deleted

@@ -172,6 +172,12 @@ driver does not start. If a required append fails, the driver stops its reader i
 continuing without the source record. At day rollover, the service publishes the legacy CSV and a
 SHA-256 manifest atomically and marks the ledger `PUBLISHED` only after both verify.
 
+Compatibility observations are removed only for completed local-day windows whose ledger,
+manifest, CSV identity, and current CSV checksum all validate. The exact-midnight cleanup is an
+initial bounded attempt; the hourly maintenance task reruns the same oldest-first catch-up so a
+lane published just after midnight is retried without waiting another day. Current unsealed-day
+rows are never compacted merely to retain a latest value.
+
 The full journal contract is maintained in the modules repository at
 [`include/osh-oakridge-modules/docs/daily-file-journal-v1.md`](../include/osh-oakridge-modules/docs/daily-file-journal-v1.md).
 

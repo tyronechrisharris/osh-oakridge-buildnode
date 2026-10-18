@@ -13,7 +13,7 @@ hosts. macOS deployment and storage operations fail closed; it is not a supporte
 | --- | --- | --- | --- |
 | Selected raw detector observations | Copy to an `ACTIVE` Parquet generation when older than 30 days | `deleteHotAfterArchive=true`, valid Parquet and schema objects, active catalog generation, exact-row parity receipt, 7-day rollback grace, no applicable hold | No in the shipping profile; `deleteHotAfterArchive` defaults to `false` |
 | Other PostgreSQL observations and transactional records | Remain hot | Existing application policy | Not by the cold-tier scheduler |
-| Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV and v1 manifest before compatibility-observation cleanup | Journal files are not pressure-cleanup candidates |
+| Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV, v1 manifest, and `PUBLISHED` ledger before compatibility-observation cleanup; retry hourly if midnight publication is still in progress | Journal files are not pressure-cleanup candidates |
 | Alarm source MP4 | Convert after 7 days | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
 | Retained five-JPEG media set | Remains available | Complete set, no hold, rollback grace elapsed, minimum pressure age met, filesystem at pressure threshold | Yes, only under configured storage pressure |
 | Uncatalogued legacy video | Legacy behavior only | Not eligible for new pressure cleanup | No |
@@ -209,20 +209,27 @@ recovered journal; a conflicting immutable CSV or manifest is not overwritten.
 
 `dailyFileObservationMode` controls only the legacy OSH compatibility stream:
 
-- `FULL` publishes every compatibility observation.
-- `LATEST` publishes live/latest values and permits older compatibility observations to be removed.
+- `FULL` publishes every compatibility observation and uses manifest-gated completed-day cleanup.
+- `LATEST` is the production compatibility label; it publishes the same live events and uses the
+  same safe completed-day cleanup. It does not discard rows from the unsealed current day merely to
+  retain one value.
 - `NONE` disables compatibility observations but does not disable the durable journal.
 
 The 3.9.2 standard profile uses `LATEST`. The lane system consumes each live `dailyFile` event to
 derive occupancy transitions, so `NONE` would disable a required operational input. `LATEST` keeps
-that live stream and the registered datastream while the hourly maintenance task removes superseded
-compatibility rows. It does not eliminate the initial PostgreSQL/WAL write; doing that safely would
-require separating OSH's live event delivery from observation persistence. Use `FULL` only when an
-external OSH client explicitly needs queryable raw compatibility history; the journal and immutable
-daily CSV are the authoritative history in the standard profile.
+that live stream and registered datastream. The compatibility table contains the current unsealed
+local day plus any manifest-blocked backlog; the journal and immutable daily CSV are the
+authoritative history. This mode does not eliminate the initial PostgreSQL/WAL write because OSH
+currently couples live event delivery with observation persistence.
 
 OSCAR's completed-day cleanup validates the corresponding journal ledger,
 manifest, CSV, window, and current checksum before it authorizes daily-file compatibility cleanup.
+The exact-midnight pass is only an initial bounded attempt. If publication for a lane is still in
+progress, no row or checkpoint is changed; the same oldest-first catch-up runs on every hourly
+maintenance pass and retries it. `dailyFilePurgeWorkLimit` bounds each midnight or hourly invocation
+to 50 lane/day attempts in the standard profile, so a multi-day backlog converges over successive
+hours without an unbounded maintenance pass. Failures in other hourly purge phases are isolated and
+cannot suppress this retry.
 Setting `delegateObservationLifecycleToDatabase=true` delegates high-volume detector retention to
 the tiered database; it does not disable daily-file or connection-status maintenance.
 

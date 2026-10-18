@@ -44,7 +44,8 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Journal force limits | 1 s / 128 records / 1 MiB | Maximum time/count/bytes before a segment force |
 | Journal segment limits | 64 MiB / 15 min | Bounds recovery scan and segment size |
 | Journal `zoneId` | `UTC` | Defines immutable daily windows and local timestamp field |
-| Journal observation mode | `LATEST` | Keeps the live `dailyFile` event required for lane occupancy processing, while hourly maintenance retains only the newest compatibility row; immutable journal/CSV data remains authoritative |
+| Journal observation mode | `LATEST` | Keeps the live `dailyFile` events required for lane occupancy processing; only completed manifest-validated local days are removed, so the current unsealed day remains queryable |
+| Daily-file cleanup work limit | 50 lane/day attempts per invocation | Bounds both the midnight attempt and each hourly manifest-gated retry while an outage backlog converges oldest-first |
 | Database `idProviderType` | `SEQUENTIAL` | Required for exact, race-free archive ownership |
 | Database batch | 10,000 rows / 1 s | Bounded insert transaction and commit period |
 | Archive hot retention | 30 days | Age before eligible detector streams are copied to cold storage |
@@ -511,6 +512,12 @@ confirm for each active lane:
 4. `recordCount` and `byteCount` are plausible;
 5. the private ledger is `PUBLISHED` with the exact same half-open window; and
 6. OSCAR logs have no journal force, CRC, atomic-rename, or immutable-publication error.
+
+The midnight database-cleanup pass may reach a lane while its journal is still publishing. In that
+case it logs a skip and leaves both the compatibility rows and durable checkpoint unchanged. Every
+hourly maintenance pass retries the same bounded, oldest-first catch-up; after publication, confirm
+that the prior-day rows are removed and the checkpoint advances. Current-day rows remain until the
+day is sealed and published. Do not manually delete them to imitate a single-row `LATEST` view.
 
 Private sealed segments become retention-eligible only after a newly created coordinated backup
 has passed HMAC/checksum, strict tar-member, and PostgreSQL verification and has recorded a receipt
