@@ -14,7 +14,8 @@ All notable changes to this project will be documented in this file.
 - Make the daily journal a required driver dependency by default so startup or append failures cannot silently bypass source-record capture
 - Frame journal records with timestamp, length, and CRC32C; bound unforced data by time, record count, and byte count; recover only incomplete tails and fail visibly on complete-frame corruption
 - Durably create every journal and retained-media directory component with parent-directory synchronization; surface permission and filesystem failures instead of treating them as platform fallbacks
-- Make daily-journal shutdown bounded and retryable: a timed close reports the actual persistence failure, preserves the live store for a later retry, and never silently abandons an unclosed writer
+- Make daily-journal shutdown bounded and fail-visible: service stop first closes admission, drains active sensor writer handles while allowing their final records and keeping periodic fsync active, then stops maintenance and forces/closes every lane; a timed close fails module shutdown instead of silently abandoning an unclosed writer
+- Mark Rapiscan, RS350, and Aspect readers as stopping before transport teardown and join source workers before releasing their journal handles, so expected disconnects do not produce false errors and a final source record already in durable I/O cannot race sensor shutdown; RS350 releases its source writer independently of deferred WebID cleanup
 - Publish immutable legacy daily CSVs with exact time-zone windows, SHA-256 manifests, atomic commit ordering, and a manifest-gated compatibility-observation cleanup path
 - Retry the bounded daily-file cleanup on every hourly maintenance pass after the midnight attempt, isolate it from unrelated purge failures, and retain all unsealed current-day compatibility rows until manifest-validated publication
 - Batch observation inserts with immediate `DataBlock` snapshots, prepared statements, PostgreSQL batch rewriting, and one statement-level datastream-range update per batch
@@ -24,6 +25,7 @@ All notable changes to this project will be documented in this file.
 - Verify Parquet count/ID range before activation, publish manifests last, and atomically mark the exact exported hot rows so late arrivals remain eligible for later generations
 - Serialize archive activation/sealing against ingestion, updates, removals, overlays, tombstones, and exact hot-row deletion with transaction-scoped store and ordered observation locks, while keeping file export outside the critical section
 - Merge PostgreSQL and catalog-authorized Parquet reads behind the OSH observation-store contract, preferring hot overlap and applying archived overlays and tombstones without rewriting immutable files
+- Push mutation-free explicit-stream `resultTime=latest` queries into indexed PostgreSQL lateral probes and DuckDB latest-per-stream reduction before merging the two tiers, so health refreshes read at most one hot and one cold candidate per stream instead of paging the complete hot history
 - Preserve open and closed temporal bounds through archive candidate pruning and DuckDB pushdown so cold selection, count, limit, and filtered removal match hot PostgreSQL semantics
 - Add exact hot/cold row-digest parity receipts, a configurable rollback grace, bounded exact-ID hot deletion, generation/observation holds, and deferred sealing while held rows remain
 - Add versioned archive jobs, generations, objects, ID blocks, schemas, locators, overlays, tombstones, holds, verifications, deletion plans/ledger, media records, and backup epochs
@@ -32,6 +34,7 @@ All notable changes to this project will be documented in this file.
 - Bound every embedded DuckDB export, parity, deletion, query, metadata, and count connection to production-configurable memory, thread, and per-operation spill limits; add fair process-wide session admission with a bounded fail-busy wait; confine sensitive scratch to private disjoint directories and remove it on normal close
 - Keep general-purpose container temporary storage `noexec` while routing JVM native-library extraction to a bounded, owner-only executable tmpfs that is verified before startup
 - Preserve 64-bit Admin configuration values with type-correct Long, Integer, Short, and range converters, including the 2 GiB archive-generation limit, instead of narrowing every whole number through a 32-bit converter
+- Bound Viewer health snapshots to ten stream IDs per request with two global workers and a ten-second per-batch deadline, preventing large accumulated databases from leaving every RPM and camera indicator stuck at `Waiting`
 
 ### Media retention
 - Serialize recording commands in a bounded per-camera FIFO and use generation-qualified filenames so reconnects and back-to-back occupancies cannot finalize or reuse another recording's clip

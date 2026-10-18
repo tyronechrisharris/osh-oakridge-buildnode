@@ -168,6 +168,18 @@ PostgreSQL overlays, and archived deletes become PostgreSQL tombstones; immutabl
 not rewritten for individual mutations. If a live datastream schema is no longer present, the
 generation's schema snapshot is used to decode its observations.
 
+For an explicit set of datastreams with `resultTime=latest` and no sparse mutation records, OSCAR
+pushes latest-per-stream selection into both tiers before the union. PostgreSQL performs one
+backward index probe per requested stream and DuckDB returns one catalog-authorized cold candidate
+per stream; the union then chooses the newer candidate. The PostgreSQL probe treats a null result
+time as older than every non-null result time and uses the greatest observation ID as the stable
+tie-breaker, matching the cold reader and final union without scanning the stream's history. The
+fallback deliberately reads the full eligible history when overlays or tombstones exist, because
+dropping an invalidated newest row must reveal the preceding observation rather than incorrectly
+reporting no state. The Viewer additionally limits health requests to ten stream IDs and two
+concurrent batches, so a large hot table cannot turn one slow multi-stream query into an all-lanes
+`Waiting` display.
+
 DuckDB is embedded in OSCAR for archive reads. There is no required FDW, archive server, or external
 query service. An exported generation can also be inspected with ordinary DuckDB or other Parquet
 tools; see [Archive format](ARCHIVE_FORMAT.md).
