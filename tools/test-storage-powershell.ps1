@@ -121,6 +121,46 @@ try {
     . $storageScript -Command help | Out-Null
 
     $storageSource = [IO.File]::ReadAllText($storageScript)
+    $setupSource = [IO.File]::ReadAllText($setupScript)
+    foreach ($source in @($storageSource, $setupSource)) {
+        Assert-True (-not $source.Contains('{{ index ')) `
+            'A Windows launcher still passes a quoted Go-template index expression through PowerShell 5 native argument marshalling.'
+    }
+    $volumeJson = '[{"Name":"oscar_oscar_state","CreatedAt":"2026-10-18T13:45:03Z","Labels":{"com.botts.oscar.deployment-id":"12345678-1234-4234-8234-123456789abc"}}]'
+    $volumeRecord = ConvertFrom-DockerInspectJson @($volumeJson) 'volume' 'oscar_oscar_state'
+    Assert-True ((Get-DockerInspectLabel $volumeRecord $false 'com.botts.oscar.deployment-id') -ceq '12345678-1234-4234-8234-123456789abc') `
+        'The PowerShell 5 Docker JSON parser did not preserve a dotted/hyphenated volume label key.'
+    $rejectedMultiple = $false
+    try { [void](ConvertFrom-DockerInspectJson @('[{"Name":"oscar_oscar_state"},{"Name":"oscar_oscar_state"}]') 'volume' 'oscar_oscar_state') }
+    catch { $rejectedMultiple = $true }
+    Assert-True $rejectedMultiple 'The Docker JSON parser accepted multiple inspect records for one exact volume.'
+    $rejectedOversized = $false
+    try { [void](ConvertFrom-DockerInspectJson @((' ' * ($MaxDockerInspectJsonBytes + 1))) 'volume' 'oscar_oscar_state') }
+    catch { $rejectedOversized = $_.Exception.Message -like '*oversized*' }
+    Assert-True $rejectedOversized 'The Docker JSON parser accepted output above its fixed memory bound.'
+    & {
+        $script:CapturedDockerInspectArguments = @()
+        $imageJson = '[{"Id":"sha256:' + ('a' * 64) + '","RepoDigests":["oscar@sha256:' + ('b' * 64) + '"],"Config":{"Labels":{"org.opencontainers.image.version":"3.9.2"}}}]'
+        function Get-ExternalOutput([string]$Program, [string[]]$Arguments) {
+            $script:CapturedDockerInspectArguments = @($Arguments)
+            return @($imageJson)
+        }
+        Assert-True ((Get-ImageInspectValue 'oscar:3.9.2' 'org.opencontainers.image.version') -ceq '3.9.2') `
+            'The image JSON parser did not read the required OCI version label.'
+        Assert-True (($script:CapturedDockerInspectArguments -join '|') -ceq 'image|inspect|oscar:3.9.2') `
+            'Windows image inspection did not use the exact format-free JSON command.'
+    }
+    $statusStart = $storageSource.IndexOf('function Show-ArchiveStatus', [StringComparison]::Ordinal)
+    $statusEnd = $storageSource.IndexOf('function Invoke-RetentionHold', $statusStart, [StringComparison]::Ordinal)
+    Assert-True ($statusStart -ge 0 -and $statusEnd -gt $statusStart) 'Could not isolate the PowerShell archive-status query.'
+    $statusSource = $storageSource.Substring($statusStart, $statusEnd - $statusStart)
+    foreach ($qualified in @(
+        'SELECT g.store_key,g.id_scope,g.state,g.profile',
+        'coalesce(sum(g.row_count),0)',
+        'GROUP BY g.store_key,g.id_scope,g.state,g.profile',
+        'ORDER BY g.store_key,g.id_scope,g.state,g.profile')) {
+        Assert-True ($statusSource.Contains($qualified)) "PowerShell archive status is missing qualified generation columns: $qualified"
+    }
     $launcherCheck = $storageSource.IndexOf('Assert-NoReparseComponents $StorageScriptPath', [StringComparison]::Ordinal)
     $templateRead = $storageSource.IndexOf("Join-Path `$ScriptRoot '.env.example'", [StringComparison]::Ordinal)
     Assert-True ($launcherCheck -ge 0 -and $templateRead -gt $launcherCheck -and

@@ -47,6 +47,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$MaxDockerInspectJsonBytes = 1048576
 
 function Write-Heading([string]$Text) {
     Write-Host "`n== $Text ==" -ForegroundColor Cyan
@@ -423,9 +424,8 @@ function Initialize-DeploymentIdentity {
 }
 
 function Get-VolumeDeploymentLabel([string]$Volume) {
-    $label = Get-DockerOutput @('volume', 'inspect', '--format', '{{ index .Labels "com.botts.oscar.deployment-id" }}', $Volume)
-    if ($label -ceq '<no value>') { return '' }
-    return $label
+    $record = Get-DockerInspectObject 'volume' $Volume
+    return Get-DockerInspectLabel $record $false 'com.botts.oscar.deployment-id'
 }
 
 function Write-InitReceipt([string]$DeploymentId, [ValidateSet('INITIALIZING', 'COMPLETE')][string]$State) {
@@ -477,8 +477,8 @@ function Get-AdoptionReceiptValue([string]$Name) {
 function Write-VolumeAdoptionReceipt([string]$DeploymentId) {
     $receiptPath = Join-Path $ScriptRoot '.oscar-volume-adoption'
     $temporaryPath = "$receiptPath.tmp.$([Guid]::NewGuid().ToString('N'))"
-    $stateCreated = Get-DockerOutput @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_oscar_state')
-    $postgresCreated = Get-DockerOutput @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_postgres_data')
+    $stateCreated = Get-DockerVolumeCreatedAt 'oscar_oscar_state'
+    $postgresCreated = Get-DockerVolumeCreatedAt 'oscar_postgres_data'
     if (-not $stateCreated -or -not $postgresCreated) { throw 'Docker did not provide stable creation identities for the legacy volumes.' }
     $content = @(
         'format=oscar-volume-adoption',
@@ -502,8 +502,8 @@ function Test-VolumeAdoptionReceipt([string]$DeploymentId) {
         @($lines | Where-Object { $_ -ceq 'version=1' }).Count -ne 1 -or
         @($lines | Where-Object { $_ -match '^adopted_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' }).Count -ne 1) { return $false }
     if ((Get-AdoptionReceiptValue 'deployment_id') -cne $DeploymentId) { return $false }
-    $stateCreated = Get-DockerOutput @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_oscar_state')
-    $postgresCreated = Get-DockerOutput @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_postgres_data')
+    $stateCreated = Get-DockerVolumeCreatedAt 'oscar_oscar_state'
+    $postgresCreated = Get-DockerVolumeCreatedAt 'oscar_postgres_data'
     return $stateCreated -and $postgresCreated -and
         (Get-AdoptionReceiptValue 'oscar_state_created_at') -ceq $stateCreated -and
         (Get-AdoptionReceiptValue 'postgres_data_created_at') -ceq $postgresCreated
@@ -888,6 +888,79 @@ function Get-ComposeOutput([string[]]$Arguments) {
     }
 }
 
+function ConvertFrom-DockerInspectJson([string[]]$Lines, [ValidateSet('image', 'volume')][string]$Kind, [string]$Name) {
+    $rawJson = $Lines -join "`n"
+    $byteCount = $Utf8NoBom.GetByteCount($rawJson)
+    if ($byteCount -gt $MaxDockerInspectJsonBytes) {
+        throw "Docker returned oversized $Kind inspection data for: $Name"
+    }
+    $json = $rawJson.Trim()
+    if (-not $json) { throw "Docker returned no $Kind inspection data for: $Name" }
+    try { $parsed = $json | ConvertFrom-Json }
+    catch { throw "Docker returned invalid JSON while inspecting ${Kind}: $Name" }
+    # Windows PowerShell 5.1 emits a top-level JSON array as one Object[]
+    # pipeline object. Assign first, then enumerate exactly once so PS5 and
+    # modern PowerShell enforce the same single-record contract.
+    $records = @($parsed)
+    if ($records.Count -ne 1) { throw "Docker did not return exactly one $Kind inspection record for: $Name" }
+    $record = $records[0]
+    if ($Kind -ceq 'volume') {
+        $actualName = [string](Get-DockerInspectProperty $record 'Name')
+        if ($actualName -cne $Name) { throw "Docker volume inspection identity mismatch for: $Name" }
+    } else {
+        $imageId = [string](Get-DockerInspectProperty $record 'Id')
+        if ($imageId -cnotmatch '^sha256:[0-9a-f]{64}$') { throw "Docker image inspection returned an invalid immutable ID for: $Name" }
+    }
+    return $record
+}
+
+function Get-DockerInspectObject([ValidateSet('image', 'volume')][string]$Kind, [string]$Name) {
+    if (-not $Name -or $Name.Length -gt 512 -or $Name -match '[\x00-\x20]') {
+        throw "Invalid Docker $Kind inspection name."
+    }
+    $output = @(Get-DockerOutput @($Kind, 'inspect', $Name))
+    return ConvertFrom-DockerInspectJson $output $Kind $Name
+}
+
+function Get-DockerInspectProperty([object]$Object, [string]$Name) {
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-DockerInspectLabel([object]$Record, [bool]$Image, [string]$Key) {
+    $labelOwner = $Record
+    if ($Image) {
+        $labelOwner = Get-DockerInspectProperty $Record 'Config'
+        if ($null -eq $labelOwner) { throw 'Docker image inspection omitted Config metadata.' }
+    }
+    $labels = Get-DockerInspectProperty $labelOwner 'Labels'
+    if ($null -eq $labels) { return '' }
+    $value = Get-DockerInspectProperty $labels $Key
+    if ($null -eq $value) { return '' }
+    $text = [string]$value
+    if ($text.Length -gt 4096 -or $text -match '[\x00-\x1f]') { throw "Docker inspection returned an invalid label value: $Key" }
+    return $text
+}
+
+function Get-DockerImageLabel([string]$Image, [string]$Key) {
+    $record = Get-DockerInspectObject 'image' $Image
+    return Get-DockerInspectLabel $record $true $Key
+}
+
+function Get-DockerVolumeCreatedAt([string]$Volume) {
+    $record = Get-DockerInspectObject 'volume' $Volume
+    $createdValue = Get-DockerInspectProperty $record 'CreatedAt'
+    $createdAt = if ($createdValue -is [DateTime]) {
+        $createdValue.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture).Replace('+00:00', 'Z')
+    } else { [string]$createdValue }
+    if (-not $createdAt -or $createdAt.Length -gt 128 -or $createdAt -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T') {
+        throw "Docker volume inspection returned an invalid creation identity for: $Volume"
+    }
+    return $createdAt
+}
+
 function Invoke-BootstrapSql([string]$Sql) {
     $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); export PGPASSWORD; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
     $output = Get-ComposeOutput @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper', '--tuples-only', '--no-align', '--command', $Sql)
@@ -945,12 +1018,12 @@ grep -Fq '"frameRetentionCount": 5' "$config"
         if ($attempt -lt 30) { Start-Sleep -Seconds 1 }
     }
     if (-not $configReady) { throw "The saved OSCAR configuration does not contain the complete $expectedVersion storage profile after 30 seconds." }
-    $imageLabel = Get-DockerOutput @('image', 'inspect', (Get-OscarImage), '--format', '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+    $imageLabel = Get-DockerImageLabel (Get-OscarImage) 'org.opencontainers.image.version'
     if ($imageLabel -cne $expectedVersion) { throw "The selected OSCAR image is not labeled $expectedVersion (received: $(if ($imageLabel) { $imageLabel } else { 'missing' }))." }
     $postgresImage = @(Get-RequiredImages | Where-Object { $_ -match '(^|/)oscar-postgis:' } | Select-Object -First 1)
     if ($postgresImage.Count -ne 1) { throw 'The Compose model does not identify exactly one OSCAR PostGIS image.' }
-    $postgresLabel = Get-DockerOutput @('image', 'inspect', $postgresImage[0], '--format', '{{ index .Config.Labels "org.opencontainers.image.version" }}')
-    $postgresProfile = Get-DockerOutput @('image', 'inspect', $postgresImage[0], '--format', '{{ index .Config.Labels "com.botts.oscar.storage-profile" }}')
+    $postgresLabel = Get-DockerImageLabel $postgresImage[0] 'org.opencontainers.image.version'
+    $postgresProfile = Get-DockerImageLabel $postgresImage[0] 'com.botts.oscar.storage-profile'
     if ($postgresLabel -cne $expectedVersion -or $postgresProfile -cne $expectedVersion) { throw "The selected PostGIS image does not carry the OSCAR $expectedVersion storage-profile labels." }
     Write-InitReceipt $deploymentId 'COMPLETE'
 }

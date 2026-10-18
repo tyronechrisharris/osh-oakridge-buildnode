@@ -2306,7 +2306,7 @@ if command -v pwsh >/dev/null 2>&1; then
                     gateway = "nginxinc/nginx-unprivileged:1.28.1-alpine"
                 }
             }
-            function Get-ImageInspectValue([string]$Image, [string]$Template) {
+            function Get-ImageInspectValue([string]$Image, [string]$Field) {
                 return "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }
             try {
@@ -2317,18 +2317,18 @@ if command -v pwsh >/dev/null 2>&1; then
             }
 
             $portableInventoryRoot = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "image-inventory-portable"
-            function Get-ImageInspectValue([string]$Image, [string]$Template) {
-                if ($Template -ceq "{{.Id}}") {
+            function Get-ImageInspectValue([string]$Image, [string]$Field) {
+                if ($Field -ceq "Id") {
                     switch -CaseSensitive ($Image) {
                         "oscar:$RequiredReleaseVersion" { return "sha256:" + ("a" * 64) }
                         "oscar-postgis:$RequiredReleaseVersion" { return "sha256:" + ("c" * 64) }
                         "nginxinc/nginx-unprivileged:1.28.1-alpine" { return "sha256:" + ("d" * 64) }
                     }
                 }
-                if ($Template -ceq "{{json .RepoDigests}}") { return "null" }
-                if ($Template -like "*org.opencontainers.image.version*") { return $RequiredReleaseVersion }
-                if ($Template -like "*com.botts.oscar.storage-profile*") { return $RequiredReleaseVersion }
-                throw "Unexpected image inspection: $Image $Template"
+                if ($Field -ceq "RepoDigests") { return "null" }
+                if ($Field -ceq "org.opencontainers.image.version") { return $RequiredReleaseVersion }
+                if ($Field -ceq "com.botts.oscar.storage-profile") { return $RequiredReleaseVersion }
+                throw "Unexpected image inspection: $Image $Field"
             }
             Confirm-ImageInventory $portableInventoryRoot -CompareCurrent
 
@@ -3053,8 +3053,10 @@ if command -v pwsh >/dev/null 2>&1; then
             function Invoke-ExternalProbe([scriptblock]$Action) { return $true }
             function Get-VolumeDeploymentLabel([string]$Volume) { return "" }
             function Get-DockerOutput([string[]]$Arguments) {
-                if ($Arguments[-1] -ceq "oscar_oscar_state") { return "2026-01-01T00:00:00Z" }
-                return "2026-01-02T00:00:00Z"
+                $volume = $Arguments[-1]
+                $created = if ($volume -ceq "oscar_oscar_state") { "2026-01-01T00:00:00Z" } else { "2026-01-02T00:00:00Z" }
+                $record = [pscustomobject]@{ Name = $volume; CreatedAt = $created; Labels = $null }
+                return ConvertTo-Json -InputObject @($record) -Compress
             }
             Assert-DeploymentVolumeOwnership $true
             Initialize-StoragePaths
@@ -3095,6 +3097,14 @@ if command -v pwsh >/dev/null 2>&1; then
                     $volume = if ($dockerArgs.Count -ge 5 -and $dockerArgs[2] -ceq "--format") { $dockerArgs[4] } else { $dockerArgs[2] }
                     if (-not $script:Volumes.ContainsKey($volume)) { $global:LASTEXITCODE = 1; return }
                     if ($dockerArgs.Count -ge 5 -and $dockerArgs[2] -ceq "--format") { $deployment }
+                    else {
+                        $record = [pscustomobject]@{
+                            Name = $volume
+                            CreatedAt = "2026-01-01T00:00:00Z"
+                            Labels = [pscustomobject]@{ "com.botts.oscar.deployment-id" = $deployment }
+                        }
+                        ConvertTo-Json -InputObject @($record) -Compress
+                    }
                     $global:LASTEXITCODE = 0
                     return
                 }
@@ -3152,8 +3162,10 @@ if command -v pwsh >/dev/null 2>&1; then
             $script:MockStateCreated = "2026-01-01T00:00:00Z"
             $script:MockPostgresCreated = "2026-01-02T00:00:00Z"
             function Get-DockerOutput([string[]]$Arguments) {
-                if ($Arguments[-1] -ceq "oscar_oscar_state") { return $script:MockStateCreated }
-                return $script:MockPostgresCreated
+                $volume = $Arguments[-1]
+                $created = if ($volume -ceq "oscar_oscar_state") { $script:MockStateCreated } else { $script:MockPostgresCreated }
+                $record = [pscustomobject]@{ Name = $volume; CreatedAt = $created; Labels = $null }
+                return ConvertTo-Json -InputObject @($record) -Compress
             }
             Assert-DeploymentVolumeOwnership $true
             $receipt = Join-Path $ScriptRoot ".oscar-volume-adoption"

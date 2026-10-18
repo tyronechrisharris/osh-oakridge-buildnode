@@ -87,6 +87,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and
     Fail "OSCAR storage launcher must reside on a local Windows volume: $ScriptRoot"
 }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$MaxDockerInspectJsonBytes = 1048576
 $releaseVersionLine = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot '.env.example')) | Where-Object { $_ -match '^OSCAR_VERSION=' } | Select-Object -First 1)
 if ($releaseVersionLine.Count -ne 1) { throw 'The packaged OSCAR release version is missing.' }
 $RequiredReleaseVersion = $releaseVersionLine[0].Substring('OSCAR_VERSION='.Length)
@@ -572,6 +573,70 @@ function Get-ExternalOutput([string]$Program, [string[]]$Arguments) {
     return @($output)
 }
 
+function Get-DockerInspectProperty([object]$Object, [string]$Name) {
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function ConvertFrom-DockerInspectJson([string[]]$Lines, [ValidateSet('image', 'volume')][string]$Kind, [string]$Name) {
+    $rawJson = $Lines -join "`n"
+    $byteCount = $Utf8NoBom.GetByteCount($rawJson)
+    if ($byteCount -gt $MaxDockerInspectJsonBytes) { Fail "Docker returned oversized $Kind inspection data for: $Name" }
+    $json = $rawJson.Trim()
+    if (-not $json) { Fail "Docker returned no $Kind inspection data for: $Name" }
+    try { $parsed = $json | ConvertFrom-Json }
+    catch { Fail "Docker returned invalid JSON while inspecting ${Kind}: $Name" }
+    # Windows PowerShell 5.1 emits a top-level JSON array as one Object[]
+    # pipeline object. Assign first, then enumerate exactly once so PS5 and
+    # modern PowerShell enforce the same single-record contract.
+    $records = @($parsed)
+    if ($records.Count -ne 1) { Fail "Docker did not return exactly one $Kind inspection record for: $Name" }
+    $record = $records[0]
+    if ($Kind -ceq 'volume') {
+        $actualName = [string](Get-DockerInspectProperty $record 'Name')
+        if ($actualName -cne $Name) { Fail "Docker volume inspection identity mismatch for: $Name" }
+    } else {
+        $imageId = [string](Get-DockerInspectProperty $record 'Id')
+        if ($imageId -cnotmatch '^sha256:[0-9a-f]{64}$') { Fail "Docker image inspection returned an invalid immutable ID for: $Name" }
+    }
+    return $record
+}
+
+function Get-DockerInspectObject([ValidateSet('image', 'volume')][string]$Kind, [string]$Name) {
+    if (-not $Name -or $Name.Length -gt 512 -or $Name -match '[\x00-\x20]') { Fail "Invalid Docker $Kind inspection name." }
+    $output = @(Get-ExternalOutput 'docker' @($Kind, 'inspect', $Name))
+    return ConvertFrom-DockerInspectJson $output $Kind $Name
+}
+
+function Get-DockerInspectLabel([object]$Record, [bool]$Image, [string]$Key) {
+    $labelOwner = $Record
+    if ($Image) {
+        $labelOwner = Get-DockerInspectProperty $Record 'Config'
+        if ($null -eq $labelOwner) { Fail 'Docker image inspection omitted Config metadata.' }
+    }
+    $labels = Get-DockerInspectProperty $labelOwner 'Labels'
+    if ($null -eq $labels) { return '' }
+    $value = Get-DockerInspectProperty $labels $Key
+    if ($null -eq $value) { return '' }
+    $text = [string]$value
+    if ($text.Length -gt 4096 -or $text -match '[\x00-\x1f]') { Fail "Docker inspection returned an invalid label value: $Key" }
+    return $text
+}
+
+function Get-DockerVolumeCreatedAt([string]$Volume) {
+    $record = Get-DockerInspectObject 'volume' $Volume
+    $createdValue = Get-DockerInspectProperty $record 'CreatedAt'
+    $createdAt = if ($createdValue -is [DateTime]) {
+        $createdValue.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture).Replace('+00:00', 'Z')
+    } else { [string]$createdValue }
+    if (-not $createdAt -or $createdAt.Length -gt 128 -or $createdAt -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T') {
+        Fail "Docker volume inspection returned an invalid creation identity for: $Volume"
+    }
+    return $createdAt
+}
+
 function Clear-ComposeOverrideEnvironment {
     $saved = @{}
     foreach ($name in @(
@@ -631,23 +696,38 @@ function Resolve-ReleaseImages {
     return [pscustomobject]@{ application = $application[0]; postgres = $postgres[0]; gateway = $gateway[0] }
 }
 
-function Get-ImageInspectValue([string]$Image, [string]$Template) {
-    $value = ((Get-ExternalOutput 'docker' @('image', 'inspect', $Image, '--format', $Template)) -join "`n").Trim()
-    if (-not $value) { Fail "Could not inspect required image metadata: $Image" }
-    return $value
+function Get-ImageInspectValue(
+    [string]$Image,
+    [ValidateSet('Id', 'RepoDigests', 'org.opencontainers.image.version', 'com.botts.oscar.storage-profile')][string]$Field) {
+    $record = Get-DockerInspectObject 'image' $Image
+    switch ($Field) {
+        'Id' { return [string](Get-DockerInspectProperty $record 'Id') }
+        'RepoDigests' {
+            $digests = Get-DockerInspectProperty $record 'RepoDigests'
+            if ($null -eq $digests) { return 'null' }
+            $items = @($digests)
+            foreach ($digest in $items) {
+                if ([string]$digest -notmatch '^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$') {
+                    Fail "Docker image inspection returned an invalid repository digest for: $Image"
+                }
+            }
+            return ConvertTo-Json -InputObject $items -Compress
+        }
+        default { return Get-DockerInspectLabel $record $true $Field }
+    }
 }
 
 function Write-ImageInventory([string]$Root) {
     $images = Resolve-ReleaseImages
-    $appId = Get-ImageInspectValue $images.application '{{.Id}}'
-    $postgresId = Get-ImageInspectValue $images.postgres '{{.Id}}'
-    $gatewayId = Get-ImageInspectValue $images.gateway '{{.Id}}'
-    $appDigests = Get-ImageInspectValue $images.application '{{json .RepoDigests}}'
-    $postgresDigests = Get-ImageInspectValue $images.postgres '{{json .RepoDigests}}'
-    $gatewayDigests = Get-ImageInspectValue $images.gateway '{{json .RepoDigests}}'
-    $appVersion = Get-ImageInspectValue $images.application '{{ index .Config.Labels "org.opencontainers.image.version" }}'
-    $postgresVersion = Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "org.opencontainers.image.version" }}'
-    $postgresProfile = Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "com.botts.oscar.storage-profile" }}'
+    $appId = Get-ImageInspectValue $images.application 'Id'
+    $postgresId = Get-ImageInspectValue $images.postgres 'Id'
+    $gatewayId = Get-ImageInspectValue $images.gateway 'Id'
+    $appDigests = Get-ImageInspectValue $images.application 'RepoDigests'
+    $postgresDigests = Get-ImageInspectValue $images.postgres 'RepoDigests'
+    $gatewayDigests = Get-ImageInspectValue $images.gateway 'RepoDigests'
+    $appVersion = Get-ImageInspectValue $images.application 'org.opencontainers.image.version'
+    $postgresVersion = Get-ImageInspectValue $images.postgres 'org.opencontainers.image.version'
+    $postgresProfile = Get-ImageInspectValue $images.postgres 'com.botts.oscar.storage-profile'
     if ($appVersion -cne $RequiredReleaseVersion -or $postgresVersion -cne $RequiredReleaseVersion -or $postgresProfile -cne $RequiredReleaseVersion) {
         Fail 'Release images do not carry the required OSCAR version/storage-profile labels.'
     }
@@ -694,17 +774,17 @@ function Confirm-ImageInventory([string]$Root, [switch]$CompareCurrent) {
     foreach ($role in @('application','postgres','gateway')) {
         $name = [string]$images.$role
         if ($inventory["${role}_name"] -cne $name) { Fail "Restore image name mismatch for $role." }
-        if ($inventory["${role}_id"] -cne (Get-ImageInspectValue $name '{{.Id}}')) { Fail "Restore image ID mismatch for $role." }
+        if ($inventory["${role}_id"] -cne (Get-ImageInspectValue $name 'Id')) { Fail "Restore image ID mismatch for $role." }
         # Registry RepoDigests are provenance metadata and docker save/load may
         # drop them. Exact content-addressed ID, name, and labels remain hard gates.
-        $currentRepoDigests = Get-ImageInspectValue $name '{{json .RepoDigests}}'
+        $currentRepoDigests = Get-ImageInspectValue $name 'RepoDigests'
         if ($inventory["${role}_repo_digests"] -cne $currentRepoDigests) {
             Write-Warning "$role image repository-digest provenance differs after transport; exact image ID and required labels still match."
         }
     }
-    if ($inventory.application_version_label -cne (Get-ImageInspectValue $images.application '{{ index .Config.Labels "org.opencontainers.image.version" }}')) { Fail 'Restore application OCI version label mismatch.' }
-    if ($inventory.postgres_version_label -cne (Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "org.opencontainers.image.version" }}') -or
-        $inventory.postgres_storage_profile_label -cne (Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "com.botts.oscar.storage-profile" }}')) { Fail 'Restore PostGIS OCI label mismatch.' }
+    if ($inventory.application_version_label -cne (Get-ImageInspectValue $images.application 'org.opencontainers.image.version')) { Fail 'Restore application OCI version label mismatch.' }
+    if ($inventory.postgres_version_label -cne (Get-ImageInspectValue $images.postgres 'org.opencontainers.image.version') -or
+        $inventory.postgres_storage_profile_label -cne (Get-ImageInspectValue $images.postgres 'com.botts.oscar.storage-profile')) { Fail 'Restore PostGIS OCI label mismatch.' }
 }
 
 function Test-DockerVolume([string]$Volume) {
@@ -717,9 +797,8 @@ function Test-DockerVolume([string]$Volume) {
 }
 
 function Get-VolumeDeploymentLabel([string]$Volume) {
-    $value = ((Get-ExternalOutput 'docker' @('volume', 'inspect', '--format', '{{ index .Labels "com.botts.oscar.deployment-id" }}', $Volume)) -join "`n").Trim()
-    if ($value -ceq '<no value>') { return '' }
-    return $value
+    $record = Get-DockerInspectObject 'volume' $Volume
+    return Get-DockerInspectLabel $record $false 'com.botts.oscar.deployment-id'
 }
 
 function Test-ValidDeploymentId([string]$Value) {
@@ -744,8 +823,8 @@ function Test-VolumeAdoptionReceipt([string]$DeploymentId) {
         @($lines | Where-Object { $_ -ceq 'version=1' }).Count -ne 1 -or
         @($lines | Where-Object { $_ -match '^adopted_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' }).Count -ne 1 -or
         (Get-AdoptionReceiptValue 'deployment_id') -cne $DeploymentId) { return $false }
-    $stateCreated = ((Get-ExternalOutput 'docker' @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_oscar_state')) -join "`n").Trim()
-    $postgresCreated = ((Get-ExternalOutput 'docker' @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_postgres_data')) -join "`n").Trim()
+    $stateCreated = Get-DockerVolumeCreatedAt 'oscar_oscar_state'
+    $postgresCreated = Get-DockerVolumeCreatedAt 'oscar_postgres_data'
     return $stateCreated -and $postgresCreated -and
         (Get-AdoptionReceiptValue 'oscar_state_created_at') -ceq $stateCreated -and
         (Get-AdoptionReceiptValue 'postgres_data_created_at') -ceq $postgresCreated
@@ -2462,7 +2541,7 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
 
 function Show-ArchiveStatus {
     Assert-Configured
-    Invoke-Psql "SELECT store_key,id_scope,state,profile,count(*) generations,coalesce(sum(row_count),0) rows,pg_size_pretty(coalesce(sum(o.bytes),0)) bytes FROM oscar_archive_generation g LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.kind='OBSERVATIONS_PARQUET' GROUP BY store_key,id_scope,state,profile ORDER BY store_key,id_scope,state,profile;" -Table
+    Invoke-Psql "SELECT g.store_key,g.id_scope,g.state,g.profile,count(*) generations,coalesce(sum(g.row_count),0) rows,pg_size_pretty(coalesce(sum(o.bytes),0)) bytes FROM oscar_archive_generation g LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.kind='OBSERVATIONS_PARQUET' GROUP BY g.store_key,g.id_scope,g.state,g.profile ORDER BY g.store_key,g.id_scope,g.state,g.profile;" -Table
     Invoke-Psql "SELECT store_key,id_scope,count(*) active_holds FROM oscar_retention_hold WHERE released_at IS NULL GROUP BY store_key,id_scope ORDER BY store_key,id_scope;" -Table
     Test-ArchiveFilesystemRegistration
 }
