@@ -258,6 +258,8 @@ Release image tags are immutable once published. If developers rebuild 3.9.2 rep
 
 The default configuration for a new installation is labeled `OSCAR 3.9.2`. An upgrade preserves `/var/lib/oscar/config.json`, including a customized deployment name, so the Admin UI may continue to display the prior or site-specific label. Do not overwrite that value merely to display a version number. Use `OSCAR_VERSION` in `.env` and `docker compose images` to verify the running release. The OSCAR image also stamps that value into the OCI `org.opencontainers.image.version` label; inspect it on PowerShell or a POSIX shell with `docker image inspect oscar:3.9.2 --format '{{json .Config.Labels}}'` and require the label value `3.9.2` before accepting the image.
 
+On Windows, setup streams its multiline PostgreSQL checksum-marker and saved OSCAR configuration checks into the one-shot container shells over standard input. This preserves the checks exactly under Windows PowerShell 5.1 native argument handling. A failed check leaves the initialization receipt in `INITIALIZING`; correct the reported problem and rerun `oscar.bat init` from the same release and protected runtime state rather than deleting the volumes.
+
 ### 3.9.2 storage migration boundary
 
 OSCAR 3.9.2 changes the default database module, write path, daily-file source capture, media-retention format, and PostgreSQL initialization. `upgrade` deliberately does not overwrite the saved module configuration or recreate the PostgreSQL cluster, so an upgraded pre-3.9.2 system does not automatically gain the complete 3.9.2 storage profile or data checksums.

@@ -167,8 +167,11 @@ try {
     $composeInputSource = $setupSource.Substring($composeInputStart, $composeInputEnd - $composeInputStart)
     Assert-True ($composeInputSource.Contains('$OutputEncoding = $Utf8NoBom') -and
         $composeInputSource.Contains('$InputText | & docker @pinned') -and
-        $composeInputSource.Contains('$OutputEncoding = $previousOutputEncoding')) `
-        'Windows Compose stdin execution does not stream UTF-8 input and restore its encoding.'
+        $composeInputSource.Contains('$OutputEncoding = $previousOutputEncoding') -and
+        $composeInputSource.Contains('function Get-ComposeShellInputOutput') -and
+        $composeInputSource.Contains('# oscar-powershell-stdin-terminator') -and
+        $composeInputSource.Contains('.Replace("`r`n", "`n").Replace("`r", "`n")')) `
+        'Windows Compose stdin execution does not preserve UTF-8 shell input with Unix line endings and restore its encoding.'
     $bootstrapStart = $setupSource.IndexOf('function Invoke-BootstrapSql', [StringComparison]::Ordinal)
     $bootstrapEnd = $setupSource.IndexOf('function Enable-StorageDatabaseFeatures', $bootstrapStart, [StringComparison]::Ordinal)
     Assert-True ($bootstrapStart -ge 0 -and $bootstrapEnd -gt $bootstrapStart) 'Could not isolate Windows bootstrap SQL execution.'
@@ -178,6 +181,65 @@ try {
         $bootstrapSource.Contains('[string]::IsNullOrWhiteSpace($Sql)') -and
         -not $bootstrapSource.Contains('$@') -and -not $bootstrapSource.Contains("'--command'")) `
         'Windows bootstrap SQL is not a bounded stdin stream to direct psql.'
+    $completionStart = $setupSource.IndexOf('function Complete-PendingFreshInit', [StringComparison]::Ordinal)
+    $completionEnd = $setupSource.IndexOf('function Get-ConfiguredEndpoint', $completionStart, [StringComparison]::Ordinal)
+    Assert-True ($completionStart -ge 0 -and $completionEnd -gt $completionStart) 'Could not isolate Windows fresh-init completion checks.'
+    $completionSource = $setupSource.Substring($completionStart, $completionEnd - $completionStart)
+    Assert-True ($completionSource.Contains("Get-ComposeShellInputOutput `$markerCheck @('exec', '-T', 'postgres', 'sh', '-seu', `$expectedVersion)") -and
+        $completionSource.Contains("Get-ComposeShellInputOutput `$configCheck @('exec', '-T', 'oscar', 'sh', '-seu')") -and
+        $completionSource.Contains('With sh -s, arguments after the options begin at $1') -and
+        -not $completionSource.Contains("'-c', `$markerCheck") -and
+        -not $completionSource.Contains("'-c', `$configCheck")) `
+        'Windows fresh-init marker/config validation is not streamed intact over stdin.'
+    foreach ($requiredBody in @(
+        'test "$(wc -l <"$marker" | tr -d "[:space:]")" = 4',
+        'grep -Fq ''"frameRetentionCount": 5'' "$config"')) {
+        Assert-True ($completionSource.Contains($requiredBody)) "Windows fresh-init validation lost its multiline contract: $requiredBody"
+    }
+
+    # Execute the exact shell-input adapter in a native PS5 scope with a mock
+    # Compose sink. This proves CRLF/CR normalization, the comment sentinel,
+    # multiline preservation, and argv ordering independently of source text.
+    $shellHelperStart = $setupSource.IndexOf('function Get-ComposeShellInputOutput', [StringComparison]::Ordinal)
+    $shellHelperEnd = $setupSource.IndexOf('function ConvertFrom-DockerInspectJson', $shellHelperStart, [StringComparison]::Ordinal)
+    Assert-True ($shellHelperStart -ge 0 -and $shellHelperEnd -gt $shellHelperStart) 'Could not isolate Windows shell-input adapter.'
+    $shellHelperSource = $setupSource.Substring($shellHelperStart, $shellHelperEnd - $shellHelperStart)
+    $shellFixture = & {
+        $Utf8NoBom = New-Object Text.UTF8Encoding($false)
+        $script:capturedShellInput = $null
+        $script:capturedShellArguments = $null
+        function Get-ComposeInputOutput([string]$InputText, [string[]]$Arguments) {
+            $script:capturedShellInput = $InputText
+            $script:capturedShellArguments = @($Arguments)
+            return @('accepted')
+        }
+        Invoke-Expression $shellHelperSource
+        $markerFixture = "marker=/data/marker`r`ntest `"`$(grep -Fxc `"version=`$1`" `"`$marker`")`" = 1`r`n"
+        $markerResult = @(Get-ComposeShellInputOutput $markerFixture @('exec', '-T', 'postgres', 'sh', '-seu', '3.9.2'))
+        $markerInput = $script:capturedShellInput
+        $markerArguments = @($script:capturedShellArguments)
+        $configFixture = "config=/var/lib/oscar/config.json`r`ntest -f `"`$config`"`r`ngrep -Fq `"frameRetentionCount`" `"`$config`"`r`n"
+        $configResult = @(Get-ComposeShellInputOutput $configFixture @('exec', '-T', 'oscar', 'sh', '-seu'))
+        return [pscustomobject]@{
+            MarkerInput = $markerInput
+            MarkerArguments = $markerArguments
+            MarkerResult = @($markerResult)
+            ConfigInput = $script:capturedShellInput
+            ConfigArguments = @($script:capturedShellArguments)
+            ConfigResult = @($configResult)
+        }
+    }
+    $expectedMarkerInput = "marker=/data/marker`ntest `"`$(grep -Fxc `"version=`$1`" `"`$marker`")`" = 1`n# oscar-powershell-stdin-terminator"
+    $expectedConfigInput = "config=/var/lib/oscar/config.json`ntest -f `"`$config`"`ngrep -Fq `"frameRetentionCount`" `"`$config`"`n# oscar-powershell-stdin-terminator"
+    Assert-True ($shellFixture.MarkerInput -ceq $expectedMarkerInput) 'Windows shell-input adapter did not deterministically preserve the multiline marker body with Unix line endings.'
+    Assert-True ($shellFixture.ConfigInput -ceq $expectedConfigInput) 'Windows shell-input adapter did not deterministically preserve the multiline config body with Unix line endings.'
+    Assert-True (($shellFixture.MarkerArguments -join [char]0) -ceq (@('exec', '-T', 'postgres', 'sh', '-seu', '3.9.2') -join [char]0)) `
+        'Windows shell-input adapter did not keep the release version at shell positional parameter $1.'
+    Assert-True (($shellFixture.ConfigArguments -join [char]0) -ceq (@('exec', '-T', 'oscar', 'sh', '-seu') -join [char]0)) `
+        'Windows shell-input adapter changed the config-check shell arguments.'
+    Assert-True (($shellFixture.MarkerResult.Count -eq 1) -and ($shellFixture.MarkerResult[0] -ceq 'accepted') -and
+        ($shellFixture.ConfigResult.Count -eq 1) -and ($shellFixture.ConfigResult[0] -ceq 'accepted')) `
+        'Windows shell-input adapter did not return Compose output for both multiline checks.'
     $volumeJson = '[{"Name":"oscar_oscar_state","CreatedAt":"2026-10-18T13:45:03Z","Labels":{"com.botts.oscar.deployment-id":"12345678-1234-4234-8234-123456789abc"}}]'
     $volumeRecord = ConvertFrom-DockerInspectJson @($volumeJson) 'volume' 'oscar_oscar_state'
     Assert-True ((Get-DockerInspectLabel $volumeRecord $false 'com.botts.oscar.deployment-id') -ceq '12345678-1234-4234-8234-123456789abc') `

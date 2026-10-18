@@ -914,6 +914,17 @@ function Get-ComposeInputOutput([string]$InputText, [string[]]$Arguments) {
     }
 }
 
+function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
+    if ([string]::IsNullOrWhiteSpace($InputText) -or $Utf8NoBom.GetByteCount($InputText) -gt 65536 -or $InputText.IndexOf([char]0) -ge 0) {
+        throw 'Compose shell input must be nonempty, NUL-free, and at most 65536 UTF-8 bytes.'
+    }
+    # PowerShell 5.1 appends a Windows CRLF when piping one scalar to a native
+    # process. Normalize embedded lines and put that CR on a final shell-comment
+    # sentinel so every executable line still ends with a Unix LF.
+    $normalized = $InputText.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd([char[]]@([char]10))
+    return @(Get-ComposeInputOutput "$normalized`n# oscar-powershell-stdin-terminator" $Arguments)
+}
+
 function ConvertFrom-DockerInspectJson([string[]]$Lines, [ValidateSet('image', 'volume')][string]$Kind, [string]$Name) {
     $rawJson = $Lines -join "`n"
     $byteCount = $Utf8NoBom.GetByteCount($rawJson)
@@ -1032,7 +1043,9 @@ test "$(grep -Fxc "version=$1" "$marker")" = 1
 test "$(grep -Fxc data_checksums=on "$marker")" = 1
 test "$(grep -Ec '^initialized_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$marker")" = 1
 '@
-    Invoke-Compose @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $markerCheck, 'profile-check', $expectedVersion)
+    # With sh -s, arguments after the options begin at $1; $0 remains the
+    # shell name. Pass the expected release directly because markerCheck reads $1.
+    [void](Get-ComposeShellInputOutput $markerCheck @('exec', '-T', 'postgres', 'sh', '-seu', $expectedVersion))
     $configCheck = @'
 config=/var/lib/oscar/config.json
 test -f "$config" && test ! -L "$config"
@@ -1043,7 +1056,7 @@ grep -Fq '"frameRetentionCount": 5' "$config"
     $configReady = $false
     for ($attempt = 1; $attempt -le 30; $attempt++) {
         try {
-            Invoke-Compose @('exec', '-T', 'oscar', 'sh', '-eu', '-c', $configCheck) *> $null
+            [void](Get-ComposeShellInputOutput $configCheck @('exec', '-T', 'oscar', 'sh', '-seu'))
             $configReady = $true
         } catch { $configReady = $false }
         if ($configReady) { break }
