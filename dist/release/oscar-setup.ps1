@@ -141,6 +141,40 @@ function Invoke-External([string]$Program, [string[]]$Arguments) {
     }
 }
 
+function ConvertTo-ShellStdin([string]$InputText) {
+    if ([string]::IsNullOrWhiteSpace($InputText) -or $Utf8NoBom.GetByteCount($InputText) -gt 1048576 -or $InputText.IndexOf([char]0) -ge 0) {
+        throw 'Shell input must be nonempty, NUL-free, and at most 1048576 UTF-8 bytes.'
+    }
+    # Windows PowerShell 5.1 appends CRLF when piping one scalar to a native
+    # process. Normalize executable lines, then put the appended CR on a final
+    # shell-comment sentinel where it cannot alter syntax or data.
+    $normalized = $InputText.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd([char[]]@([char]10))
+    return "$normalized`n# oscar-powershell-stdin-terminator"
+}
+
+function Get-ExternalInputOutput([string]$InputText, [string]$Program, [string[]]$Arguments) {
+    $previousErrorPreference = $ErrorActionPreference
+    $previousOutputEncoding = $OutputEncoding
+    try {
+        $ErrorActionPreference = 'Continue'
+        $OutputEncoding = $Utf8NoBom
+        $output = @($InputText | & $Program @Arguments)
+        if ($LASTEXITCODE -ne 0) { throw "$Program exited with code $LASTEXITCODE." }
+        return $output
+    } finally {
+        $OutputEncoding = $previousOutputEncoding
+        $ErrorActionPreference = $previousErrorPreference
+    }
+}
+
+function Get-DockerShellInputOutput([string]$InputText, [string[]]$Arguments) {
+    if ($Arguments.Count -lt 2 -or $Arguments[0] -cne 'run' -or $Arguments -contains '--interactive' -or $Arguments -contains '-i') {
+        throw 'Docker shell-stdin execution requires one noninteractive run argument vector; the helper owns --interactive.'
+    }
+    $pinned = @('run', '--interactive') + @($Arguments[1..($Arguments.Count - 1)])
+    return @(Get-ExternalInputOutput (ConvertTo-ShellStdin $InputText) 'docker' $pinned)
+}
+
 function Invoke-ExternalProbe([scriptblock]$Action) {
     $previousErrorPreference = $ErrorActionPreference
     try {
@@ -773,8 +807,8 @@ function Initialize-Tls([string]$Name) {
     # Docker service.
     Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'chmod', '--volume', "${tlsDirectory}:/tls", $image,
         '0444', '/tls/server.crt', '/tls/server.key')
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${tlsDirectory}:/tls:ro", $image, '-c',
-        'openssl x509 -in /tls/server.crt -pubkey -noout >/tmp/cert.pub && openssl pkey -in /tls/server.key -pubout >/tmp/key.pub && cmp -s /tmp/cert.pub /tmp/key.pub')
+    $keyPairCheck = 'openssl x509 -in /tls/server.crt -pubkey -noout >/tmp/cert.pub && openssl pkey -in /tls/server.key -pubout >/tmp/key.pub && cmp -s /tmp/cert.pub /tmp/key.pub'
+    [void](Get-DockerShellInputOutput $keyPairCheck @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${tlsDirectory}:/tls:ro", $image, '-seu'))
     $parsedIp = $null
     $nameCheck = if ([Net.IPAddress]::TryParse($Name, [ref]$parsedIp)) { '-checkip' } else { '-checkhost' }
     # openssl x509 -checkhost/-checkip exits zero even when its text reports a
@@ -789,7 +823,7 @@ function Initialize-Tls([string]$Name) {
 function Remove-LegacyEmbeddedBackupDirectory {
     Invoke-Compose @('stop', 'gateway', 'oscar')
     $script = 'if [ -e /state/backups ] || [ -L /state/backups ]; then [ -d /state/backups ] && [ ! -L /state/backups ] || { echo "Legacy embedded backup path is not a regular directory." >&2; exit 1; }; rmdir -- /state/backups || { echo "Legacy embedded /var/lib/oscar/backups is nonempty. Preserve or export its contents, explicitly empty that non-authoritative volume path, then retry upgrade." >&2; exit 1; }; fi'
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', (Get-OscarImage), '-eu', '-c', $script)
+    [void](Get-DockerShellInputOutput $script @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', (Get-OscarImage), '-seu'))
 }
 
 function Add-LocalHostsMapping([string]$Name) {
@@ -819,13 +853,13 @@ function Assert-Configured {
 function Invoke-StorageCommand([string]$StorageCommand, [string]$StorageSubcommand) {
     $storageScript = Join-Path $ScriptRoot 'oscar-storage.ps1'
     if (-not (Test-Path -LiteralPath $storageScript -PathType Leaf)) { throw 'The OSCAR storage administration script is missing.' }
-    $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $storageScript, '-Command', $StorageCommand)
+    $parameters = [ordered]@{ Command = $StorageCommand }
     if ($StorageCommand -eq 'archive') {
-        $arguments += @('-Action', $(if ($StorageSubcommand) { $StorageSubcommand } else { 'status' }))
-        if ($HoldAction) { $arguments += @('-HoldAction', $HoldAction) }
+        $parameters.Action = $(if ($StorageSubcommand) { $StorageSubcommand } else { 'status' })
+        if ($HoldAction) { $parameters.HoldAction = $HoldAction }
     }
     if ($StorageCommand -eq 'prepare-directories' -and $Command -eq 'upgrade' -and $AdoptLegacyStorageRoots) {
-        $arguments += '-AdoptExistingStorageRoots'
+        $parameters.AdoptExistingStorageRoots = $true
     }
     foreach ($pair in @(
         @('BackupId', $BackupId), @('Confirm', $Confirm), @('Before', $Before), @('RequestedBy', $RequestedBy),
@@ -833,9 +867,48 @@ function Invoke-StorageCommand([string]$StorageCommand, [string]$StorageSubcomma
         @('Observation', $Observation), @('StoreKey', $StoreKey), @('IdScope', $IdScope),
         @('HoldId', $HoldId), @('Reason', $Reason), @('CreatedBy', $CreatedBy),
         @('ReleasedBy', $ReleasedBy), @('Keep', $(if ($Keep -gt 0) { "$Keep" } else { $null })))) {
-        if ($pair[1]) { $arguments += @("-$($pair[0])", $pair[1]) }
+        if ($pair[1]) { $parameters[$pair[0]] = $pair[1] }
     }
-    Invoke-External 'powershell.exe' $arguments
+
+    # Windows PowerShell 5.1 rewrites embedded quotes while marshalling native
+    # argv. Keep every operator value out of the child process command line:
+    # the fixed encoded command reads one bounded Base64/JSON environment
+    # envelope, enforces an exact parameter schema, and splats typed values.
+    $payload = [ordered]@{ ScriptPath = $storageScript; Parameters = $parameters }
+    $payloadJson = $payload | ConvertTo-Json -Compress -Depth 4
+    $payloadBase64 = [Convert]::ToBase64String($Utf8NoBom.GetBytes($payloadJson))
+    if ($payloadBase64.Length -gt 24576) { throw 'Storage launcher relay payload exceeds its 24576-character bound.' }
+    $childCommand = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$relayName = 'OSCAR_STORAGE_RELAY_PAYLOAD'
+$encodedPayload = [Environment]::GetEnvironmentVariable($relayName, 'Process')
+if ([string]::IsNullOrWhiteSpace($encodedPayload) -or $encodedPayload.Length -gt 24576) { throw 'Storage relay payload is missing or oversized.' }
+[Environment]::SetEnvironmentVariable($relayName, $null, 'Process')
+$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedPayload))
+$payload = $json | ConvertFrom-Json
+$rootNames = @($payload.PSObject.Properties.Name | Sort-Object)
+if (($rootNames -join '|') -cne 'Parameters|ScriptPath' -or [string]::IsNullOrWhiteSpace([string]$payload.ScriptPath) -or $null -eq $payload.Parameters) {
+    throw 'Storage relay payload has an invalid root schema.'
+}
+$allowed = @('Action','AdoptExistingStorageRoots','BackupId','Before','Command','Confirm','CreatedBy','Destination','Generation','HoldAction','HoldId','IdScope','Keep','Observation','Plan','Reason','ReleasedBy','RequestedBy','StoreKey','Token')
+$parameters = @{}
+foreach ($property in @($payload.Parameters.PSObject.Properties)) {
+    if ([string]$property.Name -cnotin $allowed) { throw "Storage relay payload has an unsupported parameter: $($property.Name)" }
+    $parameters[[string]$property.Name] = $property.Value
+}
+if (-not $parameters.ContainsKey('Command')) { throw 'Storage relay payload is missing Command.' }
+& ([string]$payload.ScriptPath) @parameters
+'@
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childCommand))
+    $relayName = 'OSCAR_STORAGE_RELAY_PAYLOAD'
+    $previousRelay = [Environment]::GetEnvironmentVariable($relayName, 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable($relayName, $payloadBase64, 'Process')
+        Invoke-External 'powershell.exe' @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand)
+    } finally {
+        [Environment]::SetEnvironmentVariable($relayName, $previousRelay, 'Process')
+    }
 }
 
 function Clear-ComposeOverrideEnvironment {
@@ -915,14 +988,7 @@ function Get-ComposeInputOutput([string]$InputText, [string[]]$Arguments) {
 }
 
 function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
-    if ([string]::IsNullOrWhiteSpace($InputText) -or $Utf8NoBom.GetByteCount($InputText) -gt 65536 -or $InputText.IndexOf([char]0) -ge 0) {
-        throw 'Compose shell input must be nonempty, NUL-free, and at most 65536 UTF-8 bytes.'
-    }
-    # PowerShell 5.1 appends a Windows CRLF when piping one scalar to a native
-    # process. Normalize embedded lines and put that CR on a final shell-comment
-    # sentinel so every executable line still ends with a Unix LF.
-    $normalized = $InputText.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd([char[]]@([char]10))
-    return @(Get-ComposeInputOutput "$normalized`n# oscar-powershell-stdin-terminator" $Arguments)
+    return @(Get-ComposeInputOutput (ConvertTo-ShellStdin $InputText) $Arguments)
 }
 
 function ConvertFrom-DockerInspectJson([string[]]$Lines, [ValidateSet('image', 'volume')][string]$Kind, [string]$Name) {
@@ -1002,11 +1068,15 @@ function Invoke-BootstrapSql([string]$Sql) {
     if ([string]::IsNullOrWhiteSpace($Sql) -or $Utf8NoBom.GetByteCount($Sql) -gt 65536 -or $Sql.IndexOf([char]0) -ge 0) {
         throw 'Bootstrap SQL must be nonempty, NUL-free, and at most 65536 UTF-8 bytes.'
     }
-    # Stream SQL over stdin instead of forwarding it through a quoted shell
-    # positional argument. Windows PowerShell 5.1 otherwise strips nested
-    # variadic-shell quoting and splits one SQL statement into multiple psql arguments.
-    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); export PGPASSWORD; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --tuples-only --no-align'
-    $output = Get-ComposeInputOutput $Sql @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper)
+    # Stream both the credential wrapper and SQL over stdin. The quoted,
+    # per-call delimiter makes psql consume SQL from its own heredoc without
+    # exposing a password or forwarding executable text in a native argv.
+    $normalizedSql = $Sql.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd([char[]]@([char]10))
+    do { $delimiter = 'OSCAR_SQL_' + [Guid]::NewGuid().ToString('N') }
+    while ($normalizedSql -match "(?m)^$([Regex]::Escape($delimiter))$")
+    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); export PGPASSWORD; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --tuples-only --no-align --file=-'
+    $shellInput = "$wrapper <<'$delimiter'`n$normalizedSql`n$delimiter"
+    $output = Get-ComposeShellInputOutput $shellInput @('exec', '-T', 'postgres', 'sh', '-seu')
     return (($output -join "`n").Trim())
 }
 

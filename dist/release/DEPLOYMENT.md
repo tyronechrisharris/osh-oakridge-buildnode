@@ -258,7 +258,15 @@ Release image tags are immutable once published. If developers rebuild 3.9.2 rep
 
 The default configuration for a new installation is labeled `OSCAR 3.9.2`. An upgrade preserves `/var/lib/oscar/config.json`, including a customized deployment name, so the Admin UI may continue to display the prior or site-specific label. Do not overwrite that value merely to display a version number. Use `OSCAR_VERSION` in `.env` and `docker compose images` to verify the running release. The OSCAR image also stamps that value into the OCI `org.opencontainers.image.version` label; inspect it on PowerShell or a POSIX shell with `docker image inspect oscar:3.9.2 --format '{{json .Config.Labels}}'` and require the label value `3.9.2` before accepting the image.
 
-On Windows, setup streams its multiline PostgreSQL checksum-marker and saved OSCAR configuration checks into the one-shot container shells over standard input. This preserves the checks exactly under Windows PowerShell 5.1 native argument handling. A failed check leaves the initialization receipt in `INITIALIZING`; correct the reported problem and rerun `oscar.bat init` from the same release and protected runtime state rather than deleting the volumes.
+On Windows, setup and storage administration stream every bounded shell body and direct `psql`
+statement into the one-shot container over UTF-8 standard input. The direct `docker run` adapter owns
+the required `--interactive` attachment, while Compose execution remains non-TTY with `exec -T`.
+Setup relays storage-command parameters to its child PowerShell process through a bounded,
+allowlisted Base64/JSON environment envelope and a fixed encoded command; operator text is never
+forwarded as native executable arguments. These rules preserve multiline checks, SQL, paths, and
+quoted values exactly under Windows PowerShell 5.1 native argument handling. A failed initialization
+check leaves the receipt in `INITIALIZING`; correct the reported problem and rerun `oscar.bat init`
+from the same release and protected runtime state rather than deleting the volumes.
 
 ### 3.9.2 storage migration boundary
 

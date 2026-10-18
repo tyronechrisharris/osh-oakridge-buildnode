@@ -127,6 +127,38 @@ try {
 
     $storageSource = [IO.File]::ReadAllText($storageScript)
     $setupSource = [IO.File]::ReadAllText($setupScript)
+    foreach ($astFixture in @(
+        @{ Path = $setupScript; ExpectedShellRuns = 2 },
+        @{ Path = $storageScript; ExpectedShellRuns = 18 })) {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($astFixture.Path, [ref]$tokens, [ref]$parseErrors)
+        Assert-True ($parseErrors.Count -eq 0) "Could not build the PowerShell AST inventory for $($astFixture.Path)."
+        $literalValues = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.StringConstantExpressionAst] -or
+                $node -is [Management.Automation.Language.ExpandableStringExpressionAst]
+        }, $true) | ForEach-Object { [string]$_.Value })
+        foreach ($forbiddenValue in @('-c', '--command', '$@')) {
+            Assert-True (-not ($literalValues -ccontains $forbiddenValue)) `
+                "$($astFixture.Path) contains a forbidden native shell/SQL argv literal: $forbiddenValue"
+        }
+        $shellRuns = @($ast.FindAll({
+            param($node)
+            if ($node -isnot [Management.Automation.Language.CommandAst]) { return $false }
+            $values = @($node.FindAll({
+                param($child)
+                $child -is [Management.Automation.Language.StringConstantExpressionAst]
+            }, $true) | ForEach-Object { [string]$_.Value })
+            return ($values -ccontains '--entrypoint' -and $values -ccontains 'sh')
+        }, $true))
+        Assert-True ($shellRuns.Count -eq $astFixture.ExpectedShellRuns) `
+            "$($astFixture.Path) entrypoint-sh inventory changed: expected $($astFixture.ExpectedShellRuns), found $($shellRuns.Count)."
+        foreach ($shellRun in $shellRuns) {
+            Assert-True ($shellRun.GetCommandName() -cin @('Get-DockerShellInputOutput', 'Invoke-DockerShellInput')) `
+                "$($astFixture.Path) has an entrypoint-sh call outside the bounded stdin adapters: $($shellRun.GetCommandName())"
+        }
+    }
     Assert-True ($storageSource.Contains('$writeThroughFlag = [uint32]2147483648')) `
         'The Windows durability barrier does not construct FILE_FLAG_WRITE_THROUGH as an unsigned value.'
     Assert-True (-not $storageSource.Contains(', 0x80000000,')) `
@@ -169,18 +201,20 @@ try {
         $composeInputSource.Contains('$InputText | & docker @pinned') -and
         $composeInputSource.Contains('$OutputEncoding = $previousOutputEncoding') -and
         $composeInputSource.Contains('function Get-ComposeShellInputOutput') -and
-        $composeInputSource.Contains('# oscar-powershell-stdin-terminator') -and
-        $composeInputSource.Contains('.Replace("`r`n", "`n").Replace("`r", "`n")')) `
+        $setupSource.Contains('# oscar-powershell-stdin-terminator') -and
+        $setupSource.Contains('.Replace("`r`n", "`n").Replace("`r", "`n")')) `
         'Windows Compose stdin execution does not preserve UTF-8 shell input with Unix line endings and restore its encoding.'
     $bootstrapStart = $setupSource.IndexOf('function Invoke-BootstrapSql', [StringComparison]::Ordinal)
     $bootstrapEnd = $setupSource.IndexOf('function Enable-StorageDatabaseFeatures', $bootstrapStart, [StringComparison]::Ordinal)
     Assert-True ($bootstrapStart -ge 0 -and $bootstrapEnd -gt $bootstrapStart) 'Could not isolate Windows bootstrap SQL execution.'
     $bootstrapSource = $setupSource.Substring($bootstrapStart, $bootstrapEnd - $bootstrapStart)
-    Assert-True ($bootstrapSource.Contains('Get-ComposeInputOutput $Sql') -and
-        $bootstrapSource.Contains('exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --tuples-only --no-align') -and
+    Assert-True ($bootstrapSource.Contains('Get-ComposeShellInputOutput $shellInput') -and
+        $bootstrapSource.Contains('exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --tuples-only --no-align --file=-') -and
+        $bootstrapSource.Contains("<<'`$delimiter'") -and
         $bootstrapSource.Contains('[string]::IsNullOrWhiteSpace($Sql)') -and
-        -not $bootstrapSource.Contains('$@') -and -not $bootstrapSource.Contains("'--command'")) `
-        'Windows bootstrap SQL is not a bounded stdin stream to direct psql.'
+        -not $bootstrapSource.Contains('$@') -and -not $bootstrapSource.Contains("'-c'") -and
+        -not $bootstrapSource.Contains("'--command'")) `
+        'Windows bootstrap SQL and credential wrapper are not one bounded stdin stream to direct psql.'
     $completionStart = $setupSource.IndexOf('function Complete-PendingFreshInit', [StringComparison]::Ordinal)
     $completionEnd = $setupSource.IndexOf('function Get-ConfiguredEndpoint', $completionStart, [StringComparison]::Ordinal)
     Assert-True ($completionStart -ge 0 -and $completionEnd -gt $completionStart) 'Could not isolate Windows fresh-init completion checks.'
@@ -200,10 +234,14 @@ try {
     # Execute the exact shell-input adapter in a native PS5 scope with a mock
     # Compose sink. This proves CRLF/CR normalization, the comment sentinel,
     # multiline preservation, and argv ordering independently of source text.
+    $shellNormalizerStart = $setupSource.IndexOf('function ConvertTo-ShellStdin', [StringComparison]::Ordinal)
+    $shellNormalizerEnd = $setupSource.IndexOf('function Invoke-ExternalProbe', $shellNormalizerStart, [StringComparison]::Ordinal)
     $shellHelperStart = $setupSource.IndexOf('function Get-ComposeShellInputOutput', [StringComparison]::Ordinal)
     $shellHelperEnd = $setupSource.IndexOf('function ConvertFrom-DockerInspectJson', $shellHelperStart, [StringComparison]::Ordinal)
-    Assert-True ($shellHelperStart -ge 0 -and $shellHelperEnd -gt $shellHelperStart) 'Could not isolate Windows shell-input adapter.'
-    $shellHelperSource = $setupSource.Substring($shellHelperStart, $shellHelperEnd - $shellHelperStart)
+    Assert-True ($shellNormalizerStart -ge 0 -and $shellNormalizerEnd -gt $shellNormalizerStart -and
+        $shellHelperStart -ge 0 -and $shellHelperEnd -gt $shellHelperStart) 'Could not isolate Windows shell-input adapters.'
+    $shellHelperSource = $setupSource.Substring($shellNormalizerStart, $shellNormalizerEnd - $shellNormalizerStart) + "`n" +
+        $setupSource.Substring($shellHelperStart, $shellHelperEnd - $shellHelperStart)
     $shellFixture = & {
         $Utf8NoBom = New-Object Text.UTF8Encoding($false)
         $script:capturedShellInput = $null
@@ -214,6 +252,16 @@ try {
             return @('accepted')
         }
         Invoke-Expression $shellHelperSource
+        function Get-ExternalInputOutput([string]$InputText, [string]$Program, [string[]]$Arguments) {
+            $script:capturedDockerShellInput = $InputText
+            $script:capturedDockerShellProgram = $Program
+            $script:capturedDockerShellArguments = @($Arguments)
+            return @('docker-accepted')
+        }
+        $dockerResult = @(Get-DockerShellInputOutput 'test -f /state/marker' @('run', '--rm', '--entrypoint', 'sh', 'oscar:test', '-seu'))
+        $rejectedInteractiveCaller = $false
+        try { [void](Get-DockerShellInputOutput 'true' @('run', '--interactive', '--entrypoint', 'sh', 'oscar:test', '-seu')) }
+        catch { $rejectedInteractiveCaller = $_.Exception.Message -like '*helper owns --interactive*' }
         $markerFixture = "marker=/data/marker`r`ntest `"`$(grep -Fxc `"version=`$1`" `"`$marker`")`" = 1`r`n"
         $markerResult = @(Get-ComposeShellInputOutput $markerFixture @('exec', '-T', 'postgres', 'sh', '-seu', '3.9.2'))
         $markerInput = $script:capturedShellInput
@@ -227,6 +275,11 @@ try {
             ConfigInput = $script:capturedShellInput
             ConfigArguments = @($script:capturedShellArguments)
             ConfigResult = @($configResult)
+            DockerInput = $script:capturedDockerShellInput
+            DockerProgram = $script:capturedDockerShellProgram
+            DockerArguments = @($script:capturedDockerShellArguments)
+            DockerResult = @($dockerResult)
+            RejectedInteractiveCaller = $rejectedInteractiveCaller
         }
     }
     $expectedMarkerInput = "marker=/data/marker`ntest `"`$(grep -Fxc `"version=`$1`" `"`$marker`")`" = 1`n# oscar-powershell-stdin-terminator"
@@ -240,6 +293,273 @@ try {
     Assert-True (($shellFixture.MarkerResult.Count -eq 1) -and ($shellFixture.MarkerResult[0] -ceq 'accepted') -and
         ($shellFixture.ConfigResult.Count -eq 1) -and ($shellFixture.ConfigResult[0] -ceq 'accepted')) `
         'Windows shell-input adapter did not return Compose output for both multiline checks.'
+    Assert-True ($shellFixture.DockerProgram -ceq 'docker' -and
+        ($shellFixture.DockerArguments -join [char]0) -ceq (@('run', '--interactive', '--rm', '--entrypoint', 'sh', 'oscar:test', '-seu') -join [char]0) -and
+        $shellFixture.DockerInput.EndsWith('# oscar-powershell-stdin-terminator') -and
+        $shellFixture.DockerResult[0] -ceq 'docker-accepted') `
+        'Windows direct docker shell-input adapter did not own the required interactive stdin attachment.'
+    Assert-True $shellFixture.RejectedInteractiveCaller 'Windows direct docker shell-input adapter accepted caller-owned interactive mode.'
+    Assert-True (-not $setupSource.Contains("'-c'") -and -not $storageSource.Contains("'-c'") -and
+        -not $setupSource.Contains("'--command'") -and -not $storageSource.Contains("'--command'") -and
+        -not $setupSource.Contains('$@') -and -not $storageSource.Contains('$@')) `
+        'A PowerShell release script still forwards executable shell/SQL text through a native argv.'
+
+    # Run the exact setup-to-storage relay through native Windows PowerShell.
+    # Quotes, newlines, dollar syntax, spaces, and option-looking text must
+    # arrive as one typed parameter value while native argv remains fixed.
+    $storageRelayStart = $setupSource.IndexOf('function Invoke-StorageCommand', [StringComparison]::Ordinal)
+    $storageRelayEnd = $setupSource.IndexOf('function Clear-ComposeOverrideEnvironment', $storageRelayStart, [StringComparison]::Ordinal)
+    Assert-True ($storageRelayStart -ge 0 -and $storageRelayEnd -gt $storageRelayStart) 'Could not isolate the Windows setup-to-storage relay.'
+    $storageRelaySource = $setupSource.Substring($storageRelayStart, $storageRelayEnd - $storageRelayStart)
+    $relayFixture = & {
+        $ScriptRoot = Join-Path $temporaryRoot 'storage-relay'
+        New-Item -ItemType Directory -Path $ScriptRoot | Out-Null
+        $capturePath = Join-Path $ScriptRoot 'capture.json'
+        $fakeStorageScript = @'
+param(
+    [string]$Command,
+    [string]$Action,
+    [string]$HoldAction,
+    [string]$Reason,
+    [string]$Destination,
+    [int]$Keep,
+    [switch]$AdoptExistingStorageRoots
+)
+if ($Reason -ceq 'deliberate-child-failure') { throw 'deliberate nested storage failure' }
+$result = [ordered]@{
+    Command = $Command
+    Action = $Action
+    HoldAction = $HoldAction
+    Reason = $Reason
+    Destination = $Destination
+    Keep = $Keep
+    AdoptExistingStorageRoots = [bool]$AdoptExistingStorageRoots
+}
+[IO.File]::WriteAllText($env:OSCAR_STORAGE_RELAY_CAPTURE, ($result | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+'@
+        [IO.File]::WriteAllText((Join-Path $ScriptRoot 'oscar-storage.ps1'), $fakeStorageScript, $Utf8NoBom)
+        Invoke-Expression $storageRelaySource
+        $script:CapturedRelayProgram = $null
+        $script:CapturedRelayArguments = @()
+        $script:RelayInvocationCount = 0
+        function Invoke-External([string]$Program, [string[]]$Arguments) {
+            $script:RelayInvocationCount++
+            $script:CapturedRelayProgram = $Program
+            $script:CapturedRelayArguments = @($Arguments)
+            $previousErrorPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $Program @Arguments
+                if ($LASTEXITCODE -ne 0) { throw "$Program exited with code $LASTEXITCODE." }
+            } finally { $ErrorActionPreference = $previousErrorPreference }
+        }
+        $Command = 'status'
+        $HoldAction = 'create'
+        $AdoptLegacyStorageRoots = $false
+        $BackupId = $null; $Confirm = $null; $Before = $null; $RequestedBy = $null
+        $Plan = $null; $Token = $null; $Generation = $null
+        $Observation = $null; $StoreKey = $null; $IdScope = $null; $HoldId = $null
+        $CreatedBy = $null; $ReleasedBy = $null
+        $Keep = 7
+        $Reason = "quoted `"value`"`r`nwith `$@ --command -c"
+        $Destination = 'C:\relay path\folder with spaces'
+        $positiveReason = $Reason
+        $positiveDestination = $Destination
+        $env:OSCAR_STORAGE_RELAY_CAPTURE = $capturePath
+        [Environment]::SetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', 'preserved-parent-value', 'Process')
+        try {
+            Invoke-StorageCommand 'archive' 'hold'
+            $captured = [IO.File]::ReadAllText($capturePath) | ConvertFrom-Json
+            $restoredRelay = [Environment]::GetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', 'Process')
+            $encodedArguments = @($script:CapturedRelayArguments)
+            $badPayload = [ordered]@{
+                ScriptPath = (Join-Path $ScriptRoot 'oscar-storage.ps1')
+                Parameters = [ordered]@{ Command = 'help'; Unexpected = 'rejected' }
+            }
+            $badJson = $badPayload | ConvertTo-Json -Compress -Depth 4
+            $badEnvelope = [Convert]::ToBase64String($Utf8NoBom.GetBytes($badJson))
+            [Environment]::SetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', $badEnvelope, 'Process')
+            $savedErrorPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & powershell.exe @encodedArguments 2>$null
+                $schemaRejected = ($LASTEXITCODE -ne 0)
+            } finally { $ErrorActionPreference = $savedErrorPreference }
+            $Reason = 'deliberate-child-failure'
+            [Environment]::SetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', 'negative-parent-value', 'Process')
+            $childFailurePropagated = $false
+            try { Invoke-StorageCommand 'archive' 'hold' }
+            catch { $childFailurePropagated = $_.Exception.Message -like 'powershell.exe exited with code *' }
+            $negativeRelayRestored = [Environment]::GetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', 'Process')
+            $Reason = $positiveReason
+            $Destination = ('x' * 20000)
+            [Environment]::SetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', 'oversize-parent-value', 'Process')
+            $oversizeRejected = $false
+            try { Invoke-StorageCommand 'archive' 'hold' }
+            catch { $oversizeRejected = $_.Exception.Message -like '*24576-character bound*' }
+            $oversizeRelayPreserved = [Environment]::GetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', 'Process')
+        } finally {
+            Remove-Item Env:OSCAR_STORAGE_RELAY_CAPTURE -ErrorAction SilentlyContinue
+            [Environment]::SetEnvironmentVariable('OSCAR_STORAGE_RELAY_PAYLOAD', $null, 'Process')
+        }
+        return [pscustomobject]@{
+            Captured = $captured
+            Program = $script:CapturedRelayProgram
+            Arguments = @($script:CapturedRelayArguments)
+            Reason = $positiveReason
+            Destination = $positiveDestination
+            RestoredRelay = $restoredRelay
+            SchemaRejected = $schemaRejected
+            ChildFailurePropagated = $childFailurePropagated
+            NegativeRelayRestored = $negativeRelayRestored
+            OversizeRejected = $oversizeRejected
+            OversizeRelayPreserved = $oversizeRelayPreserved
+            InvocationCount = $script:RelayInvocationCount
+        }
+    }
+    Assert-True ($relayFixture.Program -ceq 'powershell.exe' -and
+        $relayFixture.Arguments.Count -eq 7 -and
+        (($relayFixture.Arguments[0..5] -join [char]0) -ceq
+            (@('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand') -join [char]0)) -and
+        -not ($relayFixture.Arguments -contains '-File') -and
+        -not (($relayFixture.Arguments -join [char]0).Contains($relayFixture.Reason)) -and
+        -not (($relayFixture.Arguments -join [char]0).Contains($relayFixture.Destination))) `
+        'Windows setup still exposes dynamic storage values to native argv.'
+    Assert-True ($relayFixture.Captured.Command -ceq 'archive' -and
+        $relayFixture.Captured.Action -ceq 'hold' -and
+        $relayFixture.Captured.HoldAction -ceq 'create' -and
+        $relayFixture.Captured.Reason -ceq $relayFixture.Reason -and
+        $relayFixture.Captured.Destination -ceq $relayFixture.Destination -and
+        $relayFixture.Captured.Keep -eq 7 -and
+        $relayFixture.RestoredRelay -ceq 'preserved-parent-value') `
+        'Windows setup-to-storage Base64/JSON relay did not preserve exact typed values or restore its environment.'
+    Assert-True ($relayFixture.SchemaRejected -and $relayFixture.ChildFailurePropagated -and
+        $relayFixture.NegativeRelayRestored -ceq 'negative-parent-value' -and
+        $relayFixture.OversizeRejected -and
+        $relayFixture.OversizeRelayPreserved -ceq 'oversize-parent-value' -and
+        $relayFixture.InvocationCount -eq 2) `
+        'Windows setup-to-storage relay hid a nested failure, leaked its environment, or launched an oversized payload.'
+
+    $bootstrapCollisionFixture = & {
+        $script:BootstrapDelimiterCalls = 0
+        $script:CapturedBootstrapInput = $null
+        $script:CapturedBootstrapArguments = @()
+        function Get-BootstrapDelimiterToken {
+            $script:BootstrapDelimiterCalls++
+            if ($script:BootstrapDelimiterCalls -eq 1) { return ('3' * 32) }
+            return ('4' * 32)
+        }
+        function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
+            $script:CapturedBootstrapInput = $InputText
+            $script:CapturedBootstrapArguments = @($Arguments)
+            return @('bootstrap-ok')
+        }
+        $testSource = $bootstrapSource.Replace("[Guid]::NewGuid().ToString('N')", '(Get-BootstrapDelimiterToken)')
+        Invoke-Expression $testSource
+        $firstDelimiter = 'OSCAR_SQL_' + ('3' * 32)
+        $secondDelimiter = 'OSCAR_SQL_' + ('4' * 32)
+        $sql = "SELECT '`$@ --command -c';`r`n$firstDelimiter`r`nSELECT 'quote '' preserved';"
+        $result = Invoke-BootstrapSql $sql
+        return [pscustomobject]@{
+            Calls = $script:BootstrapDelimiterCalls
+            Input = $script:CapturedBootstrapInput
+            Arguments = @($script:CapturedBootstrapArguments)
+            Result = $result
+            Sql = $sql.Replace("`r`n", "`n")
+            Delimiter = $secondDelimiter
+        }
+    }
+    $bootstrapLines = @($bootstrapCollisionFixture.Input.Split([char]10))
+    Assert-True ($bootstrapCollisionFixture.Calls -eq 2 -and
+        $bootstrapCollisionFixture.Result -ceq 'bootstrap-ok' -and
+        ($bootstrapCollisionFixture.Arguments -join [char]0) -ceq (@('exec', '-T', 'postgres', 'sh', '-seu') -join [char]0) -and
+        $bootstrapLines[0].EndsWith("<<'$($bootstrapCollisionFixture.Delimiter)'") -and
+        $bootstrapLines[$bootstrapLines.Count - 1] -ceq $bootstrapCollisionFixture.Delimiter -and
+        ([string]::Join("`n", $bootstrapLines[1..($bootstrapLines.Count - 2)]) -ceq $bootstrapCollisionFixture.Sql)) `
+        'Windows bootstrap SQL did not retry a delimiter collision and preserve quoted multiline SQL exactly.'
+
+    # Prove the direct psql adapter preserves shell-looking SQL as inert
+    # heredoc data and quotes its unique delimiter. Then substitute a
+    # deterministic two-value delimiter source into the exact production
+    # function to force and verify its standalone-line collision retry.
+    $quotedSql = @'
+SELECT '$@', '--command', '-c';
+SELECT 'single quote '' and $dollar';
+'@
+    $quotedShellInput = New-PsqlShellInput $quotedSql
+    $quotedLines = @($quotedShellInput.Split([char]10))
+    $quotedDelimiter = $quotedLines[$quotedLines.Count - 1]
+    Assert-True ($quotedDelimiter -match '^OSCAR_SQL_[0-9a-f]{32}$' -and
+        $quotedLines[0].EndsWith("<<'$quotedDelimiter'") -and
+        $quotedLines[0].Contains('exec psql ') -and
+        $quotedLines[0].Contains(' --file=-') -and
+        -not $quotedLines[0].Contains(' --command ')) `
+        'Windows psql stdin does not use one quoted, direct-psql heredoc delimiter.'
+    $quotedRoundTrip = [string]::Join("`n", $quotedLines[1..($quotedLines.Count - 2)])
+    Assert-True ($quotedRoundTrip -ceq $quotedSql.TrimEnd([char[]]@([char]10))) `
+        'Windows psql stdin changed SQL containing shell-looking text or quotes.'
+    $psqlInputStart = $storageSource.IndexOf('function New-PsqlShellInput', [StringComparison]::Ordinal)
+    $psqlInputEnd = $storageSource.IndexOf('function Invoke-Psql', $psqlInputStart, [StringComparison]::Ordinal)
+    Assert-True ($psqlInputStart -ge 0 -and $psqlInputEnd -gt $psqlInputStart) 'Could not isolate the Windows psql stdin adapter.'
+    $psqlInputSource = $storageSource.Substring($psqlInputStart, $psqlInputEnd - $psqlInputStart)
+    $collisionFixture = & {
+        $script:TestDelimiterCalls = 0
+        function Get-TestDelimiterToken {
+            $script:TestDelimiterCalls++
+            if ($script:TestDelimiterCalls -eq 1) { return ('1' * 32) }
+            return ('2' * 32)
+        }
+        $testSource = $psqlInputSource.Replace("[Guid]::NewGuid().ToString('N')", '(Get-TestDelimiterToken)')
+        Invoke-Expression $testSource
+        $firstDelimiter = 'OSCAR_SQL_' + ('1' * 32)
+        $secondDelimiter = 'OSCAR_SQL_' + ('2' * 32)
+        $sql = "SELECT 1;`n$firstDelimiter`nSELECT 2;"
+        $shellInput = New-PsqlShellInput $sql
+        return [pscustomobject]@{
+            Calls = $script:TestDelimiterCalls
+            First = $firstDelimiter
+            Second = $secondDelimiter
+            ShellInput = $shellInput
+            Sql = $sql
+        }
+    }
+    $collisionLines = @($collisionFixture.ShellInput.Split([char]10))
+    Assert-True ($collisionFixture.Calls -eq 2 -and
+        $collisionLines[0].EndsWith("<<'$($collisionFixture.Second)'") -and
+        $collisionLines[$collisionLines.Count - 1] -ceq $collisionFixture.Second -and
+        ([string]::Join("`n", $collisionLines[1..($collisionLines.Count - 2)]) -ceq $collisionFixture.Sql)) `
+        'Windows psql stdin did not retry a colliding heredoc delimiter while preserving SQL exactly.'
+
+    # Exercise the actual file-streaming helper with a native-command-shaped
+    # pipeline sink. A nonzero docker status must survive the pipeline and
+    # prevent callers from treating a partial output file as success.
+    & {
+        $savedScriptRoot = $ScriptRoot
+        $ScriptRoot = $temporaryRoot
+        $capturePath = Join-Path $temporaryRoot 'failed-psql-stream.txt'
+        $script:CapturedDockerPipelineInput = $null
+        $script:CapturedDockerPipelineArguments = @()
+        function docker {
+            process {
+                $script:CapturedDockerPipelineInput = [string]$_
+                $script:CapturedDockerPipelineArguments = @($args)
+                'partial-row'
+                $global:LASTEXITCODE = 23
+            }
+        }
+        $failurePropagated = $false
+        try {
+            Write-ComposeShellInputOutputToFile 'printf ''row\n''' @('exec', '-T', 'postgres', 'sh', '-seu') $capturePath
+        } catch {
+            $failurePropagated = $_.Exception.Message -like '*exited with code 23*'
+        } finally {
+            $ScriptRoot = $savedScriptRoot
+        }
+        Assert-True $failurePropagated 'Windows Compose shell-to-file streaming hid a nonzero docker exit code.'
+        Assert-True ($script:CapturedDockerPipelineInput.EndsWith('# oscar-powershell-stdin-terminator') -and
+            ($script:CapturedDockerPipelineArguments -join [char]0).Contains('compose')) `
+            'Windows Compose shell-to-file failure test did not exercise the real stdin/argv pipeline.'
+    }
     $volumeJson = '[{"Name":"oscar_oscar_state","CreatedAt":"2026-10-18T13:45:03Z","Labels":{"com.botts.oscar.deployment-id":"12345678-1234-4234-8234-123456789abc"}}]'
     $volumeRecord = ConvertFrom-DockerInspectJson @($volumeJson) 'volume' 'oscar_oscar_state'
     Assert-True ((Get-DockerInspectLabel $volumeRecord $false 'com.botts.oscar.deployment-id') -ceq '12345678-1234-4234-8234-123456789abc') `
@@ -272,8 +592,11 @@ try {
         function Protect-DockerStorageDirectory([string]$Path, [string]$Mode) {}
         function Get-ComposeOutput([string[]]$Arguments) { return @('postgres') }
         function Invoke-Compose([string[]]$Arguments) {}
+        function Invoke-DockerShellInput([string]$InputText, [string[]]$Arguments) {
+            $calls.Add([pscustomobject]@{ Program = 'docker'; Arguments = @($Arguments); InputText = $InputText })
+        }
         function Invoke-External([string]$Program, [string[]]$Arguments) {
-            $calls.Add([pscustomobject]@{ Program = $Program; Arguments = @($Arguments) })
+            $calls.Add([pscustomobject]@{ Program = $Program; Arguments = @($Arguments); InputText = $null })
         }
         try {
             $id = '20261018T120000Z-1234abcd'
@@ -287,12 +610,13 @@ try {
         $validatorArgs = [string]::Join('|', $calls[0].Arguments)
         $extractorArgs = [string]::Join('|', $calls[1].Arguments)
         $javaArgs = [string]::Join('|', $calls[2].Arguments)
-        Assert-True ($validatorArgs.Contains('--user|0') -and $validatorArgs.Contains('/validate-storage-archive.sh oscar-state')) `
+        Assert-True ($validatorArgs.Contains('--user|0') -and
+            ([string]$calls[0].InputText).Contains('/validate-storage-archive.sh oscar-state')) `
             'Daily journal confirmation does not validate the authenticated archive as root before extraction.'
         foreach ($required in @('--cap-drop|ALL|--cap-add|CHOWN', '--workdir|/|--user|0|--entrypoint|sh')) {
             Assert-True ($extractorArgs.Contains($required)) "Daily journal extraction is missing its constrained root ownership bridge: $required"
         }
-        $extractCommand = [string]$calls[1].Arguments[$calls[1].Arguments.Count - 1]
+        $extractCommand = [string]$calls[1].InputText
         $extractIndex = $extractCommand.IndexOf('tar --no-same-owner', [StringComparison]::Ordinal)
         $directoryModeIndex = $extractCommand.IndexOf('find /snapshot -type d -exec chmod 0700', [StringComparison]::Ordinal)
         $fileModeIndex = $extractCommand.IndexOf('find /snapshot -type f -exec chmod 0600', [StringComparison]::Ordinal)

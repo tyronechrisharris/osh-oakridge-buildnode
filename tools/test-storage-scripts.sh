@@ -277,6 +277,17 @@ assert_contains "Get-ComposeShellInputOutput \\\$configCheck @\\('exec', '-T', '
 assert_contains '# oscar-powershell-stdin-terminator' "$setup_powershell_script"
 assert_not_contains "'-c', \\\$markerCheck" "$setup_powershell_script"
 assert_not_contains "'-c', \\\$configCheck" "$setup_powershell_script"
+for powershell_release_script in "$setup_powershell_script" "$powershell_script"; do
+    assert_not_contains "'-c'" "$powershell_release_script"
+    assert_not_contains "'--command'" "$powershell_release_script"
+    assert_not_contains '\$@' "$powershell_release_script"
+done
+assert_contains '\$pinned = @\('"'"'run'"'"', '"'"'--interactive'"'"'\)' "$setup_powershell_script"
+assert_contains '\$pinned = @\('"'"'run'"'"', '"'"'--interactive'"'"'\)' "$powershell_script"
+assert_contains "OSCAR_STORAGE_RELAY_PAYLOAD" "$setup_powershell_script"
+assert_contains "'-EncodedCommand', \\\$encodedCommand" "$setup_powershell_script"
+assert_contains "'Parameters\|ScriptPath'" "$setup_powershell_script"
+assert_not_contains "'-File', \\\$storageScript" "$setup_powershell_script"
 assert_contains 'for attempt in \{1\.\.30\}' "$setup_shell_script"
 assert_contains 'after 30 seconds' "$setup_shell_script"
 assert_contains 'grep -Fq "\\"objClass\\": \\"com\.botts\.impl\.service\.dailyfile\.DailyFileJournalServiceConfig\\""' "$setup_shell_script"
@@ -2603,6 +2614,7 @@ if command -v pwsh >/dev/null 2>&1; then
             function Confirm-ChecksumHmac([string]$Root, [string]$Image) {}
             function Get-JournalConfirmationHmac([string]$ReceiptPath, [string]$Image) { return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }
             function Invoke-External([string]$File, [string[]]$Arguments) {}
+            function Invoke-DockerShellInput([string]$InputText, [string[]]$Arguments) {}
             function Invoke-Compose([string[]]$Arguments) {}
             function Protect-AdministratorFile([string]$Path) {}
             function Assert-AdministratorFile([string]$Path, [string]$Description) {}
@@ -2756,12 +2768,13 @@ if command -v pwsh >/dev/null 2>&1; then
             $journalExtraction = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "UNSAFE-JOURNAL-EXTRACTION"
             function Get-ComposeOutput([string[]]$Arguments) { return @("postgres") }
             function Invoke-Compose([string[]]$Arguments) {}
-            function Invoke-External([string]$File, [string[]]$Arguments) {
-                if (($Arguments -join " ") -match "/validate-storage-archive\.sh oscar-state") {
+            function Invoke-DockerShellInput([string]$InputText, [string[]]$Arguments) {
+                if ($InputText -match "/validate-storage-archive\.sh oscar-state") {
                     throw "deliberate scoped validator failure"
                 }
                 [IO.File]::WriteAllText($journalExtraction, "extraction launched")
             }
+            function Invoke-External([string]$File, [string[]]$Arguments) {}
             $journalStateHash = (Get-FileHash -LiteralPath (Join-Path (Join-Path $BackupDirectory $acceptanceId) "oscar-state.tar.gz") -Algorithm SHA256).Hash.ToLowerInvariant()
             try {
                 Confirm-DailyJournalBackup $acceptanceId (Join-Path $BackupDirectory $acceptanceId) "oscar:test" $journalStateHash
@@ -2778,6 +2791,7 @@ if command -v pwsh >/dev/null 2>&1; then
                     throw "PowerShell journal confirmation used the Compose service container"
                 }
             }
+            function Invoke-DockerShellInput([string]$InputText, [string[]]$Arguments) {}
             function Invoke-External([string]$File, [string[]]$Arguments) {
                 $joined = $Arguments -join " "
                 if ($joined -match "--entrypoint java") {
@@ -2838,12 +2852,13 @@ if command -v pwsh >/dev/null 2>&1; then
             function Invoke-Compose([string[]]$Arguments) {
                 [IO.File]::WriteAllText($preflightComposeMarker, ($Arguments -join " "))
             }
-            function Invoke-External([string]$File, [string[]]$Arguments) {
+            function Invoke-DockerShellInput([string]$InputText, [string[]]$Arguments) {
                 $mount = @($Arguments | Where-Object { $_ -like "*:/restore" } | Select-Object -First 1)
                 if ($mount.Count -ne 1) { throw "Restore mock did not receive a staging mount" }
                 $restorePath = $mount[0].Substring(0, $mount[0].Length - ":/restore".Length)
                 Copy-Item -LiteralPath (Join-Path $preflightPayload ".env"), (Join-Path $preflightPayload "secrets") -Destination $restorePath -Recurse
             }
+            function Invoke-External([string]$File, [string[]]$Arguments) {}
             try {
                 Restore-Backup $preflightId $preflightId
                 throw "PowerShell restore accepted an incomplete staged credential set"

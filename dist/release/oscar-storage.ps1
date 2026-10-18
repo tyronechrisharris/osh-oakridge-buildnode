@@ -577,6 +577,43 @@ function Get-ExternalOutput([string]$Program, [string[]]$Arguments) {
     return @($output)
 }
 
+function ConvertTo-ShellStdin([string]$InputText) {
+    if ([string]::IsNullOrWhiteSpace($InputText) -or $Utf8NoBom.GetByteCount($InputText) -gt 1048576 -or $InputText.IndexOf([char]0) -ge 0) {
+        Fail 'Shell input must be nonempty, NUL-free, and at most 1048576 UTF-8 bytes.'
+    }
+    # PowerShell 5.1 appends CRLF when piping one scalar to a native process.
+    # Put that CR on a final comment after normalizing every executable line.
+    $normalized = $InputText.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd([char[]]@([char]10))
+    return "$normalized`n# oscar-powershell-stdin-terminator"
+}
+
+function Get-ExternalInputOutput([string]$InputText, [string]$Program, [string[]]$Arguments) {
+    $previousErrorPreference = $ErrorActionPreference
+    $previousOutputEncoding = $OutputEncoding
+    try {
+        $ErrorActionPreference = 'Continue'
+        $OutputEncoding = $Utf8NoBom
+        $output = @($InputText | & $Program @Arguments)
+        if ($LASTEXITCODE -ne 0) { Fail "$Program exited with code $LASTEXITCODE." }
+        return $output
+    } finally {
+        $OutputEncoding = $previousOutputEncoding
+        $ErrorActionPreference = $previousErrorPreference
+    }
+}
+
+function Get-DockerShellInputOutput([string]$InputText, [string[]]$Arguments) {
+    if ($Arguments.Count -lt 2 -or $Arguments[0] -cne 'run' -or $Arguments -contains '--interactive' -or $Arguments -contains '-i') {
+        Fail 'Docker shell-stdin execution requires one noninteractive run argument vector; the helper owns --interactive.'
+    }
+    $pinned = @('run', '--interactive') + @($Arguments[1..($Arguments.Count - 1)])
+    return @(Get-ExternalInputOutput (ConvertTo-ShellStdin $InputText) 'docker' $pinned)
+}
+
+function Invoke-DockerShellInput([string]$InputText, [string[]]$Arguments) {
+    [void](Get-DockerShellInputOutput $InputText $Arguments)
+}
+
 function Get-DockerInspectProperty([object]$Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
     $property = $Object.PSObject.Properties[$Name]
@@ -684,6 +721,59 @@ function Get-ComposeOutput([string[]]$Arguments) {
         if ($LASTEXITCODE -ne 0) { Fail "docker compose exited with code $LASTEXITCODE." }
         return @($output)
     } finally {
+        Restore-ComposeOverrideEnvironment $saved
+        Pop-Location
+    }
+}
+
+function Get-ComposeInputOutput([string]$InputText, [string[]]$Arguments) {
+    Push-Location $ScriptRoot
+    $saved = Clear-ComposeOverrideEnvironment
+    $previousErrorPreference = $ErrorActionPreference
+    $previousOutputEncoding = $OutputEncoding
+    try {
+        $ErrorActionPreference = 'Continue'
+        $OutputEncoding = $Utf8NoBom
+        $pinned = @(
+            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
+            '--file', (Join-Path $ScriptRoot 'compose.yaml')) + $Arguments
+        $output = @($InputText | & docker @pinned)
+        if ($LASTEXITCODE -ne 0) { Fail "docker compose exited with code $LASTEXITCODE." }
+        return $output
+    } finally {
+        $OutputEncoding = $previousOutputEncoding
+        $ErrorActionPreference = $previousErrorPreference
+        Restore-ComposeOverrideEnvironment $saved
+        Pop-Location
+    }
+}
+
+function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
+    return @(Get-ComposeInputOutput (ConvertTo-ShellStdin $InputText) $Arguments)
+}
+
+function Write-ComposeShellInputOutputToFile([string]$InputText, [string[]]$Arguments, [string]$Path) {
+    Push-Location $ScriptRoot
+    $saved = Clear-ComposeOverrideEnvironment
+    $previousErrorPreference = $ErrorActionPreference
+    $previousOutputEncoding = $OutputEncoding
+    $writer = $null
+    try {
+        $ErrorActionPreference = 'Continue'
+        $OutputEncoding = $Utf8NoBom
+        $pinned = @(
+            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
+            '--file', (Join-Path $ScriptRoot 'compose.yaml')) + $Arguments
+        $writer = [IO.StreamWriter]::new($Path, $false, $Utf8NoBom)
+        $writer.NewLine = "`n"
+        (ConvertTo-ShellStdin $InputText) | & docker @pinned | ForEach-Object { $writer.WriteLine(([string]$_).TrimEnd("`r")) }
+        $exitCode = $LASTEXITCODE
+        $writer.Flush()
+        if ($exitCode -ne 0) { Fail "docker compose shell stream exited with code $exitCode." }
+    } finally {
+        if ($writer) { $writer.Dispose() }
+        $OutputEncoding = $previousOutputEncoding
+        $ErrorActionPreference = $previousErrorPreference
         Restore-ComposeOverrideEnvironment $saved
         Pop-Location
     }
@@ -848,67 +938,37 @@ function Assert-DeploymentVolumeOwnership {
     Fail 'OSCAR named volumes do not match this deployment identity. No storage operation was performed.'
 }
 
+function New-PsqlShellInput([string]$Sql, [switch]$Table) {
+    if ([string]::IsNullOrWhiteSpace($Sql) -or $Utf8NoBom.GetByteCount($Sql) -gt 1048576 -or $Sql.IndexOf([char]0) -ge 0) {
+        Fail 'PostgreSQL input must be nonempty, NUL-free, and at most 1048576 UTF-8 bytes.'
+    }
+    $normalizedSql = $Sql.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd([char[]]@([char]10))
+    do { $delimiter = 'OSCAR_SQL_' + [Guid]::NewGuid().ToString('N') }
+    while ($normalizedSql -match "(?m)^$([Regex]::Escape($delimiter))$")
+    $psqlFlags = if ($Table) { '' } else { ' --quiet --tuples-only --no-align' }
+    $command = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis' + $psqlFlags + ' --file=-'
+    return "$command <<'$delimiter'`n$normalizedSql`n$delimiter"
+}
+
 function Invoke-Psql([string]$Sql, [switch]$Table) {
-    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
-    $arguments = @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper')
-    if (-not $Table) { $arguments += @('--quiet', '--tuples-only', '--no-align') }
-    $arguments += @('--command', $Sql)
-    $output = Get-ComposeOutput $arguments
+    $shellInput = New-PsqlShellInput $Sql -Table:$Table
+    $output = Get-ComposeShellInputOutput $shellInput @('exec', '-T', 'postgres', 'sh', '-seu')
     if ($Table) { $output | Out-Host; return }
     return (($output -join "`n").Trim())
 }
 
 function Invoke-PsqlScript([string]$Sql) {
-    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --quiet --tuples-only --no-align'
-    Push-Location $ScriptRoot
-    $saved = Clear-ComposeOverrideEnvironment
-    $savedOutputEncoding = $OutputEncoding
-    try {
-        $script:OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-        $arguments = @(
-            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
-            '--file', (Join-Path $ScriptRoot 'compose.yaml'),
-            'exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper'
-        )
-        $output = $Sql | & docker @arguments
-        if ($LASTEXITCODE -ne 0) { Fail "docker compose PostgreSQL script exited with code $LASTEXITCODE." }
-        return (($output -join "`n").Trim())
-    } finally {
-        $script:OutputEncoding = $savedOutputEncoding
-        Restore-ComposeOverrideEnvironment $saved
-        Pop-Location
-    }
+    $output = Get-ComposeShellInputOutput (New-PsqlShellInput $Sql) @('exec', '-T', 'postgres', 'sh', '-seu')
+    return (($output -join "`n").Trim())
 }
 
 function Invoke-PsqlLines([string]$Sql) {
-    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
-    $arguments = @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper', '--quiet', '--tuples-only', '--no-align', '--command', $Sql)
-    return @(Get-ComposeOutput $arguments | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -ne '' })
+    return @(Get-ComposeShellInputOutput (New-PsqlShellInput $Sql) @('exec', '-T', 'postgres', 'sh', '-seu') |
+        ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -ne '' })
 }
 
 function Write-PsqlLinesToFile([string]$Sql, [string]$Path) {
-    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
-    Push-Location $ScriptRoot
-    $saved = Clear-ComposeOverrideEnvironment
-    $writer = $null
-    try {
-        $pinned = @(
-            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
-            '--file', (Join-Path $ScriptRoot 'compose.yaml'),
-            'exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper',
-            '--quiet', '--tuples-only', '--no-align', '--command', $Sql
-        )
-        $writer = [IO.StreamWriter]::new($Path, $false, $Utf8NoBom)
-        $writer.NewLine = "`n"
-        & docker @pinned | ForEach-Object { $writer.WriteLine(([string]$_).TrimEnd("`r")) }
-        $exitCode = $LASTEXITCODE
-        $writer.Flush()
-        if ($exitCode -ne 0) { Fail "docker compose PostgreSQL snapshot exited with code $exitCode." }
-    } finally {
-        if ($writer) { $writer.Dispose() }
-        Restore-ComposeOverrideEnvironment $saved
-        Pop-Location
-    }
+    Write-ComposeShellInputOutputToFile (New-PsqlShellInput $Sql) @('exec', '-T', 'postgres', 'sh', '-seu') $Path
 }
 
 function Test-FileContentEqual([string]$First, [string]$Second) {
@@ -1450,7 +1510,8 @@ function Write-Checksums([string]$Root) {
 }
 
 function Get-ChecksumHmac([string]$Root, [string]$Image, [switch]$ReadOnly) {
-    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-eu', '-c', 'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A')
+    $script = 'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A'
+    $output = Get-DockerShellInputOutput $script @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-seu')
     $tag = (($output -join '').Trim())
     if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not calculate a valid backup authentication tag.' }
     return $tag
@@ -1475,7 +1536,7 @@ function Confirm-ChecksumHmac([string]$Root, [string]$Image) {
 
 function Confirm-ReleaseConfigArchive([string]$Root, [string]$Image) {
     $validation = 'sh /validator/validate-storage-archive.sh release-config /backup/release-config.tar.gz'
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+    Invoke-DockerShellInput $validation @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-seu')
 }
 
 function Confirm-BackupArchiveMembers([string]$Root, [string]$Image) {
@@ -1490,7 +1551,7 @@ sh /validator/validate-storage-archive.sh \
     release-config /backup/release-config.tar.gz \
     deployment-secrets "$secret_archive"
 '@
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+    Invoke-DockerShellInput $validation @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-seu')
 }
 
 function Write-VerifiedMarker([string]$Root) {
@@ -1519,11 +1580,12 @@ function Get-JournalConfirmationHmac([string]$ReceiptPath, [string]$Image) {
     if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         Fail 'Journal-confirmation receipt payload is missing or unsafe.'
     }
-    $output = Get-ExternalOutput 'docker' @(
+    $script = 'key=$(cat /backup-key.txt); head -n 4 /journal-confirmation | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A'
+    $output = Get-DockerShellInputOutput $script @(
         'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh',
         '--volume', "${ReceiptPath}:/journal-confirmation:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro",
-        $Image, '-eu', '-c', 'key=$(cat /backup-key.txt); head -n 4 /journal-confirmation | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A')
+        $Image, '-seu')
     $tag = (($output -join '').Trim())
     if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not authenticate the journal-confirmation receipt.' }
     return $tag
@@ -1693,7 +1755,8 @@ SELECT * FROM upserted;
 }
 
 function Get-ReleaseConfigVersion([string]$Root, [string]$Image) {
-    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", $Image, '-eu', '-c', "tar -xOzf /backup/release-config.tar.gz .env.example | sed -n 's/^OSCAR_VERSION=//p' | head -n 1")
+    $script = "tar -xOzf /backup/release-config.tar.gz .env.example | sed -n 's/^OSCAR_VERSION=//p' | head -n 1"
+    $output = Get-DockerShellInputOutput $script @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", $Image, '-seu')
     return (($output -join "`n").Trim())
 }
 
@@ -1730,9 +1793,10 @@ function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, 
     try {
         if ($resumeGateway) { Invoke-Compose @('stop', 'gateway') }
         if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-eu', '-c', 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz')
+        $validation = 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz'
+        Invoke-DockerShellInput $validation @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-seu')
         $extract = 'umask 077; tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz; find /snapshot -type d -exec chmod 0700 {} +; find /snapshot -type f -exec chmod 0600 {} +; chown -R 10001:10001 /snapshot'
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-eu', '-c', $extract)
+        Invoke-DockerShellInput $extract @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-seu')
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshot}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)
     } finally {
         Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1808,7 +1872,7 @@ function New-Backup {
         }
         $postgresContainer = $postgresContainers[0]
         $basebackup = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); export PGPASSWORD; exec pg_basebackup --pgdata=/backup --username=oscar_bootstrap --dbname="host=127.0.0.1 port=5432 dbname=gis" --format=plain --wal-method=stream --checkpoint=fast'
-        Invoke-External 'docker' @('run', '--rm', '--network', "container:$postgresContainer", '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '999:999', '--entrypoint', 'sh', '--volume', "$(Join-Path $work 'postgres'):/backup", '--volume', "$(Join-Path $ScriptRoot 'secrets/postgres-bootstrap-password.txt'):/run/secrets/postgres_bootstrap_password:ro", $postgresImage, '-eu', '-c', $basebackup)
+        Invoke-DockerShellInput $basebackup @('run', '--rm', '--network', "container:$postgresContainer", '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '999:999', '--entrypoint', 'sh', '--volume', "$(Join-Path $work 'postgres'):/backup", '--volume', "$(Join-Path $ScriptRoot 'secrets/postgres-bootstrap-password.txt'):/run/secrets/postgres_bootstrap_password:ro", $postgresImage, '-seu')
         Invoke-Compose @('stop', 'postgres')
         $stateArchive = @'
 for entry in lib web rules documentation trusted_certificates config logback.xml; do
@@ -1820,13 +1884,15 @@ for entry in lib web rules documentation trusted_certificates config logback.xml
 done
 tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclude='./lib' --exclude='./web' --exclude='./rules' --exclude='./documentation' --exclude='./trusted_certificates' --exclude='./config' --exclude='./logback.xml' -C /state -czf /output.tar.gz .
 '@
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state:ro', '--volume', "$(Join-Path $work 'oscar-state.tar.gz'):/output.tar.gz", $image, '-eu', '-c', $stateArchive)
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive:ro", '--volume', "$(Join-Path $work 'archive.tar.gz'):/output.tar.gz", $image, '-eu', '-c', "tar --exclude='./.oscar-storage-root' -C /archive -czf /output.tar.gz .")
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', "${WalArchiveDirectory}:/wal-archive:ro", '--volume', "$(Join-Path $work 'wal-archive.tar.gz'):/output.tar.gz", $postgresImage, '-eu', '-c', "if find /wal-archive -type f -name '*.partial*' -print -quit | grep -q .; then echo 'WAL archive contains a .partial file while backup writers are quiesced.' >&2; exit 1; fi; tar --exclude='./.oscar-storage-root' -C /wal-archive -czf /output.tar.gz .")
+        Invoke-DockerShellInput $stateArchive @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state:ro', '--volume', "$(Join-Path $work 'oscar-state.tar.gz'):/output.tar.gz", $image, '-seu')
+        Invoke-DockerShellInput "tar --exclude='./.oscar-storage-root' -C /archive -czf /output.tar.gz ." @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive:ro", '--volume', "$(Join-Path $work 'archive.tar.gz'):/output.tar.gz", $image, '-seu')
+        $walArchiveScript = "if find /wal-archive -type f -name '*.partial*' -print -quit | grep -q .; then echo 'WAL archive contains a .partial file while backup writers are quiesced.' >&2; exit 1; fi; tar --exclude='./.oscar-storage-root' -C /wal-archive -czf /output.tar.gz ."
+        Invoke-DockerShellInput $walArchiveScript @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', "${WalArchiveDirectory}:/wal-archive:ro", '--volume', "$(Join-Path $work 'wal-archive.tar.gz'):/output.tar.gz", $postgresImage, '-seu')
 
     $encryptedSecrets = Join-Path $work 'deployment-secrets.tar.gz.enc'
     [IO.File]::WriteAllBytes($encryptedSecrets, [byte[]]@())
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${encryptedSecrets}:/deployment-secrets.tar.gz.enc", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'tar -C /deployment -czf - .env secrets tls | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/backup-key.txt -out /deployment-secrets.tar.gz.enc')
+    $encryptSecrets = 'tar -C /deployment -czf - .env secrets tls | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/backup-key.txt -out /deployment-secrets.tar.gz.enc'
+    Invoke-DockerShellInput $encryptSecrets @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${encryptedSecrets}:/deployment-secrets.tar.gz.enc", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-seu')
     $releaseConfigFiles = @(
         '.dockerignore', '.env.example', 'DEPLOYMENT.md', 'QUICKSTART.md', 'compose.yaml',
         'docker/gateway/default.conf', 'docker/oscar/archive-object-helper.sh', 'docker/oscar/atomic-publish.c', 'docker/oscar/Dockerfile', 'docker/oscar/entrypoint.sh',
@@ -2001,10 +2067,10 @@ function Get-AuthenticatedBackupLabelBoundary([string]$Root) {
 function Get-PruneIntentHmac([string]$FileName, [string]$Image) {
     if ($FileName -cne '.oscar-backup-prune-intent') { Fail 'Unsafe backup prune intent filename.' }
     $intentPath = Join-Path $BackupDirectory $FileName
-    $output = Get-ExternalOutput 'docker' @(
+    $script = 'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /prune-intent | openssl base64 -A'
+    $output = Get-DockerShellInputOutput $script @(
         'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${intentPath}:/prune-intent:ro",
-        '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-eu', '-c',
-        'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /prune-intent | openssl base64 -A')
+        '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-seu')
     $tag = (($output -join '').Trim())
     if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not calculate a valid backup prune intent authentication tag.' }
     return $tag
@@ -2366,12 +2432,11 @@ function Clear-RestoreRecoverySettings {
 }
 
 function Assert-RestoreSettingsRemovedFromDataVolume {
-    Invoke-External 'docker' @(
+    $script = 'test ! -e /data/recovery.signal; test ! -e /data/standby.signal; test ! -e /data/postgresql.auto.conf || ! grep -Eq "^[[:space:]]*(restore_command|recovery_target|recovery_target_timeline|recovery_target_action)[[:space:]]*=" /data/postgresql.auto.conf'
+    Invoke-DockerShellInput $script @(
         'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh',
-        '--volume', 'oscar_postgres_data:/data:ro', (Get-PostgresImage), '-eu', '-c',
-        'test ! -e /data/recovery.signal; test ! -e /data/standby.signal; test ! -e /data/postgresql.auto.conf || ! grep -Eq "^[[:space:]]*(restore_command|recovery_target|recovery_target_timeline|recovery_target_action)[[:space:]]*=" /data/postgresql.auto.conf'
-    )
+        '--volume', 'oscar_postgres_data:/data:ro', (Get-PostgresImage), '-seu')
 }
 
 function Confirm-CleanRestoredPostgresRuntime([UInt64]$ExpectedTimeline, [UInt64]$ExpectedFailedCount) {
@@ -2479,7 +2544,8 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
     Protect-DockerStorageDirectory $walMergeStage 'ReadWrite'
     try {
         $image = "oscar:$RequiredReleaseVersion"
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${root}:/backup:ro", '--volume', "${restoreTemp}:/restore", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -')
+        $decryptSecrets = 'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -'
+        Invoke-DockerShellInput $decryptSecrets @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${root}:/backup:ro", '--volume', "${restoreTemp}:/restore", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-seu')
         Prepare-RestoredDeploymentCredentials $restoreTemp $ScriptRoot
         # Complete the authenticated WAL collision/type preflight and
         # append-only merge before a safety copy, service stop, or replacement
@@ -2501,14 +2567,17 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
         Copy-Item -LiteralPath (Join-Path $ScriptRoot '.env'), (Join-Path $ScriptRoot 'secrets'), (Join-Path $ScriptRoot 'tls') -Destination $safety -Recurse -Force
         Assert-DeploymentVolumeOwnership
         Invoke-Compose @('stop', 'gateway', 'oscar', 'postgres')
-        $sourceTimelineOutput = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', 'oscar_postgres_data:/data', '--volume', "$(Join-Path $restoreStage 'postgres'):/restore-source:ro", (Get-PostgresImage), '-eu', '-c', 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; cp -a /restore-source/. /data/; exec /usr/local/bin/oscar-prepare-restore /data')
+        $preparePostgres = 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; cp -a /restore-source/. /data/; exec /usr/local/bin/oscar-prepare-restore /data'
+        $sourceTimelineOutput = Get-DockerShellInputOutput $preparePostgres @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', 'oscar_postgres_data:/data', '--volume', "$(Join-Path $restoreStage 'postgres'):/restore-source:ro", (Get-PostgresImage), '-seu')
         $sourceTimelineText = (($sourceTimelineOutput -join '').Trim())
         [UInt64]$sourceTimeline = 0
         if (-not [UInt64]::TryParse($sourceTimelineText, [ref]$sourceTimeline) -or $sourceTimeline -eq 0) {
             Fail 'PostgreSQL restore preparation did not emit the authenticated source timeline.'
         }
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', '--volume', "$(Join-Path $restoreStage 'oscar-state.tar.gz'):/restore-state.tar.gz:ro", $image, '-eu', '-c', "find /state -mindepth 1 -maxdepth 1 ! -name archive -exec rm -rf -- {} +; tar --no-same-owner -C /state -xzf /restore-state.tar.gz")
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive", '--volume', "$(Join-Path $restoreStage 'archive.tar.gz'):/restore-archive.tar.gz:ro", $image, '-eu', '-c', "find /archive -mindepth 1 -maxdepth 1 ! -name .oscar-storage-root -exec rm -rf -- {} +; tar --no-same-owner -C /archive -xzf /restore-archive.tar.gz")
+        $restoreState = 'find /state -mindepth 1 -maxdepth 1 ! -name archive -exec rm -rf -- {} +; tar --no-same-owner -C /state -xzf /restore-state.tar.gz'
+        Invoke-DockerShellInput $restoreState @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', '--volume', "$(Join-Path $restoreStage 'oscar-state.tar.gz'):/restore-state.tar.gz:ro", $image, '-seu')
+        $restoreArchive = 'find /archive -mindepth 1 -maxdepth 1 ! -name .oscar-storage-root -exec rm -rf -- {} +; tar --no-same-owner -C /archive -xzf /restore-archive.tar.gz'
+        Invoke-DockerShellInput $restoreArchive @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive", '--volume', "$(Join-Path $restoreStage 'archive.tar.gz'):/restore-archive.tar.gz:ro", $image, '-seu')
         Assert-StorageRootIdentities
         Install-PreparedDeploymentCredentials $restoreTemp $ScriptRoot
         Assert-DeploymentVolumeOwnership
