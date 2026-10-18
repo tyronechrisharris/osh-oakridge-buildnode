@@ -496,7 +496,8 @@ SELECT 'single quote '' and $dollar';
         -not $quotedLines[0].Contains(' --command ')) `
         'Windows psql stdin does not use one quoted, direct-psql heredoc delimiter.'
     $quotedRoundTrip = [string]::Join("`n", $quotedLines[1..($quotedLines.Count - 2)])
-    Assert-True ($quotedRoundTrip -ceq $quotedSql.TrimEnd([char[]]@([char]10))) `
+    $expectedQuotedSql = $quotedSql.Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd([char[]]@([char]10))
+    Assert-True ($quotedRoundTrip -ceq $expectedQuotedSql) `
         'Windows psql stdin changed SQL containing shell-looking text or quotes.'
     $psqlInputStart = $storageSource.IndexOf('function New-PsqlShellInput', [StringComparison]::Ordinal)
     $psqlInputEnd = $storageSource.IndexOf('function Invoke-Psql', $psqlInputStart, [StringComparison]::Ordinal)
