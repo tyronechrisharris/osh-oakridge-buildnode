@@ -45,6 +45,11 @@ Directly invoked mutating commands require an elevated Windows PowerShell 5.1 wi
 
 `start`, `stop`, and `restart` never build or download images. `init` and `upgrade` may prepare missing images for a connected release. After building the local OSCAR/PostGIS images, setup rechecks the complete inventory and pulls the gateway only if it is still absent; an already-cached pinned gateway therefore does not create an unnecessary registry or credential-helper dependency. If `offline-images.tar` is present, every mutating setup run re-verifies the exact bundle inventory against the co-packaged `SHA256SUMS` and loads that checksum-verified archive even when same-version tags already exist locally. It never substitutes a stale local image for the selected bundle and fails if any required image remains unavailable afterward. Because the manifest is bundled and unsigned, this is an integrity check, not publisher or release-origin authentication. Sites that require origin authentication must verify the outer ZIP against an independently trusted detached signature or provenance attestation before offline transfer.
 
+Use the launchers for a complete stop or restart rather than issuing an unscoped multi-service
+`docker compose stop` or `docker compose restart`. The supported launchers stop the gateway first,
+wait for OSCAR to finish its bounded journal/module shutdown while PostgreSQL remains available,
+and stop PostgreSQL last. Restore uses the same dependency-safe order before replacing state.
+
 Offline releases are published in two Windows x86-64 profiles:
 
 - `offline-full` contains OSCAR images plus the approved Docker Desktop and WSL installers.

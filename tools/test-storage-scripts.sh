@@ -53,6 +53,40 @@ sh -n "$archive_validator"
 sh -n "$archive_object_helper"
 sh -n "$oscar_entrypoint"
 
+# Docker Compose does not serialize a multi-service stop. Exercise the real
+# storage helper with a mocked Compose boundary, and require the setup helper
+# source to express the same gateway -> application -> database contract.
+ordered_stop_actions="$test_root/ordered-stop.actions"
+OSCAR_STORAGE_TEST_MODE=1 bash -c '
+    storage_script=$1; actions=$2
+    set -- help; source "$storage_script" >/dev/null
+    compose() { printf "%s\n" "$*" >>"$actions"; }
+    stop_deployment_ordered
+' _ "$shell_script" "$ordered_stop_actions"
+printf 'stop gateway\nstop oscar\nstop postgres\n' >"$test_root/ordered-stop.expected"
+cmp -s "$test_root/ordered-stop.expected" "$ordered_stop_actions" || {
+    printf 'Bash storage stop is not dependency ordered.\n' >&2
+    exit 1
+}
+setup_stop_body=$(awk '
+    /^stop_application_tier_ordered\(\)/ { capture=1 }
+    /^psql_bootstrap\(\)/ { capture=0 }
+    capture { print }
+' "$setup_shell_script")
+setup_gateway_stop=$(grep -n -m1 'compose stop gateway' <<<"$setup_stop_body" | cut -d: -f1)
+setup_oscar_stop=$(grep -n -m1 'compose stop oscar' <<<"$setup_stop_body" | cut -d: -f1)
+setup_postgres_stop=$(grep -n -m1 'compose stop postgres' <<<"$setup_stop_body" | cut -d: -f1)
+[[ -n $setup_gateway_stop && -n $setup_oscar_stop && -n $setup_postgres_stop &&
+   $setup_gateway_stop -lt $setup_oscar_stop && $setup_oscar_stop -lt $setup_postgres_stop ]] || {
+    printf 'Bash setup stop is not dependency ordered.\n' >&2
+    exit 1
+}
+assert_not_contains '^[[:space:]]*compose restart([[:space:]]|$)' "$setup_shell_script"
+assert_not_contains 'compose stop gateway oscar postgres' "$shell_script"
+assert_not_contains '^[[:space:]]*compose stop([[:space:]]*$)' "$setup_shell_script"
+assert_not_contains "Invoke-Compose @\('restart'" "$setup_powershell_script"
+assert_not_contains "Invoke-Compose @\('stop', 'gateway', 'oscar', 'postgres'\)" "$powershell_script"
+
 # The release directory is part of every destructive containment decision.
 # Resolve directory aliases physically and reject a launcher-file alias before
 # reading deployment configuration.
@@ -3492,7 +3526,7 @@ assert_contains 'Assert-CanonicalCredentialBindings' "$setup_powershell_script"
 
 bash_restore_decrypt=$(grep -n "openssl enc -d .*tar -C /restore" "$shell_script" | tail -n 1 | cut -d: -f1)
 bash_restore_prepare=$(grep -n 'prepare_restored_credentials_exact "\$restore_temp"' "$shell_script" | tail -n 1 | cut -d: -f1)
-bash_restore_stop=$(grep -n 'compose stop gateway oscar postgres' "$shell_script" | tail -n 1 | cut -d: -f1)
+bash_restore_stop=$(grep -n '^[[:space:]]*stop_deployment_ordered$' "$shell_script" | tail -n 1 | cut -d: -f1)
 [[ -n $bash_restore_decrypt && -n $bash_restore_prepare && -n $bash_restore_stop &&
    $bash_restore_decrypt -lt $bash_restore_prepare && $bash_restore_prepare -lt $bash_restore_stop ]] || {
     printf 'Bash restore does not validate staged credentials before destructive Compose operations.\n' >&2
@@ -3501,7 +3535,7 @@ bash_restore_stop=$(grep -n 'compose stop gateway oscar postgres' "$shell_script
 
 ps_restore_decrypt=$(grep -n "openssl enc -d .*tar -C /restore" "$powershell_script" | tail -n 1 | cut -d: -f1)
 ps_restore_prepare=$(grep -n 'Prepare-RestoredDeploymentCredentials \$restoreTemp' "$powershell_script" | tail -n 1 | cut -d: -f1)
-ps_restore_stop=$(grep -n "Invoke-Compose @('stop', 'gateway', 'oscar', 'postgres')" "$powershell_script" | tail -n 1 | cut -d: -f1)
+ps_restore_stop=$(grep -n '^[[:space:]]*Stop-DeploymentOrdered$' "$powershell_script" | tail -n 1 | cut -d: -f1)
 [[ -n $ps_restore_decrypt && -n $ps_restore_prepare && -n $ps_restore_stop &&
    $ps_restore_decrypt -lt $ps_restore_prepare && $ps_restore_prepare -lt $ps_restore_stop ]] || {
     printf 'PowerShell restore does not validate staged credentials before destructive Compose operations.\n' >&2

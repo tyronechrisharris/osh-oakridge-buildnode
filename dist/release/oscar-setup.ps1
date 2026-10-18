@@ -828,7 +828,7 @@ function Initialize-Tls([string]$Name) {
 }
 
 function Remove-LegacyEmbeddedBackupDirectory {
-    Invoke-Compose @('stop', 'gateway', 'oscar')
+    Stop-ApplicationTierOrdered
     $script = 'if [ -e /state/backups ] || [ -L /state/backups ]; then [ -d /state/backups ] && [ ! -L /state/backups ] || { echo "Legacy embedded backup path is not a regular directory." >&2; exit 1; }; rmdir -- /state/backups || { echo "Legacy embedded /var/lib/oscar/backups is nonempty. Preserve or export its contents, explicitly empty that non-authoritative volume path, then retry upgrade." >&2; exit 1; }; fi'
     [void](Get-DockerShellInputOutput $script @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', (Get-OscarImage), '-seu'))
 }
@@ -950,6 +950,20 @@ function Invoke-Compose([string[]]$Arguments) {
         Restore-ComposeOverrideEnvironment $saved
         Pop-Location
     }
+}
+
+function Stop-ApplicationTierOrdered {
+    # Compose does not reverse depends_on for stop/restart. A single
+    # multi-service stop signals every container concurrently, which can take
+    # PostgreSQL away while OSCAR is still draining writers. Preserve the
+    # service stop_grace_period deadlines while enforcing dependency order.
+    Invoke-Compose @('stop', 'gateway')
+    Invoke-Compose @('stop', 'oscar')
+}
+
+function Stop-DeploymentOrdered {
+    Stop-ApplicationTierOrdered
+    Invoke-Compose @('stop', 'postgres')
 }
 
 function Get-ComposeOutput([string[]]$Arguments) {
@@ -1265,13 +1279,13 @@ try {
         }
         'stop' {
             Assert-Administrator; Assert-Docker; Assert-Configured
-            Invoke-Compose @('stop')
+            Stop-DeploymentOrdered
             Write-Host 'OSCAR stopped. Persistent application and database data were retained.' -ForegroundColor Green
         }
         'restart' {
             Assert-Administrator; Assert-Docker; Assert-Configured; Assert-DeploymentImagesAvailable
             Assert-DeploymentVolumeOwnership $false
-            Invoke-Compose @('restart')
+            Stop-DeploymentOrdered
             Invoke-Compose @('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')
             Enable-StorageDatabaseFeatures
             Complete-PendingFreshInit

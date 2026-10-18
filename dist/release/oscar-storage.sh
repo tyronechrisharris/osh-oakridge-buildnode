@@ -32,6 +32,14 @@ compose() {
             docker compose --project-name oscar --env-file "$script_dir/.env" --file "$script_dir/compose.yaml" "$@"
     )
 }
+
+stop_deployment_ordered() {
+    # Keep PostgreSQL online until OSCAR has completed its bounded writer and
+    # module shutdown. Compose otherwise signals every named service at once.
+    compose stop gateway
+    compose stop oscar
+    compose stop postgres
+}
 oscar_image() { printf 'oscar:%s' "$(env_value OSCAR_VERSION local)"; }
 
 archive_object_helper() {
@@ -1967,7 +1975,7 @@ restore_backup() (
     chmod 0700 "$safety"
     cp -a "$script_dir/.env" "$script_dir/secrets" "$script_dir/tls" "$safety/"
     assert_deployment_volume_ownership
-    compose stop gateway oscar postgres
+    stop_deployment_ordered
     source_timeline=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --user 999:999 --entrypoint sh --volume oscar_postgres_data:/data \
         --volume "$restore_stage/postgres:/restore-source:ro" "$(postgres_image)" -eu -c \

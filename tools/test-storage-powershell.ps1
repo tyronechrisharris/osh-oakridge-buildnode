@@ -120,6 +120,17 @@ try {
     $env:OSCAR_STORAGE_TEST_MODE = '1'
     . $storageScript -Command help | Out-Null
 
+    $storageStopOrder = & {
+        $captured = New-Object System.Collections.Generic.List[string]
+        function Invoke-Compose([string[]]$Arguments) {
+            [void]$captured.Add([string]::Join(' ', $Arguments))
+        }
+        Stop-DeploymentOrdered
+        [string]::Join(';', $captured)
+    }
+    Assert-True ($storageStopOrder -ceq 'stop gateway;stop oscar;stop postgres') `
+        'Windows storage stop is not dependency ordered.'
+
     # Exercise the real Windows volume-handle durability barrier. This catches
     # PS 5.1 native-argument binding regressions that a parser/static gate
     # cannot see (notably the signed interpretation of 0x80000000).
@@ -1069,6 +1080,16 @@ SELECT 'single quote '' and $dollar';
     Assert-True $rejectedOversized 'PowerShell accepted an archive-generation inventory above 37,000,000 bytes.'
 
     . $setupScript -Command help | Out-Null
+    $setupStopOrder = & {
+        $captured = New-Object System.Collections.Generic.List[string]
+        function Invoke-Compose([string[]]$Arguments) {
+            [void]$captured.Add([string]::Join(' ', $Arguments))
+        }
+        Stop-DeploymentOrdered
+        [string]::Join(';', $captured)
+    }
+    Assert-True ($setupStopOrder -ceq 'stop gateway;stop oscar;stop postgres') `
+        'Windows setup stop/restart is not dependency ordered.'
     Assert-True (-not (Test-FullyQualifiedDeploymentPath '\\server\share\archive')) 'Setup accepted a UNC storage root.'
 
     $wslCandidates = Join-Path $temporaryRoot 'wsl-candidates'

@@ -710,6 +710,14 @@ function Invoke-Compose([string[]]$Arguments) {
     }
 }
 
+function Stop-DeploymentOrdered {
+    # Keep PostgreSQL available until OSCAR finishes its bounded writer and
+    # module shutdown. Compose otherwise signals all named services together.
+    Invoke-Compose @('stop', 'gateway')
+    Invoke-Compose @('stop', 'oscar')
+    Invoke-Compose @('stop', 'postgres')
+}
+
 function Get-ComposeOutput([string[]]$Arguments) {
     Push-Location $ScriptRoot
     $saved = Clear-ComposeOverrideEnvironment
@@ -2575,7 +2583,7 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
         Protect-PrivateDirectory $safety
         Copy-Item -LiteralPath (Join-Path $ScriptRoot '.env'), (Join-Path $ScriptRoot 'secrets'), (Join-Path $ScriptRoot 'tls') -Destination $safety -Recurse -Force
         Assert-DeploymentVolumeOwnership
-        Invoke-Compose @('stop', 'gateway', 'oscar', 'postgres')
+        Stop-DeploymentOrdered
         $preparePostgres = 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; cp -a /restore-source/. /data/; exec /usr/local/bin/oscar-prepare-restore /data'
         $sourceTimelineOutput = Get-DockerShellInputOutput $preparePostgres @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', 'oscar_postgres_data:/data', '--volume', "$(Join-Path $restoreStage 'postgres'):/restore-source:ro", (Get-PostgresImage), '-seu')
         $sourceTimelineText = (($sourceTimelineOutput -join '').Trim())

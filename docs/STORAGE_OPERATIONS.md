@@ -758,6 +758,7 @@ Track at least:
 | WAL archive path full/unwritable | PostgreSQL retries archiving and local `pg_wal` can grow | Restore archive path immediately, verify PostgreSQL logs and backup chain; use verified-backup pruning rather than deleting WAL blindly |
 | Backup fails | `.partial` or finalized-but-unverified directory remains; services are resumed where possible | Check `status`, preserve diagnostics, correct the cause, then re-verify or run a new backup |
 | Restore fails | Deployment may remain stopped/partial | Keep producers disconnected; preserve `pre-restore-*`; repair cause and repeat from the same verified backup or escalate |
+| PostgreSQL shutdown errors appear during OSCAR stop/restart | Qualification fails; OSCAR may not complete its database-backed module drain | Use the release `oscar` launcher, which stops gateway, OSCAR, and PostgreSQL sequentially; preserve logs and do not substitute an unscoped multi-service Compose stop/restart |
 
 ## Monthly storage audit
 

@@ -83,6 +83,10 @@ sudo bash oscar.sh restart
 sudo bash oscar.sh logs --service oscar
 ```
 
+The launcher deliberately stops services in dependency order: gateway, OSCAR, then PostgreSQL.
+This lets OSCAR finish its bounded journal and database-backed module shutdown before the database
+is stopped. Do not replace the launcher command with a multi-service `docker compose restart`.
+
 Create and verify a coordinated backup before an upgrade or retention change:
 
 Windows:

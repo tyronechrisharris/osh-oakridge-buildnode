@@ -360,7 +360,8 @@ The restore workflow:
    the existing WAL root without deleting or replacing any prior WAL/history;
 5. copies the current `.env`, `secrets/`, and `tls/` into
    `pre-restore-<backup-id>` under the release directory;
-6. stops gateway, OSCAR, and PostgreSQL;
+6. stops the gateway, waits for OSCAR's bounded writer/module drain to finish while PostgreSQL is
+   still available, and only then stops PostgreSQL;
 7. replaces the named PostgreSQL volume contents with the base backup;
 8. replaces OSCAR application state and the configured archive tree;
 9. preserves and revalidates the target host's archive/WAL root identities rather than extracting,

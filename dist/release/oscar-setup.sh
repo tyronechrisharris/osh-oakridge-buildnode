@@ -719,7 +719,7 @@ remove_legacy_embedded_backup_directory() {
     # visible to the long-running application. Remove only an empty legacy
     # mountpoint while OSCAR is stopped. Nonempty content requires an explicit
     # operator migration decision and is never discarded by upgrade.
-    compose stop gateway oscar >/dev/null
+    stop_application_tier_ordered >/dev/null
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --user 10001:10001 --entrypoint sh --volume oscar_oscar_state:/state "$(oscar_image)" -eu -c '
         if [ -e /state/backups ] || [ -L /state/backups ]; then
@@ -763,6 +763,21 @@ compose() {
             -u OSCAR_HTTPS_PORT -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
             docker compose --project-name oscar --env-file "$script_dir/.env" --file "$script_dir/compose.yaml" "$@"
     )
+}
+
+stop_application_tier_ordered() {
+    # Compose does not apply depends_on in reverse for `stop`/`restart` and a
+    # multi-service stop signals every container concurrently. Keep the
+    # database available while OSCAR drains its writers and completes its
+    # module shutdown. The service stop_grace_period values in compose.yaml
+    # remain the authoritative per-service deadlines.
+    compose stop gateway
+    compose stop oscar
+}
+
+stop_deployment_ordered() {
+    stop_application_tier_ordered
+    compose stop postgres
 }
 
 psql_bootstrap() {
@@ -908,14 +923,14 @@ case "$command_name" in
         ;;
     stop)
         require_admin; require_docker; configured || fail 'Run init before stopping OSCAR.'
-        compose stop
+        stop_deployment_ordered
         printf 'OSCAR stopped. Persistent application and database data were retained.\n'
         ;;
     restart)
         require_admin; require_supported_storage_host; require_docker; configured || fail 'Run init before restarting OSCAR.'
         assert_deployment_volume_ownership false
         assert_deployment_images_available
-        compose restart
+        stop_deployment_ordered
         compose up --detach --no-build --pull never --wait --wait-timeout 240
         ensure_storage_database_features
         finalize_pending_fresh_init
