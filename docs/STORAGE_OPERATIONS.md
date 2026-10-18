@@ -589,7 +589,10 @@ POSIX-shell examples avoid accidentally inspecting obsolete
 
 ```sh
 docker compose exec -T oscar sh -c \
-  'du -sh /var/lib/oscar/archive /var/lib/oscar/files /var/lib/oscar/db; df -h /var/lib/oscar/archive /var/lib/oscar'
+  'du -sh /var/lib/oscar/archive /var/lib/oscar/files /var/lib/oscar/db; \
+   printf "oscar_state_files="; find /var/lib/oscar -xdev -type f | wc -l; \
+   printf "cold_archive_files="; find /var/lib/oscar/archive -xdev -type f | wc -l; \
+   df -h /var/lib/oscar/archive /var/lib/oscar'
 docker compose exec -T postgres sh -c \
   'du -sh /var/lib/postgresql/data /var/lib/postgresql/wal-archive; df -h /var/lib/postgresql/data /var/lib/postgresql/wal-archive'
 sudo du -sh -- \
@@ -597,6 +600,13 @@ sudo du -sh -- \
   "$(awk -F= '$1=="OSCAR_WAL_ARCHIVE_DIR" {print substr($0,index($0,"=")+1)}' .env)" \
   "$(awk -F= '$1=="OSCAR_BACKUP_DIR" {print substr($0,index($0,"=")+1)}' .env)"
 ```
+
+Trend the file counts as well as bytes and inodes. Coordinated-backup archive validation uses a
+bounded 256 MiB private tmpfs; its scratch demand grows with tar member count and path length, not
+with compressed media or WAL bytes. Treat an abrupt cardinality increase as an operational signal,
+and run `backup-verify` and an isolated restore against a representative high-watermark backup
+before adopting a materially larger retention window. See
+[Backup and restore](BACKUP_RESTORE.md#verify-a-backup) for the fail-closed limit and response.
 
 PostgreSQL database and major relations:
 

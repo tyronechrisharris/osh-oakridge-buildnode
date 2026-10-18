@@ -272,6 +272,16 @@ set. Verification does not prove that an operator can recover the separately esc
 every Compose service image remains available, or that application workflows pass after restore.
 Only a restore drill proves those dependencies.
 
+Validator scratch usage is determined by the number and path lengths of archive members, not by
+their compressed payload bytes. The 256 MiB tmpfs is a deliberate fail-closed resource ceiling;
+it is not an unlimited file-count guarantee. The one-million generation-ID parser ceiling is also
+a hostile-input bound, not a supported-capacity claim. Trend file counts in OSCAR state, cold
+archive, and backup payloads, and qualify `backup-verify` plus an isolated restore with a
+representative high-watermark dataset before deploying a materially larger retention policy. A
+scratch-exhaustion failure leaves the backup unverified and must be resolved by reducing file
+cardinality through approved retention/tiering or by a reviewed release change—not by disabling
+archive validation or making the validator scratch mount unbounded.
+
 After verification, copy the complete backup directory to at least one encrypted medium or system
 outside the OSCAR host and verify the checksums again at the destination. Restrict the copy because
 it contains operational records and encrypted—not anonymized—credentials.
