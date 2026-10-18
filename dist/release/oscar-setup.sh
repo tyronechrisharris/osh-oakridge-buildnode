@@ -657,6 +657,8 @@ prepare_deployment_images() {
     ((${#missing[@]} == 0)) || fail "Required container images are unavailable: ${missing[*]}"
 }
 
+# Capability-free uid0 helpers use a neutral workdir rather than inheriting the
+# image-owned, mode-0700 OSCAR state workdir.
 initialize_tls() {
     local name=$1 tls_dir="$script_dir/tls" cert="$script_dir/tls/server.crt" key="$script_dir/tls/server.key" image san_type
     if [[ (-e $cert && ! -e $key) || (! -e $cert && -e $key) ]]; then fail 'TLS setup is incomplete. Remove the partial certificate/key pair or provide both files.'; fi
@@ -674,7 +676,7 @@ initialize_tls() {
                 san_type=DNS
                 is_ip_address "$name" && san_type=IP
                 docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-                    --tmpfs /tmp:rw,noexec,nosuid,nodev --user 0:0 --entrypoint openssl --volume "${tls_dir}:/out" "$image" \
+                    --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint openssl --volume "${tls_dir}:/out" "$image" \
                     req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 -subj "/CN=$name" \
                     -addext "subjectAltName=${san_type}:$name" -keyout /out/server.key -out /out/server.crt
                 ;;
@@ -686,7 +688,7 @@ initialize_tls() {
     # must be readable by the deliberately non-root service processes.
     chmod 644 "$cert" "$key"
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev --user 0:0 --entrypoint sh --volume "${tls_dir}:/tls:ro" "$image" -c \
+        --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint sh --volume "${tls_dir}:/tls:ro" "$image" -c \
         'openssl x509 -in /tls/server.crt -pubkey -noout >/tmp/cert.pub && openssl pkey -in /tls/server.key -pubout >/tmp/key.pub && cmp -s /tmp/cert.pub /tmp/key.pub' \
         || fail 'The TLS certificate and private key are invalid or do not match.'
     local name_check=-checkhost
@@ -695,7 +697,7 @@ initialize_tls() {
     # exits zero. Inspect the result text explicitly so a wrong certificate
     # cannot pass setup merely because the OpenSSL command executed.
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev --user 0:0 --entrypoint sh --volume "${tls_dir}:/tls:ro" "$image" -eu -c '
+        --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint sh --volume "${tls_dir}:/tls:ro" "$image" -eu -c '
         output=$(openssl x509 -in /tls/server.crt -noout "$1" "$2")
         printf "%s\n" "$output"
         case $output in *" does match certificate") ;; *) exit 1 ;; esac

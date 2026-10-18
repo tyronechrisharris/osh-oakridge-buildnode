@@ -264,7 +264,7 @@ assert_contains 'Initialize-LegacyBackupKeyBinding' "$setup_powershell_script"
 assert_contains 'Assert-UpgradeableEnvironmentBindings' "$setup_powershell_script"
 assert_contains 'Initialize-FreshDeploymentVolumes' "$setup_powershell_script"
 assert_contains 'docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$setup_shell_script"
-assert_contains '--tmpfs /tmp:rw,noexec,nosuid,nodev --user 0:0 --entrypoint sh --volume "\$\{tls_dir\}:/tls:ro"' "$setup_shell_script"
+assert_contains '--tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint sh --volume "\$\{tls_dir\}:/tls:ro"' "$setup_shell_script"
 assert_contains 'case \$output in \*" does match certificate"\)' "$setup_shell_script"
 assert_contains '\$nameOutput = Get-DockerOutput @\(' "$setup_powershell_script"
 assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges'.*'--user', '0:0', '--entrypoint', 'openssl'.*tlsDirectory.*:/tls:ro" "$setup_powershell_script"
@@ -1658,17 +1658,19 @@ grep -Fq -- "--volume $snapshot_path:/verified-snapshot:ro" "$journal_isolation_
     exit 1
 }
 
-# Every capability-free uid0 helper needs a neutral cwd. In particular, the
-# application image owns /var/lib/oscar as uid 10001 with mode 0700, so a uid0
-# process after `--cap-drop ALL` cannot traverse or restore the inherited cwd.
+# Every capability-free uid0 helper in setup and storage needs a neutral cwd.
+# In particular, the application image owns /var/lib/oscar as uid 10001 with
+# mode 0700, so a uid0 process after `--cap-drop ALL` cannot traverse or restore
+# the inherited cwd.
 awk '
+    FNR == 1 { previous="" }
     /--user 0(:0)?([[:space:]]|$)/ {
         root_helpers++
         if (index(previous "\n" $0, "--workdir /") == 0) missing++
     }
     { previous=$0 }
-    END { exit !(root_helpers >= 12 && missing == 0) }
-' "$shell_script" || {
+    END { exit !(root_helpers >= 15 && missing == 0) }
+' "$shell_script" "$setup_shell_script" || {
     printf 'Bash capless-root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
