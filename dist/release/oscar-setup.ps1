@@ -778,10 +778,12 @@ function Initialize-Tls([string]$Name) {
     $parsedIp = $null
     $nameCheck = if ([Net.IPAddress]::TryParse($Name, [ref]$parsedIp)) { '-checkip' } else { '-checkhost' }
     # openssl x509 -checkhost/-checkip exits zero even when its text reports a
-    # mismatch, so the shell must explicitly classify the result.
-    $nameCommand = 'output=$(openssl x509 -in /tls/server.crt -noout "$1" "$2"); printf "%s\n" "$output"; case $output in *" does match certificate") ;; *) exit 1 ;; esac'
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${tlsDirectory}:/tls:ro", $image,
-        '-eu', '-c', $nameCommand, 'tls-name-check', $nameCheck, $Name)
+    # mismatch. Invoke OpenSSL directly so Windows PowerShell 5.1 never has to
+    # preserve nested shell quotes, then require its one exact success line.
+    $nameOutput = Get-DockerOutput @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/tls:ro", $image,
+        'x509', '-in', '/tls/server.crt', '-noout', $nameCheck, $Name)
+    $expectedNameOutput = if ($nameCheck -ceq '-checkip') { "IP $Name does match certificate" } else { "Hostname $Name does match certificate" }
+    if ($nameOutput -cne $expectedNameOutput) { throw "TLS certificate does not match the configured hostname or IP address: $Name" }
 }
 
 function Remove-LegacyEmbeddedBackupDirectory {

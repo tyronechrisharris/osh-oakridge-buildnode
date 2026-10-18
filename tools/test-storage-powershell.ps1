@@ -135,6 +135,20 @@ try {
         Assert-True (-not $source.Contains('{{ index ')) `
             'A Windows launcher still passes a quoted Go-template index expression through PowerShell 5 native argument marshalling.'
     }
+    $tlsStart = $setupSource.IndexOf('function Initialize-Tls', [StringComparison]::Ordinal)
+    $tlsEnd = $setupSource.IndexOf('function Remove-LegacyEmbeddedBackupDirectory', $tlsStart, [StringComparison]::Ordinal)
+    Assert-True ($tlsStart -ge 0 -and $tlsEnd -gt $tlsStart) 'Could not isolate Windows TLS initialization.'
+    $tlsSource = $setupSource.Substring($tlsStart, $tlsEnd - $tlsStart)
+    Assert-True (-not $tlsSource.Contains('$nameCommand') -and
+        $tlsSource.Contains('$nameOutput = Get-DockerOutput @(') -and
+        $tlsSource.Contains("'--entrypoint', 'openssl'") -and
+        $tlsSource.Contains("'x509', '-in', '/tls/server.crt', '-noout', `$nameCheck, `$Name")) `
+        'Windows TLS name validation is not a direct, format-stable OpenSSL invocation.'
+    foreach ($expected in @('IP $Name does match certificate', 'Hostname $Name does match certificate')) {
+        Assert-True ($tlsSource.Contains($expected)) "Windows TLS name validation is missing its exact success result: $expected"
+    }
+    Assert-True ($tlsSource.Contains('if ($nameOutput -cne $expectedNameOutput)')) `
+        'Windows TLS name validation does not fail closed on any noncanonical OpenSSL result.'
     $volumeJson = '[{"Name":"oscar_oscar_state","CreatedAt":"2026-10-18T13:45:03Z","Labels":{"com.botts.oscar.deployment-id":"12345678-1234-4234-8234-123456789abc"}}]'
     $volumeRecord = ConvertFrom-DockerInspectJson @($volumeJson) 'volume' 'oscar_oscar_state'
     Assert-True ((Get-DockerInspectLabel $volumeRecord $false 'com.botts.oscar.deployment-id') -ceq '12345678-1234-4234-8234-123456789abc') `
