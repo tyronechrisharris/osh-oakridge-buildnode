@@ -31,6 +31,7 @@ All notable changes to this project will be documented in this file.
 - Add embedded DuckDB query pushdown over explicit catalog-authorized file lists and portable generation export for independent Parquet inspection
 - Bound every embedded DuckDB export, parity, deletion, query, metadata, and count connection to production-configurable memory, thread, and per-operation spill limits; add fair process-wide session admission with a bounded fail-busy wait; confine sensitive scratch to private disjoint directories and remove it on normal close
 - Keep general-purpose container temporary storage `noexec` while routing JVM native-library extraction to a bounded, owner-only executable tmpfs that is verified before startup
+- Preserve 64-bit Admin configuration values with type-correct Long, Integer, Short, and range converters, including the 2 GiB archive-generation limit, instead of narrowing every whole number through a 32-bit converter
 
 ### Media retention
 - Serialize recording commands in a bounded per-camera FIFO and use generation-qualified filenames so reconnects and back-to-back occupancies cannot finalize or reuse another recording's clip
@@ -63,6 +64,8 @@ All notable changes to this project will be documented in this file.
 - Add explicit-confirmation restore and preservation of pre-restore deployment credentials
 - Add external archive and WAL service bind mounts, an isolated administrator-owned backup root exposed only to scoped one-shot helpers, and size-rotated Docker logs
 - Add archive status and full object-checksum verification commands that require exactly one active Parquet, manifest, and schema object for every query-visible generation, reject stale generation Parquet path/checksum or manifest-path pointers, and fail/retry if the canonical catalog snapshot changes during live verification
+- Qualify archive-generation status fields across the object join so an object's identically named lifecycle columns cannot make the operator status query ambiguous
+- Parse Docker image and volume inspection metadata as bounded, identity-validated JSON on Windows PowerShell 5.1, avoiding native-argument quote loss in setup, backup, and restore label checks
 - Add supported generation/observation hold list/create/release commands with persistent actor, reason, and release audit fields
 - Resolve observation-hold membership from an exact hot row before consulting coarse archive ID ranges, so sparse/interleaved retired generations cannot reject unrelated extant rows while tombstoned and cold-only ambiguous targets remain fail-closed
 - Persist each new hold's `GENERATION_EXACT`, `HOT_EXACT`, or `COLD_RANGE_CONSERVATIVE` resolution mode, expose it in both administration CLIs, preserve unresolvable pre-3.9.2 observation-hold provenance as protective `LEGACY_UNKNOWN`, and document that neither a cold range nor unknown legacy provenance proves a sparse observation ID exists
