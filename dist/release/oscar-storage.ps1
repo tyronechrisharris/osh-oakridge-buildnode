@@ -1965,6 +1965,15 @@ function Confirm-BackupManifestInventory([string]$Root, [string[]]$ManifestPaths
     }
 }
 
+function Confirm-PostgresBaseBackup([string]$Root, [string]$PostgresImage) {
+    # pg_basebackup writes its private payload as the PostgreSQL image user
+    # (UID/GID 999), including mode-0600 backup_manifest data on some hosts.
+    # A capability-free uid 0 verifier cannot bypass those mode bits. Run the
+    # read-only verifier as the same unprivileged identity instead of granting
+    # DAC capabilities or weakening the backup directory permissions.
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '999:999', '--entrypoint', 'pg_verifybackup', '--volume', "$(Join-Path $Root 'postgres'):/backup:ro", $PostgresImage, '/backup')
+}
+
 function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
     Assert-Administrator; Assert-Configured; Assert-BackupKey
     if (-not (Test-BackupId $Id)) { Fail 'A valid backup ID is required.' }
@@ -2001,7 +2010,7 @@ function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
     }
     [void](Get-ArchiveGenerationInventory $root)
     Confirm-BackupManifestInventory $root $manifestPaths
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'pg_verifybackup', '--volume', "$(Join-Path $root 'postgres'):/backup:ro", $postgresImage, '/backup')
+    Confirm-PostgresBaseBackup $root $postgresImage
     Confirm-ReleaseConfigArchive $root $image
     Confirm-BackupArchiveMembers $root $image
     Confirm-ImageInventory $root

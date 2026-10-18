@@ -255,7 +255,9 @@ Verification:
   toward retention;
 - checks every `SHA256SUMS` entry;
 - starts a one-shot, dependency-free PostgreSQL utility container and runs `pg_verifybackup`
-  against the base backup; no live database container is required;
+  against the base backup as the same unprivileged UID/GID 999 that wrote it; this preserves
+  mode-0600 backup payloads without granting DAC capabilities or weakening storage permissions,
+  and no live database container is required;
 - decrypts the secret/configuration archive into a disposable utility-container path;
 - validates every tar payload without extracting it into the deployment: member names cannot be
   absolute, contain `..`, use backslash traversal, contain control characters, alias another path,

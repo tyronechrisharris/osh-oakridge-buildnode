@@ -197,7 +197,7 @@ bash "$repo_root/tools/test-archive-object-helper.sh"
 assert_contains 'LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE' "$shell_script"
 assert_contains "SET state='DELETING'" "$shell_script"
 assert_contains 'docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$shell_script"
-assert_contains '--user 0 --entrypoint pg_verifybackup' "$shell_script"
+assert_contains '--user 999:999 --entrypoint pg_verifybackup' "$shell_script"
 assert_contains 'SHA256SUMS\.hmac' "$shell_script"
 assert_contains 'cannot be accepted as an authenticated \$required_release_version recovery point' "$shell_script"
 assert_contains 'required_release_version=\$\(awk .*OSCAR_VERSION' "$shell_script"
@@ -1685,14 +1685,14 @@ awk '
         if (index(previous "\n" $0, "--workdir /") == 0) missing++
     }
     { previous=$0 }
-    END { exit !(root_helpers >= 15 && missing == 0) }
+    END { exit !(root_helpers == 14 && missing == 0) }
 ' "$shell_script" "$setup_shell_script" || {
     printf 'Bash capless-root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
 windows_root_helper_count=$(grep -hE -- "'--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
 windows_neutral_root_helper_count=$(grep -hE -- "'--workdir', '/', '--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
-[[ $windows_root_helper_count -ge 16 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
+[[ $windows_root_helper_count == 15 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
     printf 'PowerShell capless-root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
@@ -3321,7 +3321,8 @@ fi
 
 assert_contains 'LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE' "$powershell_script"
 assert_contains "SET state='DELETING'" "$powershell_script"
-assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
+assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '999:999', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
+assert_not_contains "'--user', '0', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
 assert_contains 'SHA256SUMS\.hmac' "$powershell_script"
 assert_contains 'cannot be accepted as an authenticated \$RequiredReleaseVersion recovery point' "$powershell_script"
 assert_contains 'RequiredReleaseVersion = \$releaseVersionLine' "$powershell_script"
