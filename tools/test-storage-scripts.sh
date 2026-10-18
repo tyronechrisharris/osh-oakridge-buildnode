@@ -91,6 +91,23 @@ assert_contains 'regular, non-symlink file' "$shell_script"
 assert_contains 'Assert-NoReparseComponents \$StorageScriptPath' "$powershell_script"
 assert_contains 'Resolve-PhysicalContainmentPath \$ScriptRoot' "$powershell_script"
 
+# Both archive-generation and archive-object expose a state column. Exercise
+# the status command through its public function and require every generation
+# projection/grouping column to remain explicitly bound to the generation
+# alias so PostgreSQL cannot reject the LEFT JOIN as ambiguous.
+archive_status_sql="$test_root/archive-status.sql"
+bash -c '
+    storage_script=$1; capture=$2
+    set -- help; source "$storage_script" >/dev/null
+    require_configured() { :; }
+    psql_admin() { printf "%s\n" "$*" >>"$capture"; }
+    audit_archive_filesystem() { :; }
+    archive_status
+' _ "$shell_script" "$archive_status_sql"
+assert_contains 'SELECT g\.store_key, g\.id_scope, g\.state, g\.profile, count\(\*\) generations, coalesce\(sum\(g\.row_count\),0\) rows' "$archive_status_sql"
+assert_contains 'GROUP BY g\.store_key, g\.id_scope, g\.state, g\.profile ORDER BY g\.store_key, g\.id_scope, g\.state, g\.profile' "$archive_status_sql"
+assert_not_contains 'SELECT store_key, id_scope, state, profile' "$archive_status_sql"
+
 if command -v pwsh >/dev/null 2>&1; then
     release_ps_physical="$test_root/release-ps-physical"
     release_ps_alias="$test_root/release-ps-alias"

@@ -1991,7 +1991,7 @@ restore_backup() (
 
 archive_status() {
     require_configured
-    psql_admin --command "SELECT store_key, id_scope, state, profile, count(*) generations, coalesce(sum(row_count),0) rows, pg_size_pretty(coalesce(sum(o.bytes),0)) bytes FROM oscar_archive_generation g LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.kind='OBSERVATIONS_PARQUET' GROUP BY store_key, id_scope, state, profile ORDER BY store_key, id_scope, state, profile;"
+    psql_admin --command "SELECT g.store_key, g.id_scope, g.state, g.profile, count(*) generations, coalesce(sum(g.row_count),0) rows, pg_size_pretty(coalesce(sum(o.bytes),0)) bytes FROM oscar_archive_generation g LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.kind='OBSERVATIONS_PARQUET' GROUP BY g.store_key, g.id_scope, g.state, g.profile ORDER BY g.store_key, g.id_scope, g.state, g.profile;"
     psql_admin --command "SELECT store_key, id_scope, count(*) active_holds FROM oscar_retention_hold WHERE released_at IS NULL GROUP BY store_key, id_scope ORDER BY store_key, id_scope;"
     audit_archive_filesystem
 }
