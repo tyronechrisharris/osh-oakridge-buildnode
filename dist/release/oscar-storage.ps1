@@ -122,7 +122,11 @@ function Sync-DurableMetadata([string]$Path) {
     $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path)).TrimEnd('\')
     if ($root -notmatch '^[A-Za-z]:$') { Fail "Durable metadata flush requires a local Windows volume: $Path" }
     $volume = "\\.\$root"
-    $handle = [OscarStorageNative]::CreateFile($volume, 0x40000000, 0x7, [IntPtr]::Zero, 3, 0x80000000, [IntPtr]::Zero)
+    # Windows PowerShell 5.1 parses 0x80000000 as a negative Int32. Passing
+    # that literal directly cannot bind to CreateFile's unsigned flags
+    # parameter, so construct FILE_FLAG_WRITE_THROUGH from a positive Int64.
+    $writeThroughFlag = [uint32]2147483648
+    $handle = [OscarStorageNative]::CreateFile($volume, [uint32]0x40000000, [uint32]0x7, [IntPtr]::Zero, [uint32]3, $writeThroughFlag, [IntPtr]::Zero)
     if ($handle -eq [IntPtr](-1)) {
         $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         Fail "Could not open the storage volume for a durability barrier (Win32 $code): $volume"
@@ -1727,8 +1731,8 @@ function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, 
         if ($resumeGateway) { Invoke-Compose @('stop', 'gateway') }
         if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-eu', '-c', 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz')
-        $extract = 'umask 077; tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz; find /snapshot -type d -exec chmod 0700 {} +; find /snapshot -type f -exec chmod 0600 {} +'
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-eu', '-c', $extract)
+        $extract = 'umask 077; tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz; find /snapshot -type d -exec chmod 0700 {} +; find /snapshot -type f -exec chmod 0600 {} +; chown -R 10001:10001 /snapshot'
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-eu', '-c', $extract)
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshot}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)
     } finally {
         Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue

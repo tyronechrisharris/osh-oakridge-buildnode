@@ -120,8 +120,17 @@ try {
     $env:OSCAR_STORAGE_TEST_MODE = '1'
     . $storageScript -Command help | Out-Null
 
+    # Exercise the real Windows volume-handle durability barrier. This catches
+    # PS 5.1 native-argument binding regressions that a parser/static gate
+    # cannot see (notably the signed interpretation of 0x80000000).
+    Sync-DurableMetadata $temporaryRoot
+
     $storageSource = [IO.File]::ReadAllText($storageScript)
     $setupSource = [IO.File]::ReadAllText($setupScript)
+    Assert-True ($storageSource.Contains('$writeThroughFlag = [uint32]2147483648')) `
+        'The Windows durability barrier does not construct FILE_FLAG_WRITE_THROUGH as an unsigned value.'
+    Assert-True (-not $storageSource.Contains(', 0x80000000,')) `
+        'A signed high-bit CreateFile flag is still passed directly under Windows PowerShell 5.1.'
     foreach ($source in @($storageSource, $setupSource)) {
         Assert-True (-not $source.Contains('{{ index ')) `
             'A Windows launcher still passes a quoted Go-template index expression through PowerShell 5 native argument marshalling.'
@@ -149,6 +158,46 @@ try {
             'The image JSON parser did not read the required OCI version label.'
         Assert-True (($script:CapturedDockerInspectArguments -join '|') -ceq 'image|inspect|oscar:3.9.2') `
             'Windows image inspection did not use the exact format-free JSON command.'
+    }
+    & {
+        $savedBackupDirectory = $BackupDirectory
+        $BackupDirectory = Join-Path $temporaryRoot 'journal-confirmation'
+        New-Item -ItemType Directory -Path $BackupDirectory | Out-Null
+        $calls = New-Object System.Collections.Generic.List[object]
+        function Protect-DockerStorageDirectory([string]$Path, [string]$Mode) {}
+        function Get-ComposeOutput([string[]]$Arguments) { return @('postgres') }
+        function Invoke-Compose([string[]]$Arguments) {}
+        function Invoke-External([string]$Program, [string[]]$Arguments) {
+            $calls.Add([pscustomobject]@{ Program = $Program; Arguments = @($Arguments) })
+        }
+        try {
+            $id = '20261018T120000Z-1234abcd'
+            $root = Join-Path $BackupDirectory $id
+            New-Item -ItemType Directory -Path $root | Out-Null
+            Confirm-DailyJournalBackup $id $root 'oscar:test' ('a' * 64)
+        } finally {
+            $BackupDirectory = $savedBackupDirectory
+        }
+        Assert-True ($calls.Count -eq 3) 'Daily journal confirmation did not run exactly validator, extractor, and Java verifier containers.'
+        $validatorArgs = [string]::Join('|', $calls[0].Arguments)
+        $extractorArgs = [string]::Join('|', $calls[1].Arguments)
+        $javaArgs = [string]::Join('|', $calls[2].Arguments)
+        Assert-True ($validatorArgs.Contains('--user|0') -and $validatorArgs.Contains('/validate-storage-archive.sh oscar-state')) `
+            'Daily journal confirmation does not validate the authenticated archive as root before extraction.'
+        foreach ($required in @('--cap-drop|ALL|--cap-add|CHOWN', '--user|0|--entrypoint|sh')) {
+            Assert-True ($extractorArgs.Contains($required)) "Daily journal extraction is missing its constrained root ownership bridge: $required"
+        }
+        $extractCommand = [string]$calls[1].Arguments[$calls[1].Arguments.Count - 1]
+        $extractIndex = $extractCommand.IndexOf('tar --no-same-owner', [StringComparison]::Ordinal)
+        $directoryModeIndex = $extractCommand.IndexOf('find /snapshot -type d -exec chmod 0700', [StringComparison]::Ordinal)
+        $fileModeIndex = $extractCommand.IndexOf('find /snapshot -type f -exec chmod 0600', [StringComparison]::Ordinal)
+        $ownerIndex = $extractCommand.IndexOf('chown -R 10001:10001 /snapshot', [StringComparison]::Ordinal)
+        Assert-True ($extractIndex -ge 0 -and $directoryModeIndex -gt $extractIndex -and
+            $fileModeIndex -gt $directoryModeIndex -and $ownerIndex -gt $fileModeIndex) `
+            'Daily journal extraction does not validate modes before handing the private snapshot to UID 10001.'
+        Assert-True ($javaArgs.Contains('--user|10001:10001|--entrypoint|java') -and
+            $javaArgs.Contains('/verified-snapshot:ro')) `
+            'Daily journal Java confirmation does not remain an unprivileged read-only consumer.'
     }
     $statusStart = $storageSource.IndexOf('function Show-ArchiveStatus', [StringComparison]::Ordinal)
     $statusEnd = $storageSource.IndexOf('function Invoke-RetentionHold', $statusStart, [StringComparison]::Ordinal)
