@@ -1,6 +1,6 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
-## 3.9.2 2026-10-17
+## 3.9.2 2026-10-18
 ### Storage-profile changes and rollout
 - Introduce the `OscarTieredObsSystemDatabase` storage profile with sequential observation IDs, batched writes, archive ownership markers, and a versioned PostgreSQL archive catalog
 - Initialize new PostgreSQL clusters with data checksums, WAL archiving, I/O timing, and `pg_stat_statements`; an existing cluster is not recreated by `upgrade`
@@ -29,6 +29,10 @@ All notable changes to this project will be documented in this file.
 - Keep general-purpose container temporary storage `noexec` while routing JVM native-library extraction to a bounded, owner-only executable tmpfs that is verified before startup
 
 ### Media retention
+- Serialize recording commands in a bounded per-camera FIFO and use generation-qualified filenames so reconnects and back-to-back occupancies cannot finalize or reuse another recording's clip
+- Bind every published recording to its exact lane, camera, and alarm; reject blank, duplicate, cross-camera, stale-generation, or otherwise unowned paths instead of attaching them heuristically
+- Cancel non-alarm recordings and fail closed on close timeouts, invalid output, or publication failure, while retaining authoritative late-close cleanup so delayed camera work cannot leave an orphaned clip
+- Make camera, occupancy, and state-listener delivery race-safe so lifecycle transitions cannot lose, duplicate, or leak recording callbacks
 - Retain exactly five distinct decoded positions (`FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`) from each eligible alarm camera clip
 - Encode each retained asset as an independently decodable opaque baseline sRGB JPEG with configurable quality (85 by default), SHA-256, dimensions, decoded ordinal, source PTS, and lifecycle metadata
 - Publish frames before a versioned manifest commit marker, use a durable identity-keyed job ledger for idempotent retry, and preserve the source MP4 on every failure or fewer-than-five-frame result

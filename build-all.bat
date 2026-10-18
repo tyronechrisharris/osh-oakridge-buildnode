@@ -24,7 +24,9 @@ popd
 
 call gradlew.bat --no-parallel :sensorhub-datastore-postgis:test --tests org.sensorhub.impl.datastore.postgis.TestTieredArchiveConfiguration --tests org.sensorhub.impl.datastore.postgis.TestParquetArchiveReader --tests org.sensorhub.impl.datastore.postgis.archive.TestArchiveLifecycleInvariants --tests org.sensorhub.impl.datastore.postgis.database.TestOscarTieredModuleProvider --tests org.sensorhub.impl.datastore.postgis.TestParameterizedQueryBuilder || exit /b 1
 
-call gradlew.bat --no-parallel :sensorhub-service-oscar:test :sensorhub-service-bucket:test :sensorhub-service-dailyfile-journal:test || exit /b 1
+call gradlew.bat --no-parallel :sensorhub-service-oscar:test :sensorhub-service-bucket:test :sensorhub-service-dailyfile-journal:test :sensorhub-system-lane:test || exit /b 1
+
+call gradlew.bat --no-parallel :sensorhub-utils-rad:test --tests org.sensorhub.impl.utils.rad.cambio.CambioTempDirectoryTest --tests org.sensorhub.impl.utils.rad.output.OccupancyOutputConcurrencyTest || exit /b 1
 
 call gradlew.bat --no-parallel :sensorhub-driver-aspect:test --tests com.botts.impl.sensor.aspect.MessageHandlerJournalTest :sensorhub-driver-ffmpeg:test --tests org.sensorhub.impl.sensor.ffmpeg.controls.FileControlPublicationTest :sensorhub-driver-rapiscan:test --tests com.botts.impl.sensor.rapiscan.MessageHandlerJournalTest :sensorhub-driver-rs350:test --tests com.botts.impl.sensor.rs350.MessageHandlerJournalTest || exit /b 1
 

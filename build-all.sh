@@ -32,11 +32,13 @@ node --test tools/update-version.test.js
 ./gradlew --no-parallel \
     :sensorhub-service-oscar:test \
     :sensorhub-service-bucket:test \
-    :sensorhub-service-dailyfile-journal:test
+    :sensorhub-service-dailyfile-journal:test \
+    :sensorhub-system-lane:test
 
 ./gradlew --no-parallel \
     :sensorhub-utils-rad:test \
-    --tests org.sensorhub.impl.utils.rad.cambio.CambioTempDirectoryTest
+    --tests org.sensorhub.impl.utils.rad.cambio.CambioTempDirectoryTest \
+    --tests org.sensorhub.impl.utils.rad.output.OccupancyOutputConcurrencyTest
 
 ./gradlew --no-parallel \
     :sensorhub-driver-aspect:test \

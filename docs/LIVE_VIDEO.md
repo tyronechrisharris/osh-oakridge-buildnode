@@ -38,6 +38,28 @@ The live-video panel has three explicit states:
 
 The Viewer retries transient playlist and media failures without repeatedly issuing start commands. After a terminal failure, selecting **Retry** waits for the old start attempt to settle, sends one stop command, and then issues one fresh start command. Leaving Lane Details, changing lanes, or unmounting the player still sends the normal stop command and clears retry timers. Stopping while OSCAR is still waiting for the first keyframe is treated as a successful cancellation: native resources are finalized, incomplete HLS artifacts are removed, and queued packets cannot leak into a later restart. Actual packet-write or cleanup failures are still reported.
 
+## Occupancy recording integrity
+
+MP4 occupancy recordings use a bounded FIFO for each configured camera. Start, close, and cancel
+commands for one camera therefore execute in request order, while different cameras can still make
+progress independently. Each start creates a generation-qualified name of the form
+`<timestamp>-g<generation>.mp4`; a later reconnect or occupancy must never overwrite or claim that
+path.
+
+The close operation's validated result is authoritative. OSCAR attaches only that returned path to
+the alarm that requested it, and verifies its exact lane, camera, and recording generation. It does
+not rediscover the clip by scanning a directory or by reading a mutable current-filename field.
+Blank, duplicate, stale-generation, cross-camera, invalid-extension, missing, empty, or unfinalized
+results fail closed instead of being published in `videoPaths`.
+
+An occupancy that does not become an alarm explicitly cancels and removes its unpublished camera
+recordings. A close timeout quarantines that camera's command queue from new recording work, but
+OSCAR continues to observe the underlying close result. If the close completes after the owning
+occupancy has been invalidated, the validated late path is removed instead of becoming an orphan.
+Camera reconnects, overlapping lifecycle callbacks, and concurrent listener registration/removal
+use generation gates and race-safe listener collections so a callback cannot migrate to a later
+occupancy.
+
 ## Acceptance test
 
 1. Open Lane Details for a lane with a connected camera.
@@ -46,7 +68,10 @@ The Viewer retries transient playlist and media failures without repeatedly issu
 4. Repeat on the first, middle, and last configured lanes, then switch rapidly between two lanes and confirm the old stream is stopped.
 5. Stop an emulator publisher or disconnect a test camera. Confirm the Viewer eventually shows **Live video could not be played** and a **Retry** action instead of remaining at `0:00` indefinitely.
 6. Restore the source, select **Retry**, and confirm playback resumes.
-7. Run an occupancy recording and confirm its MP4 finalizes and decodes; the live-HLS startup gate must not change MP4 packet handling.
+7. Run an alarm occupancy and confirm exactly one nonblank, unique `videoPaths` entry exists for each configured camera; every path must include a generation suffix, belong to that camera, exist, be nonzero, finalize, and decode in the browser.
+8. Run a non-alarm occupancy and confirm its unpublished MP4 and any partial file are removed.
+9. Trigger back-to-back alarms and a camera reconnect during recording. Confirm each alarm references only its own camera generations, no new orphan or partial appears, and every retained-media ledger row names the same event, lane, camera, and source clip with one successful attempt.
+10. Exercise a delayed close past the command timeout. Confirm later recording commands for that camera fail closed until cleanup completes and the late clip is removed rather than attached to another alarm.
 
 ## Troubleshooting
 
@@ -57,3 +82,5 @@ The Viewer retries transient playlist and media failures without repeatedly issu
 | Player remains at `0:00` | Confirm the deployed OSCAR 3.9.2 image includes the keyframe-gated HLS and Viewer recovery fixes; inspect the first segment for a leading keyframe and valid H.264 parameter sets. |
 | Emulator playback is slow to start | Run the emulator asset-preparation and validation scripts, then recreate the publisher containers. Runtime publishing should continue to use stream copy rather than live transcoding. |
 | Recordings fail after a live-video change | Treat this as a regression. Live HLS and MP4 share camera input but have separate output rules; run the recording acceptance test before release. |
+| An alarm references a clip from another event or camera | Stop release qualification. Recordings are bound by lane, camera, event, and generation; inspect the per-camera command queue and recording-coordinator logs. Never repair the database by guessing a nearby filename. |
+| A timed-out close later leaves an MP4 | Stop release qualification. The late authoritative result should be observed and removed after invalidation; capture the queue timeout and cleanup logs before restarting the camera module. |

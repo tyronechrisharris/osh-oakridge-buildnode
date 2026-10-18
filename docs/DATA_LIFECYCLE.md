@@ -256,6 +256,20 @@ protected, and automatic pruning is skipped. Manual backup re-verification does 
 Camera recordings continue to be referenced by the occupancy observation's `videoPaths` value.
 The v1 retained-media representation is additive, so old clients and old events remain readable.
 
+For new recordings, a bounded FIFO serializes start, close, and cancel commands independently for
+each camera. A successful start owns one generation-qualified source path,
+`videos/clips/<camera-token>/<timestamp>-g<generation>.mp4`. The validated close return value is the only
+authoritative path eligible for the occupancy; OSCAR does not associate a recording by directory
+order, timestamp proximity, or a mutable camera filename. Publication requires an exact match for
+the owning event, lane, camera, and generation, plus a nonblank, unique, finalized, nonzero MP4.
+
+Non-alarm occupancies cancel and remove their unpublished recordings. If a close or cancel times
+out, the affected camera queue is quarantined from later recording work while the underlying result
+remains observed. A validated result that arrives after invalidation is removed, including its
+partial output, so it cannot become an orphan or be attached to a subsequent event. Reconnects and
+listener changes are generation-gated and use race-safe collections to keep callbacks with their
+original occupancy.
+
 ### Five-frame publication
 
 At `timeToRetention` (seven days by default), the sliding retention query processes each camera
@@ -284,6 +298,21 @@ The source is never deleted on the creation attempt. Any error, including fewer 
 frames, preserves the source and records a failed job. After successful publication the source is
 `PRESERVED_FOR_ROLLBACK` for `sourceRollbackGraceHours` (24 by default). A subsequent retention pass
 re-verifies the set and, if no hold applies, advances through `ELIGIBLE_FOR_DELETION` to `DELETED`.
+
+### Recording and retained-media regression gate
+
+Release acceptance must create fresh alarm and non-alarm occupancies rather than validating only
+pre-existing files. For every alarm, the suite resolves the exact event UUID and configured camera
+UIDs, then requires one unique, nonblank generation-qualified source per camera, verifies that each
+MP4 exists, is nonzero, and decodes with valid duration and dimensions, and rejects any new orphan
+final or partial file. A non-alarm recording must leave no source behind. Back-to-back alarms and a
+camera reconnect must preserve exact event/lane/camera ownership.
+
+After the test-only retention interval elapses, acceptance requires one complete manifest per source
+with exactly five independently decodable JPEGs, matching source identity and event/lane/camera
+ledger fields, one successful attempt, and no failure record. Release qualification may set the
+disposable test deployment to zero retention days and a one-minute query period; shipped production
+defaults remain seven days and must not be accelerated merely to make a test complete sooner.
 
 ### Viewer behavior
 
