@@ -1,0 +1,2561 @@
+[CmdletBinding()]
+param(
+    [ValidateSet('backup', 'backup-verify', 'backup-prune', 'restore', 'prepare-directories', 'archive', 'help')]
+    [string]$Command = 'help',
+    [string]$Action = 'status',
+    [string]$HoldAction = 'list',
+    [string]$BackupId,
+    [string]$Confirm,
+    [string]$Before,
+    [string]$RequestedBy,
+    [string]$Plan,
+    [string]$Token,
+    [string]$Generation,
+    [string]$Destination,
+    [string]$Observation,
+    [string]$StoreKey,
+    [string]$IdScope,
+    [string]$HoldId,
+    [string]$Reason,
+    [string]$CreatedBy,
+    [string]$ReleasedBy,
+    [switch]$AdoptExistingStorageRoots,
+    [ValidateRange(1, 10000)]
+    [int]$Keep = 0
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$StorageScriptTestMode = ($MyInvocation.InvocationName -eq '.' -and $env:OSCAR_STORAGE_TEST_MODE -ceq '1')
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$releaseVersionLine = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot '.env.example')) | Where-Object { $_ -match '^OSCAR_VERSION=' } | Select-Object -First 1)
+if ($releaseVersionLine.Count -ne 1) { throw 'The packaged OSCAR release version is missing.' }
+$RequiredReleaseVersion = $releaseVersionLine[0].Substring('OSCAR_VERSION='.Length)
+if ($RequiredReleaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?$') { throw 'The packaged OSCAR release version is invalid.' }
+$MaxBackupArchiveGenerationIds = 1000000
+$MaxBackupArchiveGenerationInventoryBytes = 37000000
+$script:StorageAdminLock = $null
+
+function Fail([string]$Message) { throw $Message }
+
+function Initialize-NativeStorageMethods {
+    if ('OscarStorageNative' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OscarStorageNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool MoveFileEx(string existingName, string newName, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool FlushFileBuffers(IntPtr handle);
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+}
+
+function Sync-DurableMetadata([string]$Path) {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+    Initialize-NativeStorageMethods
+    $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path)).TrimEnd('\')
+    if ($root -notmatch '^[A-Za-z]:$') { Fail "Durable metadata flush requires a local Windows volume: $Path" }
+    $volume = "\\.\$root"
+    $handle = [OscarStorageNative]::CreateFile($volume, 0x40000000, 0x7, [IntPtr]::Zero, 3, 0x80000000, [IntPtr]::Zero)
+    if ($handle -eq [IntPtr](-1)) {
+        $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Fail "Could not open the storage volume for a durability barrier (Win32 $code): $volume"
+    }
+    try {
+        if (-not [OscarStorageNative]::FlushFileBuffers($handle)) {
+            $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Fail "Could not flush storage metadata durably (Win32 $code): $Path"
+        }
+    } finally {
+        [void][OscarStorageNative]::CloseHandle($handle)
+    }
+}
+
+function Add-DurableLogLine([string]$Path, [string]$Line) {
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read, 4096, [IO.FileOptions]::WriteThrough)
+    try {
+        $bytes = $Utf8NoBom.GetBytes("$Line`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally { $stream.Dispose() }
+}
+
+function Move-DurableNoReplace([string]$Source, [string]$Destination) {
+    if (Test-Path -LiteralPath $Destination) { Fail "Refusing to replace an existing durable destination: $Destination" }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Initialize-NativeStorageMethods
+        if (-not [OscarStorageNative]::MoveFileEx($Source, $Destination, 0x8)) {
+            $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Fail "Atomic durable no-replace move failed (Win32 $code): $Destination"
+        }
+    } else {
+        if (Test-Path -LiteralPath $Source -PathType Container) {
+            [IO.Directory]::Move($Source, $Destination)
+        } else {
+            [IO.File]::Move($Source, $Destination)
+        }
+    }
+}
+
+function Move-DurableReplace([string]$Source, [string]$Destination) {
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Initialize-NativeStorageMethods
+        if (-not [OscarStorageNative]::MoveFileEx($Source, $Destination, 0x9)) {
+            $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Fail "Atomic durable replacement failed (Win32 $code): $Destination"
+        }
+    } else {
+        [IO.File]::Move($Source, $Destination, $true)
+    }
+}
+
+function Sync-DurableTree([string]$Root) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Root -File -Force -Recurse)) {
+        $stream = [IO.FileStream]::new($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
+        try { $stream.Flush($true) } finally { $stream.Dispose() }
+    }
+}
+
+function Assert-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Fail 'Run this command from an Administrator PowerShell window.'
+    }
+}
+
+function Get-EnvValue([string]$Name, [string]$Fallback) {
+    $source = Join-Path $ScriptRoot '.env'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { $source = Join-Path $ScriptRoot '.env.example' }
+    foreach ($line in [IO.File]::ReadAllLines($source)) {
+        if ($line -match "^$([Regex]::Escape($Name))=(.*)$" -and $Matches[1]) { return $Matches[1] }
+    }
+    return $Fallback
+}
+
+function Test-FullyQualifiedDeploymentPath([string]$Value) {
+    if (-not $Value -or -not [IO.Path]::IsPathRooted($Value)) { return $false }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        # Storage durability uses local-volume flush primitives. UNC roots cannot
+        # provide the required acceptance/rename ordering and are rejected before
+        # setup can create or apply ACLs to any directory.
+        return $Value -cmatch '^[A-Za-z]:[\\/]'
+    }
+    return $Value.StartsWith('/', [StringComparison]::Ordinal)
+}
+
+function Assert-ManagedEnvironmentBindings {
+    $source = Join-Path $ScriptRoot '.env'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or
+        ((Get-Item -LiteralPath $source -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'Deployment .env must be a regular, non-reparse-point file.'
+    }
+    $lines = [IO.File]::ReadAllLines($source)
+    foreach ($name in @(
+        'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR',
+        'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR', 'OSCAR_BACKUP_KEY_FILE')) {
+        $matches = @($lines | Where-Object { $_.StartsWith("$name=", [StringComparison]::Ordinal) })
+        if ($matches.Count -ne 1) { Fail "Deployment .env must contain exactly one literal $name binding." }
+        $value = $matches[0].Substring($name.Length + 1)
+        $interpreted = $value.IndexOfAny([char[]]@('$', '#', '"', "'")) -ge 0
+        if (-not $value -or $interpreted -or @($value.ToCharArray() | Where-Object { [char]::IsWhiteSpace($_) }).Count -ne 0) {
+            Fail "Deployment .env contains a Compose-interpreted or nonliteral $name value."
+        }
+        if ($name -in @('OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR', 'OSCAR_WAL_ARCHIVE_DIR') -and
+            -not (Test-FullyQualifiedDeploymentPath $value)) {
+            Fail "$name must be an absolute stable storage-root path."
+        }
+    }
+}
+
+function Resolve-DeploymentPath([string]$Value) {
+    if ([IO.Path]::IsPathRooted($Value)) { return [IO.Path]::GetFullPath($Value) }
+    return [IO.Path]::GetFullPath((Join-Path $ScriptRoot $Value))
+}
+
+$ArchiveDirectory = Resolve-DeploymentPath (Get-EnvValue 'OSCAR_ARCHIVE_DIR' '..\oscar-storage\archive')
+$BackupDirectory = Resolve-DeploymentPath (Get-EnvValue 'OSCAR_BACKUP_DIR' '..\oscar-storage\backups')
+$WalArchiveDirectory = Resolve-DeploymentPath (Get-EnvValue 'OSCAR_WAL_ARCHIVE_DIR' '..\oscar-storage\wal-archive')
+$BackupKeyFile = Resolve-DeploymentPath (Get-EnvValue 'OSCAR_BACKUP_KEY_FILE' '.\secrets\backup-key.txt')
+
+function Test-PathContains([string]$Parent, [string]$Child) {
+    $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd([char[]]@('\', '/'))
+    $childFull = [IO.Path]::GetFullPath($Child).TrimEnd([char[]]@('\', '/'))
+    return $childFull.Equals($parentFull, [StringComparison]::OrdinalIgnoreCase) -or
+        $childFull.StartsWith($parentFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-StorageRootShapes {
+    $roots = @(
+        @('OSCAR_ARCHIVE_DIR', $ArchiveDirectory),
+        @('OSCAR_BACKUP_DIR', $BackupDirectory),
+        @('OSCAR_WAL_ARCHIVE_DIR', $WalArchiveDirectory)
+    )
+    foreach ($entry in $roots) {
+        $label = $entry[0]
+        $path = [IO.Path]::GetFullPath($entry[1])
+        $volumeRoot = [IO.Path]::GetPathRoot($path)
+        $relative = $path.Substring($volumeRoot.Length).Trim('\', '/')
+        $components = @($relative -split '[\\/]' | Where-Object { $_ })
+        if ($components.Count -lt 2) {
+            Fail "$label is too broad; configure a dedicated directory at least two components below its volume root: $path"
+        }
+        if (Test-PathContains $path $ScriptRoot) {
+            Fail "$label must not equal or contain the OSCAR release directory: $path"
+        }
+        if (Test-PathContains $ScriptRoot $path) {
+            Fail "$label must not be located inside the versioned OSCAR release directory: $path"
+        }
+        $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+        if ($profile -and (Test-PathContains $path $profile)) {
+            Fail "$label must not equal or contain the administrator profile directory: $path"
+        }
+    }
+    for ($left = 0; $left -lt $roots.Count; $left++) {
+        for ($right = $left + 1; $right -lt $roots.Count; $right++) {
+            if ((Test-PathContains $roots[$left][1] $roots[$right][1]) -or
+                (Test-PathContains $roots[$right][1] $roots[$left][1])) {
+                Fail 'Archive, backup, and WAL archive directories must be distinct and must not contain one another.'
+            }
+        }
+    }
+}
+
+function Assert-StorageRootsReady {
+    Assert-StorageRootShapes
+    foreach ($path in @($ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+            Fail 'Configured storage directories are missing; run OSCAR init/upgrade preparation first.'
+        }
+        Assert-NoReparseComponents $path
+    }
+}
+
+function Protect-AdministratorFile([string]$Path) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $acl = New-Object Security.AccessControl.FileSecurity
+    $acl.SetOwner($administrators)
+    $acl.SetAccessRuleProtection($true, $false)
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $full = [Security.AccessControl.FileSystemRights]::FullControl
+    foreach ($principal in @(
+        $identity.User,
+        ([Security.Principal.SecurityIdentifier]::new('S-1-5-18')),
+        $administrators)) {
+        [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal, $full, $allow))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Get-DockerUsersSid {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $null }
+    foreach ($name in @("$env:COMPUTERNAME\docker-users", 'docker-users')) {
+        try {
+            return ([Security.Principal.NTAccount]::new($name)).Translate([Security.Principal.SecurityIdentifier])
+        } catch {}
+    }
+    Fail 'The local docker-users group is required to protect and share OSCAR storage with Docker Desktop.'
+}
+
+function Assert-ProtectedAdministratorAcl(
+    [string]$Path,
+    [string]$Description,
+    [string[]]$AllowedAdditionalWriteSids = @()
+) {
+    $acl = Get-Acl -LiteralPath $Path
+    $ownerSid = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $administratorSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
+    $allowedSids = @($administratorSids + $AllowedAdditionalWriteSids)
+    if (-not $acl.AreAccessRulesProtected -or $ownerSid -notin @('S-1-5-18', 'S-1-5-32-544')) {
+        Fail "$Description is not protected and owned by an administrator: $Path"
+    }
+    # Use only atomic mutating rights here. Composite values such as
+    # FullControl/Modify also contain read bits and would misclassify a
+    # docker-users ReadAndExecute grant as writable.
+    $writeMask = [Security.AccessControl.FileSystemRights]::WriteData -bor
+        [Security.AccessControl.FileSystemRights]::AppendData -bor
+        [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+        [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($sid -notin $allowedSids -and ($rule.FileSystemRights -band $writeMask) -ne 0) {
+            Fail "$Description grants write or ownership rights outside the administrator set: $Path"
+        }
+    }
+}
+
+function Assert-AdministratorFile([string]$Path, [string]$Description) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Fail "$Description is missing: $Path" }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "$Description is a reparse point: $Path" }
+    Assert-ProtectedAdministratorAcl $Path $Description
+}
+
+function Assert-AdministratorDirectory([string]$Path, [string]$Description) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { Fail "$Description is missing: $Path" }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "$Description is a reparse point: $Path" }
+    Assert-ProtectedAdministratorAcl $Path $Description
+}
+
+function Assert-DockerStorageDirectory(
+    [string]$Path,
+    [string]$Description,
+    [ValidateSet('ReadOnly', 'ReadWrite')][string]$DockerAccess
+) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { Fail "$Description is missing: $Path" }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "$Description is a reparse point: $Path" }
+    $dockerSid = Get-DockerUsersSid
+    $additionalWriters = if ($DockerAccess -ceq 'ReadWrite') { @($dockerSid.Value) } else { @() }
+    Assert-ProtectedAdministratorAcl $Path $Description $additionalWriters
+    $rules = @((Get-Acl -LiteralPath $Path).Access | Where-Object {
+        $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+        $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ceq $dockerSid.Value
+    })
+    $required = if ($DockerAccess -ceq 'ReadWrite') {
+        [Security.AccessControl.FileSystemRights]::Modify
+    } else {
+        [Security.AccessControl.FileSystemRights]::ReadAndExecute
+    }
+    if (-not ($rules | Where-Object { ($_.FileSystemRights -band $required) -eq $required })) {
+        Fail "$Description does not grant the required Docker Desktop $DockerAccess access: $Path"
+    }
+}
+
+function Read-StorageIdentity([string]$Marker) {
+    $result = @{}
+    foreach ($line in [IO.File]::ReadAllLines($Marker)) {
+        $separator = $line.IndexOf('=')
+        if ($separator -lt 1) { Fail "Storage root identity marker is malformed: $Marker" }
+        $name = $line.Substring(0, $separator)
+        if ($result.ContainsKey($name)) { Fail "Storage root identity marker contains duplicate fields: $Marker" }
+        $result[$name] = $line.Substring($separator + 1)
+    }
+    return $result
+}
+
+function Assert-StorageRootIdentity(
+    [string]$Path,
+    [ValidateSet('archive', 'backup', 'wal-archive')][string]$Kind,
+    [switch]$AllowDirectoryAclRepair
+) {
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and -not $AllowDirectoryAclRepair) {
+        $dockerAccess = if ($Kind -ceq 'backup') { 'ReadOnly' } else { 'ReadWrite' }
+        Assert-DockerStorageDirectory $Path "$Kind storage root" $dockerAccess
+    }
+    $marker = Join-Path $Path '.oscar-storage-root'
+    Assert-AdministratorFile $marker 'Storage root identity marker'
+    $lines = @([IO.File]::ReadAllLines($marker))
+    $identity = Read-StorageIdentity $marker
+    $deploymentId = Get-EnvValue 'OSCAR_DEPLOYMENT_ID' ''
+    $expectedKeys = @('format','version','deployment_id','root_kind','adoption','claimed_at','adopted_at','adopted_by')
+    if ($lines.Count -ne $expectedKeys.Count -or $identity.Count -ne $expectedKeys.Count -or
+        @($expectedKeys | Where-Object { -not $identity.ContainsKey($_) }).Count -ne 0 -or
+        $identity.format -cne 'oscar-storage-root-identity' -or $identity.version -cne '1' -or
+        -not (Test-ValidDeploymentId $identity.deployment_id) -or $identity.deployment_id -cne $deploymentId -or
+        $identity.root_kind -cne $Kind -or $identity.adoption -notin @('new','explicit-existing') -or
+        $identity.claimed_at -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' -or
+        $identity.adopted_at -notmatch '^(none|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)$' -or
+        $identity.adopted_by -notmatch '^(none|[A-Za-z0-9_.@-]{1,128})$') {
+        Fail "Storage root identity is malformed, foreign, or has the wrong root kind: $Path"
+    }
+    if (($identity.adoption -ceq 'new' -and ($identity.adopted_at -cne 'none' -or $identity.adopted_by -cne 'none')) -or
+        ($identity.adoption -ceq 'explicit-existing' -and ($identity.adopted_at -ceq 'none' -or $identity.adopted_by -ceq 'none'))) {
+        Fail "Storage root identity has inconsistent adoption metadata: $marker"
+    }
+}
+
+function Assert-StorageRootIdentities {
+    Assert-StorageRootIdentity $ArchiveDirectory 'archive'
+    Assert-StorageRootIdentity $BackupDirectory 'backup'
+    Assert-StorageRootIdentity $WalArchiveDirectory 'wal-archive'
+}
+
+function Write-StorageRootIdentity([string]$Path, [string]$Kind, [string]$Adoption) {
+    $deploymentId = Get-EnvValue 'OSCAR_DEPLOYMENT_ID' ''
+    if (-not (Test-ValidDeploymentId $deploymentId)) { Fail 'OSCAR_DEPLOYMENT_ID is missing or invalid; storage roots cannot be claimed.' }
+    $marker = Join-Path $Path '.oscar-storage-root'
+    if (Test-Path -LiteralPath $marker) { Fail "Refusing to replace an existing storage root identity: $marker" }
+    $temporary = Join-Path $Path ('.oscar-storage-root.tmp.' + [Guid]::NewGuid().ToString('N'))
+    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $actor = 'none'
+    $adoptedAt = 'none'
+    if ($Adoption -ceq 'explicit-existing') {
+        $actor = [Environment]::UserName
+        if ($actor -notmatch '^[A-Za-z0-9_.@-]{1,128}$') { $actor = 'administrator' }
+        $adoptedAt = $now
+    }
+    $content = @(
+        'format=oscar-storage-root-identity', 'version=1', "deployment_id=$deploymentId", "root_kind=$Kind",
+        "adoption=$Adoption", "claimed_at=$now", "adopted_at=$adoptedAt", "adopted_by=$actor"
+    ) -join "`n"
+    try {
+        $bytes = $Utf8NoBom.GetBytes("$content`n")
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Protect-AdministratorFile $temporary
+        Move-DurableNoReplace $temporary $marker
+        Sync-DurableMetadata $Path
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+    Assert-StorageRootIdentity $Path $Kind
+}
+
+function Assert-OfflineBackupDirectory {
+    Assert-StorageRootShapes
+    if (-not (Test-Path -LiteralPath $BackupDirectory -PathType Container)) { Fail "Configured backup directory is missing: $BackupDirectory" }
+    Assert-NoReparseComponents $BackupDirectory
+}
+
+function Assert-Configured {
+    if (-not (Test-Path -LiteralPath (Join-Path $ScriptRoot '.env') -PathType Leaf)) { Fail 'Run OSCAR init first.' }
+    Assert-ManagedEnvironmentBindings
+}
+
+function Assert-BackupKey {
+    if (-not (Test-Path -LiteralPath $BackupKeyFile -PathType Leaf) -or (Get-Item -LiteralPath $BackupKeyFile).Length -eq 0) {
+        Fail "Backup key is missing: $BackupKeyFile"
+    }
+}
+
+function Enter-StorageAdminLock {
+    if ($Command -eq 'help') { return }
+    $deploymentId = Get-EnvValue 'OSCAR_DEPLOYMENT_ID' ''
+    if (-not (Test-ValidDeploymentId $deploymentId)) { Fail 'OSCAR_DEPLOYMENT_ID is missing or invalid; a deployment-scoped storage lock cannot be acquired.' }
+    $lockDirectory = if ($StorageScriptTestMode -and $env:OSCAR_STORAGE_LOCK_DIR) {
+        [IO.Path]::GetFullPath($env:OSCAR_STORAGE_LOCK_DIR)
+    } else {
+        Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)) 'OSCAR\StorageLocks'
+    }
+    Assert-SafeCreatableDirectoryPath $lockDirectory
+    New-Item -ItemType Directory -Force -Path $lockDirectory | Out-Null
+    Assert-NoReparseComponents $lockDirectory
+    Protect-PrivateDirectory $lockDirectory
+    $lockPath = Join-Path $lockDirectory "$deploymentId.lock"
+    if (Test-Path -LiteralPath $lockPath) {
+        $item = Get-Item -LiteralPath $lockPath -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Storage administration lock is not a regular, non-reparse-point file: $lockPath"
+        }
+        Assert-AdministratorFile $lockPath 'Storage administration lock'
+    } else {
+        [IO.File]::WriteAllBytes($lockPath, [byte[]]@())
+        Protect-AdministratorFile $lockPath
+    }
+    try {
+        $script:StorageAdminLock = [IO.File]::Open(
+            $lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $owner = [Text.Encoding]::UTF8.GetBytes("pid=$PID acquired=$([DateTime]::UtcNow.ToString('o'))`n")
+        $script:StorageAdminLock.SetLength(0)
+        $script:StorageAdminLock.Write($owner, 0, $owner.Length)
+        $script:StorageAdminLock.Flush($true)
+    } catch {
+        if ($script:StorageAdminLock) { $script:StorageAdminLock.Dispose(); $script:StorageAdminLock = $null }
+        Fail "Another OSCAR storage administration command is already running, or the lock cannot be opened: $lockPath"
+    }
+}
+
+function Exit-StorageAdminLock {
+    if ($script:StorageAdminLock) {
+        $script:StorageAdminLock.Dispose()
+        $script:StorageAdminLock = $null
+    }
+}
+
+function Invoke-External([string]$Program, [string[]]$Arguments) {
+    & $Program @Arguments
+    if ($LASTEXITCODE -ne 0) { Fail "$Program exited with code $LASTEXITCODE." }
+}
+
+function Get-ExternalOutput([string]$Program, [string[]]$Arguments) {
+    $output = & $Program @Arguments
+    if ($LASTEXITCODE -ne 0) { Fail "$Program exited with code $LASTEXITCODE." }
+    return @($output)
+}
+
+function Clear-ComposeOverrideEnvironment {
+    $saved = @{}
+    foreach ($name in @(
+        'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME', 'COMPOSE_ENV_FILES', 'COMPOSE_PROFILES',
+        'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR',
+        'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR', 'OSCAR_BACKUP_KEY_FILE',
+        'OSCAR_HTTPS_PORT', 'OSCAR_JAVA_OPTS', 'OSCAR_POSTGIS_PLATFORM')) {
+        if (Test-Path -LiteralPath "Env:$name") {
+            $saved[$name] = (Get-Item -LiteralPath "Env:$name").Value
+            Remove-Item -LiteralPath "Env:$name"
+        }
+    }
+    return $saved
+}
+
+function Restore-ComposeOverrideEnvironment([hashtable]$Saved) {
+    foreach ($name in $Saved.Keys) { Set-Item -LiteralPath "Env:$name" -Value $Saved[$name] }
+}
+
+function Invoke-Compose([string[]]$Arguments) {
+    Push-Location $ScriptRoot
+    $saved = Clear-ComposeOverrideEnvironment
+    try {
+        Invoke-External 'docker' (@(
+            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
+            '--file', (Join-Path $ScriptRoot 'compose.yaml')) + $Arguments)
+    } finally {
+        Restore-ComposeOverrideEnvironment $saved
+        Pop-Location
+    }
+}
+
+function Get-ComposeOutput([string[]]$Arguments) {
+    Push-Location $ScriptRoot
+    $saved = Clear-ComposeOverrideEnvironment
+    try {
+        $pinned = @(
+            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
+            '--file', (Join-Path $ScriptRoot 'compose.yaml')) + $Arguments
+        $output = & docker @pinned
+        if ($LASTEXITCODE -ne 0) { Fail "docker compose exited with code $LASTEXITCODE." }
+        return @($output)
+    } finally {
+        Restore-ComposeOverrideEnvironment $saved
+        Pop-Location
+    }
+}
+
+function Resolve-ReleaseImages {
+    $images = @(Get-ComposeOutput @('config', '--images') | Where-Object { $_ } | Sort-Object -Unique)
+    $application = @($images | Where-Object { $_ -match '(^|/)oscar:' })
+    $postgres = @($images | Where-Object { $_ -match '(^|/)oscar-postgis:' })
+    $gateway = @($images | Where-Object { $_ -match 'nginx-unprivileged:' })
+    if ($application.Count -ne 1 -or $postgres.Count -ne 1 -or $gateway.Count -ne 1) {
+        Fail 'Could not resolve exactly one application, PostGIS, and gateway image from Compose.'
+    }
+    return [pscustomobject]@{ application = $application[0]; postgres = $postgres[0]; gateway = $gateway[0] }
+}
+
+function Get-ImageInspectValue([string]$Image, [string]$Template) {
+    $value = ((Get-ExternalOutput 'docker' @('image', 'inspect', $Image, '--format', $Template)) -join "`n").Trim()
+    if (-not $value) { Fail "Could not inspect required image metadata: $Image" }
+    return $value
+}
+
+function Write-ImageInventory([string]$Root) {
+    $images = Resolve-ReleaseImages
+    $appId = Get-ImageInspectValue $images.application '{{.Id}}'
+    $postgresId = Get-ImageInspectValue $images.postgres '{{.Id}}'
+    $gatewayId = Get-ImageInspectValue $images.gateway '{{.Id}}'
+    $appDigests = Get-ImageInspectValue $images.application '{{json .RepoDigests}}'
+    $postgresDigests = Get-ImageInspectValue $images.postgres '{{json .RepoDigests}}'
+    $gatewayDigests = Get-ImageInspectValue $images.gateway '{{json .RepoDigests}}'
+    $appVersion = Get-ImageInspectValue $images.application '{{ index .Config.Labels "org.opencontainers.image.version" }}'
+    $postgresVersion = Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "org.opencontainers.image.version" }}'
+    $postgresProfile = Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "com.botts.oscar.storage-profile" }}'
+    if ($appVersion -cne $RequiredReleaseVersion -or $postgresVersion -cne $RequiredReleaseVersion -or $postgresProfile -cne $RequiredReleaseVersion) {
+        Fail 'Release images do not carry the required OSCAR version/storage-profile labels.'
+    }
+    $lines = @(
+        'format=oscar-image-inventory', 'version=1',
+        "application_name=$($images.application)", "application_id=$appId", "application_repo_digests=$appDigests", "application_version_label=$appVersion",
+        "postgres_name=$($images.postgres)", "postgres_id=$postgresId", "postgres_repo_digests=$postgresDigests", "postgres_version_label=$postgresVersion", "postgres_storage_profile_label=$postgresProfile",
+        "gateway_name=$($images.gateway)", "gateway_id=$gatewayId", "gateway_repo_digests=$gatewayDigests",
+        "created_at=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+    )
+    [IO.File]::WriteAllLines((Join-Path $Root 'image-inventory.txt'), $lines, $Utf8NoBom)
+}
+
+function Read-ImageInventory([string]$Root) {
+    $path = Join-Path $Root 'image-inventory.txt'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'Authenticated image inventory is missing or is a reparse point.'
+    }
+    $lines = @([IO.File]::ReadAllLines($path))
+    if ($lines.Count -ne 15) { Fail 'Authenticated image inventory is malformed.' }
+    $inventory = @{}
+    foreach ($line in $lines) {
+        $separator = $line.IndexOf('=')
+        if ($separator -lt 1) { Fail 'Image inventory contains an invalid field.' }
+        $key = $line.Substring(0, $separator); $value = $line.Substring($separator + 1)
+        if ($inventory.ContainsKey($key)) { Fail "Image inventory contains duplicate field: $key" }
+        $inventory[$key] = $value
+    }
+    $keys = @('format','version','application_name','application_id','application_repo_digests','application_version_label','postgres_name','postgres_id','postgres_repo_digests','postgres_version_label','postgres_storage_profile_label','gateway_name','gateway_id','gateway_repo_digests','created_at')
+    foreach ($key in $keys) { if (-not $inventory.ContainsKey($key)) { Fail "Image inventory is missing field: $key" } }
+    if ($inventory.format -cne 'oscar-image-inventory' -or $inventory.version -cne '1') { Fail 'Image inventory format/version is unsupported.' }
+    foreach ($key in @('application_name','postgres_name','gateway_name')) { if ($inventory[$key] -notmatch '^[A-Za-z0-9][A-Za-z0-9._/@:-]*$') { Fail "Image inventory has an invalid $key." } }
+    foreach ($key in @('application_id','postgres_id','gateway_id')) { if ($inventory[$key] -notmatch '^sha256:[0-9a-f]{64}$') { Fail "Image inventory has an invalid $key." } }
+    foreach ($key in @('application_repo_digests','postgres_repo_digests','gateway_repo_digests')) { if ($inventory[$key] -notmatch '^(?:null|\[(?:"[A-Za-z0-9._/@:+-]+"(?:,"[A-Za-z0-9._/@:+-]+")*)?\])$') { Fail "Image inventory has an invalid $key." } }
+    if ($inventory.application_version_label -cne $RequiredReleaseVersion -or $inventory.postgres_version_label -cne $RequiredReleaseVersion -or $inventory.postgres_storage_profile_label -cne $RequiredReleaseVersion) { Fail 'Image inventory release labels do not match this OSCAR release.' }
+    if ($inventory.created_at -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$') { Fail 'Image inventory creation time is invalid.' }
+    return $inventory
+}
+
+function Confirm-ImageInventory([string]$Root, [switch]$CompareCurrent) {
+    $inventory = Read-ImageInventory $Root
+    if (-not $CompareCurrent) { return }
+    $images = Resolve-ReleaseImages
+    foreach ($role in @('application','postgres','gateway')) {
+        $name = [string]$images.$role
+        if ($inventory["${role}_name"] -cne $name) { Fail "Restore image name mismatch for $role." }
+        if ($inventory["${role}_id"] -cne (Get-ImageInspectValue $name '{{.Id}}')) { Fail "Restore image ID mismatch for $role." }
+        # Registry RepoDigests are provenance metadata and docker save/load may
+        # drop them. Exact content-addressed ID, name, and labels remain hard gates.
+        $currentRepoDigests = Get-ImageInspectValue $name '{{json .RepoDigests}}'
+        if ($inventory["${role}_repo_digests"] -cne $currentRepoDigests) {
+            Write-Warning "$role image repository-digest provenance differs after transport; exact image ID and required labels still match."
+        }
+    }
+    if ($inventory.application_version_label -cne (Get-ImageInspectValue $images.application '{{ index .Config.Labels "org.opencontainers.image.version" }}')) { Fail 'Restore application OCI version label mismatch.' }
+    if ($inventory.postgres_version_label -cne (Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "org.opencontainers.image.version" }}') -or
+        $inventory.postgres_storage_profile_label -cne (Get-ImageInspectValue $images.postgres '{{ index .Config.Labels "com.botts.oscar.storage-profile" }}')) { Fail 'Restore PostGIS OCI label mismatch.' }
+}
+
+function Test-DockerVolume([string]$Volume) {
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & docker volume inspect $Volume *> $null
+        return $LASTEXITCODE -eq 0
+    } finally { $ErrorActionPreference = $previousErrorPreference }
+}
+
+function Get-VolumeDeploymentLabel([string]$Volume) {
+    $value = ((Get-ExternalOutput 'docker' @('volume', 'inspect', '--format', '{{ index .Labels "com.botts.oscar.deployment-id" }}', $Volume)) -join "`n").Trim()
+    if ($value -ceq '<no value>') { return '' }
+    return $value
+}
+
+function Test-ValidDeploymentId([string]$Value) {
+    return $Value -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+}
+
+function Get-AdoptionReceiptValue([string]$Name) {
+    $receipt = Join-Path $ScriptRoot '.oscar-volume-adoption'
+    if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) { return $null }
+    $matches = @([IO.File]::ReadAllLines($receipt) | Where-Object { $_ -match "^$([Regex]::Escape($Name))=" })
+    if ($matches.Count -ne 1) { return $null }
+    return $matches[0].Substring($matches[0].IndexOf('=') + 1)
+}
+
+function Test-VolumeAdoptionReceipt([string]$DeploymentId) {
+    $receipt = Join-Path $ScriptRoot '.oscar-volume-adoption'
+    if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) { return $false }
+    $item = Get-Item -LiteralPath $receipt
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    $lines = @([IO.File]::ReadAllLines($receipt))
+    if ($lines.Count -ne 6 -or @($lines | Where-Object { $_ -ceq 'format=oscar-volume-adoption' }).Count -ne 1 -or
+        @($lines | Where-Object { $_ -ceq 'version=1' }).Count -ne 1 -or
+        @($lines | Where-Object { $_ -match '^adopted_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' }).Count -ne 1 -or
+        (Get-AdoptionReceiptValue 'deployment_id') -cne $DeploymentId) { return $false }
+    $stateCreated = ((Get-ExternalOutput 'docker' @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_oscar_state')) -join "`n").Trim()
+    $postgresCreated = ((Get-ExternalOutput 'docker' @('volume', 'inspect', '--format', '{{.CreatedAt}}', 'oscar_postgres_data')) -join "`n").Trim()
+    return $stateCreated -and $postgresCreated -and
+        (Get-AdoptionReceiptValue 'oscar_state_created_at') -ceq $stateCreated -and
+        (Get-AdoptionReceiptValue 'postgres_data_created_at') -ceq $postgresCreated
+}
+
+function Assert-DeploymentVolumeOwnership {
+    $deploymentId = Get-EnvValue 'OSCAR_DEPLOYMENT_ID' ''
+    if (-not (Test-ValidDeploymentId $deploymentId)) { Fail 'OSCAR_DEPLOYMENT_ID is missing or invalid; run the release upgrade ownership preflight before storage administration.' }
+    foreach ($volume in @('oscar_oscar_state', 'oscar_postgres_data')) {
+        if (-not (Test-DockerVolume $volume)) { Fail "Required Docker volume is missing: $volume." }
+    }
+    $stateLabel = Get-VolumeDeploymentLabel 'oscar_oscar_state'
+    $postgresLabel = Get-VolumeDeploymentLabel 'oscar_postgres_data'
+    if ($stateLabel -ceq $deploymentId -and $postgresLabel -ceq $deploymentId) { return }
+    if ($stateLabel -ceq $postgresLabel -and (-not $stateLabel -or $stateLabel -ceq 'uninitialized') -and
+        (Test-VolumeAdoptionReceipt $deploymentId)) { return }
+    Fail 'OSCAR named volumes do not match this deployment identity. No storage operation was performed.'
+}
+
+function Invoke-Psql([string]$Sql, [switch]$Table) {
+    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
+    $arguments = @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper')
+    if (-not $Table) { $arguments += @('--quiet', '--tuples-only', '--no-align') }
+    $arguments += @('--command', $Sql)
+    $output = Get-ComposeOutput $arguments
+    if ($Table) { $output | Out-Host; return }
+    return (($output -join "`n").Trim())
+}
+
+function Invoke-PsqlScript([string]$Sql) {
+    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --quiet --tuples-only --no-align'
+    Push-Location $ScriptRoot
+    $saved = Clear-ComposeOverrideEnvironment
+    $savedOutputEncoding = $OutputEncoding
+    try {
+        $script:OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $arguments = @(
+            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
+            '--file', (Join-Path $ScriptRoot 'compose.yaml'),
+            'exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper'
+        )
+        $output = $Sql | & docker @arguments
+        if ($LASTEXITCODE -ne 0) { Fail "docker compose PostgreSQL script exited with code $LASTEXITCODE." }
+        return (($output -join "`n").Trim())
+    } finally {
+        $script:OutputEncoding = $savedOutputEncoding
+        Restore-ComposeOverrideEnvironment $saved
+        Pop-Location
+    }
+}
+
+function Invoke-PsqlLines([string]$Sql) {
+    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
+    $arguments = @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper', '--quiet', '--tuples-only', '--no-align', '--command', $Sql)
+    return @(Get-ComposeOutput $arguments | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -ne '' })
+}
+
+function Get-OscarImage { return "oscar:$(Get-EnvValue 'OSCAR_VERSION' 'local')" }
+
+function Invoke-ArchiveObjectHelper(
+    [ValidateSet('verify', 'copy', 'delete')][string]$Operation,
+    [string]$Relative,
+    [string]$ExpectedSha256,
+    [ValidateSet('ro', 'rw')][string]$ArchiveAccess,
+    [string]$ExportRoot = ''
+) {
+    $arguments = @(
+        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges', '--user', '10001:10001',
+        '--entrypoint', '/usr/local/bin/oscar-archive-object',
+        '--volume', "${ArchiveDirectory}:/archive:${ArchiveAccess}"
+    )
+    if ($ExportRoot) { $arguments += @('--volume', "${ExportRoot}:/export") }
+    $arguments += @((Get-OscarImage), $Operation, $Relative, $ExpectedSha256)
+    $output = @(Get-ExternalOutput 'docker' $arguments)
+    return (($output -join "`n").Trim())
+}
+
+function Get-ReleaseTemplateVersion {
+    $source = Join-Path $ScriptRoot '.env.example'
+    foreach ($line in [IO.File]::ReadAllLines($source)) {
+        if ($line -match '^OSCAR_VERSION=(.*)$' -and $Matches[1]) { return $Matches[1] }
+    }
+    return ''
+}
+
+function Assert-LocalImage([string]$Image) {
+    if (-not $Image) { Fail 'Compose resolved an empty container image name.' }
+    & docker image inspect $Image *> $null
+    if ($LASTEXITCODE -ne 0) { Fail "Required local container image is unavailable: $Image" }
+}
+
+function Get-PostgresImage {
+    $images = @(Get-ComposeOutput @('config', '--images'))
+    $image = @($images | Where-Object { $_ -match '(^|/)oscar-postgis:' } | Select-Object -First 1)
+    if ($image.Count -ne 1) { Fail 'Could not resolve the PostgreSQL image from compose.yaml.' }
+    return $image[0]
+}
+function Test-BackupId([string]$Value) { return $Value -match '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$' }
+function Test-Uuid([string]$Value) { return $Value -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$' }
+function Test-ObservationId([string]$Value) { return $Value -match '^[1-9][0-9]{0,18}$' }
+function Test-UtcCutoff([string]$Value) { return $Value -match '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' }
+function Test-StoreKey([string]$Value) { return $Value -match '^[A-Za-z_][A-Za-z0-9_]{0,62}$' }
+function Test-IdScope([string]$Value) {
+    if ($Value -notmatch '^(?:0|-?[1-9][0-9]{0,9})$') { return $false }
+    try {
+        $number = [int64]$Value
+        return $number -ge [int]::MinValue -and $number -le [int]::MaxValue
+    } catch { return $false }
+}
+function Test-RelativeObjectPath([string]$Value) {
+    return $Value -match '^[A-Za-z0-9][A-Za-z0-9._/+=-]*$' -and -not [IO.Path]::IsPathRooted($Value) -and
+        $Value -notmatch '(^|/)\.\.(/|$)' -and $Value -notmatch '//'
+}
+
+function Assert-NoReparseComponents([string]$FullPath, [switch]$AllowMissingLeaf) {
+    $full = [IO.Path]::GetFullPath($FullPath)
+    $volume = [IO.Path]::GetPathRoot($full)
+    $current = $volume
+    $parts = $full.Substring($volume.Length) -split '[\\/]'
+    for ($index = 0; $index -lt $parts.Count; $index++) {
+        if (-not $parts[$index]) { continue }
+        $current = Join-Path $current $parts[$index]
+        $isLeaf = $index -eq ($parts.Count - 1)
+        if (-not (Test-Path -LiteralPath $current)) {
+            if ($AllowMissingLeaf -and $isLeaf) { return }
+            Fail "Path component is missing: $current"
+        }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Reparse points are not permitted in privileged storage paths: $current"
+        }
+    }
+}
+
+function Assert-SafeCreatableDirectoryPath([string]$FullPath) {
+    $full = [IO.Path]::GetFullPath($FullPath)
+    $volume = [IO.Path]::GetPathRoot($full)
+    $current = $volume
+    foreach ($part in @($full.Substring($volume.Length) -split '[\\/]' | Where-Object { $_ })) {
+        $current = Join-Path $current $part
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if (-not $item) { return }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Reparse points are not permitted in privileged storage paths: $current"
+        }
+        if (-not $item.PSIsContainer) { Fail "Privileged storage path component is not a directory: $current" }
+    }
+}
+
+function Resolve-ConfinedStorageFile([string]$RootPath, [string]$Relative, [switch]$AllowMissing) {
+    if (-not (Test-RelativeObjectPath $Relative)) { Fail "Catalog contains unsafe object path: $Relative" }
+    Assert-NoReparseComponents $RootPath
+    $root = [IO.Path]::GetFullPath($RootPath)
+    $candidate = [IO.Path]::GetFullPath((Join-Path $root ($Relative.Replace('/', [IO.Path]::DirectorySeparatorChar))))
+    $prefix = $root
+    if (-not $prefix.EndsWith([string][IO.Path]::DirectorySeparatorChar)) { $prefix += [IO.Path]::DirectorySeparatorChar }
+    if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail "Storage object escapes the configured root: $Relative"
+    }
+    Assert-NoReparseComponents $candidate -AllowMissingLeaf:$AllowMissing
+    if (Test-Path -LiteralPath $candidate) {
+        $item = Get-Item -LiteralPath $candidate -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Archive object is not a regular, non-reparse-point file: $Relative"
+        }
+    } elseif (-not $AllowMissing) {
+        Fail "Archive object is missing: $Relative"
+    }
+    return $candidate
+}
+
+function Resolve-ConfinedArchivePath([string]$Relative, [switch]$AllowMissing) {
+    return Resolve-ConfinedStorageFile $ArchiveDirectory $Relative -AllowMissing:$AllowMissing
+}
+
+function Get-RegisteredArchivePaths {
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($path in @(Invoke-PsqlLines "SELECT relative_path FROM oscar_archive_object WHERE state IN ('ACTIVE','DELETING') ORDER BY relative_path;")) {
+        if (-not (Test-RelativeObjectPath $path)) { Fail "Catalog contains unsafe object path: $path" }
+        [void]$paths.Add($path)
+    }
+    Write-Output -NoEnumerate $paths
+}
+
+function Test-ArchiveFilesystemRegistration([switch]$RejectPartials) {
+    if (-not (Test-Path -LiteralPath $ArchiveDirectory -PathType Container)) { Fail "Archive root is unavailable: $ArchiveDirectory" }
+    Assert-NoReparseComponents $ArchiveDirectory
+    $root = [IO.Path]::GetFullPath($ArchiveDirectory).TrimEnd('\', '/')
+    $catalog = Get-RegisteredArchivePaths
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $pending = New-Object System.Collections.Generic.Stack[string]
+    $pending.Push($root)
+    $failures = 0
+    $freshPartials = 0
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            $relative = $item.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Write-Error "Unsafe reparse-point archive entry: $relative" -ErrorAction Continue
+                $failures++
+                continue
+            }
+            if (-not (Test-RelativeObjectPath $relative)) {
+                Write-Error "Unsafe archive filesystem path: $relative" -ErrorAction Continue
+                $failures++
+                continue
+            }
+            if ($relative -ceq '.oscar-storage-root') {
+                if ($item.PSIsContainer -or $item -isnot [IO.FileInfo]) {
+                    Write-Error "Archive root identity marker is not a regular file: $relative" -ErrorAction Continue
+                    $failures++
+                }
+                continue
+            }
+            $validDirectory = $relative -ceq 'datasets' -or $relative -ceq 'datasets/observations' -or
+                $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}$' -or
+                $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+$'
+            $validObject = $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+/generation-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(?:parquet|schemas\.json\.gz|manifest\.json)$'
+            $validPartial = $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+/generation-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(?:parquet|schemas\.json\.gz|manifest\.json)\.partial.*$'
+            if ($item.Name.IndexOf('.partial', [StringComparison]::Ordinal) -ge 0) {
+                if (-not $validPartial) {
+                    Write-Error "Archive partial is outside the approved generation-object layout: $relative" -ErrorAction Continue
+                    $failures++
+                    continue
+                }
+                if ($RejectPartials) {
+                    Write-Error "Archive partial exists while writers are quiesced: $relative" -ErrorAction Continue
+                    $failures++
+                } elseif (([DateTime]::UtcNow - $item.LastWriteTimeUtc).TotalSeconds -ge 7200) {
+                    Write-Error "Stale archive partial (at least two hours old): $relative" -ErrorAction Continue
+                    $failures++
+                } else {
+                    Write-Warning "Archive partial is still within the two-hour in-progress window: $relative"
+                    $freshPartials++
+                }
+                continue
+            }
+            if ($item.PSIsContainer) {
+                if (-not $validDirectory) {
+                    Write-Error "Archive directory is outside the approved datasets layout: $relative" -ErrorAction Continue
+                    $failures++
+                }
+                $pending.Push($item.FullName)
+            } elseif ($item -is [IO.FileInfo]) {
+                if (-not $validObject) {
+                    Write-Error "Archive file is outside the approved generation-object layout: $relative" -ErrorAction Continue
+                    $failures++
+                } else {
+                    $candidates.Add($relative)
+                }
+            } else {
+                Write-Error "Unsafe non-regular archive entry: $relative" -ErrorAction Continue
+                $failures++
+            }
+        }
+    }
+
+    # Merge a second catalog read so a generation activated during the scan is
+    # not reported as an orphan merely because publication and catalog commit race.
+    $latestCatalog = Get-RegisteredArchivePaths
+    foreach ($path in $latestCatalog) { [void]$catalog.Add($path) }
+    foreach ($relative in $candidates) {
+        if (-not $catalog.Contains($relative)) {
+            Write-Error "Unregistered archive object: $relative" -ErrorAction Continue
+            $failures++
+        }
+    }
+    if ($failures -ne 0) { Fail "$failures archive filesystem reconciliation failure(s); no files were changed" }
+    if ($freshPartials -ne 0) { Write-Host "$freshPartials recent archive partial(s) reported but not treated as stale." }
+}
+
+function Protect-PrivateDirectory([string]$Path) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($administrators)
+    $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $full = [Security.AccessControl.FileSystemRights]::FullControl
+    $principals = @(
+        $identity.User,
+        ([Security.Principal.SecurityIdentifier]::new('S-1-5-18')),
+        $administrators
+    )
+    foreach ($principal in $principals) {
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new($principal, $full, $inheritance, $propagation, $allow)
+        [void]$acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Protect-DockerStorageDirectory(
+    [string]$Path,
+    [ValidateSet('ReadOnly', 'ReadWrite')][string]$DockerAccess
+) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($administrators)
+    $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $full = [Security.AccessControl.FileSystemRights]::FullControl
+    foreach ($principal in @(
+        $identity.User,
+        ([Security.Principal.SecurityIdentifier]::new('S-1-5-18')),
+        $administrators)) {
+        [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $principal, $full, $inheritance, $propagation, $allow))
+    }
+    $dockerRights = if ($DockerAccess -ceq 'ReadWrite') {
+        [Security.AccessControl.FileSystemRights]::Modify
+    } else {
+        [Security.AccessControl.FileSystemRights]::ReadAndExecute
+    }
+    [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        (Get-DockerUsersSid), $dockerRights, $inheritance, $propagation, $allow))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+    Assert-DockerStorageDirectory $Path 'Docker-accessible OSCAR storage directory' $DockerAccess
+}
+
+function Protect-DockerReadableAdministratorFile([string]$Path) {
+    Protect-AdministratorFile $Path
+    $acl = Get-Acl -LiteralPath $Path
+    [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        (Get-DockerUsersSid),
+        [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        [Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+    Assert-AdministratorFile $Path 'Docker-readable administrator file'
+}
+
+function Initialize-StorageDirectories([switch]$AdoptExisting) {
+    Assert-Administrator
+    Assert-StorageRootShapes
+    foreach ($path in @($ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory)) {
+        Assert-SafeCreatableDirectoryPath $path
+    }
+    New-Item -ItemType Directory -Force -Path $ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory | Out-Null
+    Assert-StorageRootsReady
+    $roots = @(
+        @($ArchiveDirectory, 'archive'), @($BackupDirectory, 'backup'), @($WalArchiveDirectory, 'wal-archive')
+    )
+    # Preflight every root before claiming any one of them so a foreign/swapped
+    # marker or an unacknowledged nonempty legacy root cannot cause a partial claim.
+    foreach ($entry in $roots) {
+        $marker = Join-Path $entry[0] '.oscar-storage-root'
+        if (Test-Path -LiteralPath $marker) {
+            # Authenticate the protected marker before normalizing a root ACL
+            # left in the exact temporary state of an interrupted operation.
+            Assert-StorageRootIdentity $entry[0] $entry[1] -AllowDirectoryAclRepair
+        } elseif (@(Get-ChildItem -LiteralPath $entry[0] -Force).Count -gt 0 -and -not $AdoptExisting) {
+            Fail "Nonempty $($entry[1]) storage root is unclaimed. Re-run setup with the explicit legacy-storage-root adoption option after verifying this path: $($entry[0])"
+        }
+    }
+    foreach ($entry in $roots) {
+        $dockerAccess = if ($entry[1] -ceq 'backup') { 'ReadOnly' } else { 'ReadWrite' }
+        Protect-DockerStorageDirectory $entry[0] $dockerAccess
+    }
+    foreach ($entry in $roots) {
+        $marker = Join-Path $entry[0] '.oscar-storage-root'
+        if (-not (Test-Path -LiteralPath $marker)) {
+            $isNonempty = @(Get-ChildItem -LiteralPath $entry[0] -Force).Count -gt 0
+            Write-StorageRootIdentity $entry[0] $entry[1] $(if ($isNonempty) { 'explicit-existing' } else { 'new' })
+            if ($isNonempty) { Write-Host "Adopted existing $($entry[1]) storage root for this deployment: $($entry[0])" -ForegroundColor Yellow }
+        }
+    }
+    Assert-StorageRootIdentities
+}
+
+function Write-Checksums([string]$Root) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    Get-ChildItem -LiteralPath $Root -File -Recurse | Where-Object { $_.Name -notin @('SHA256SUMS', 'SHA256SUMS.hmac') } | Sort-Object FullName | ForEach-Object {
+        $relative = $_.FullName.Substring($Root.Length).TrimStart('\', '/').Replace('\', '/')
+        $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $lines.Add("$hash  ./$relative")
+    }
+    [IO.File]::WriteAllLines((Join-Path $Root 'SHA256SUMS'), $lines, $Utf8NoBom)
+}
+
+function Get-ChecksumHmac([string]$Root, [string]$Image, [switch]$ReadOnly) {
+    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-eu', '-c', 'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A')
+    $tag = (($output -join '').Trim())
+    if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not calculate a valid backup authentication tag.' }
+    return $tag
+}
+
+function Write-ChecksumHmac([string]$Root, [string]$Image) {
+    [IO.File]::WriteAllText((Join-Path $Root 'SHA256SUMS.hmac'), (Get-ChecksumHmac $Root $Image) + "`n", $Utf8NoBom)
+}
+
+function Confirm-ChecksumHmac([string]$Root, [string]$Image) {
+    $path = Join-Path $Root 'SHA256SUMS.hmac'
+    [void](Resolve-ConfinedStorageFile $Root 'SHA256SUMS')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        Fail "Backup has no SHA256SUMS.hmac and cannot be accepted as an authenticated $RequiredReleaseVersion recovery point."
+    }
+    [void](Resolve-ConfinedStorageFile $Root 'SHA256SUMS.hmac')
+    $expected = [IO.File]::ReadAllText($path).Trim()
+    if ($expected -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Backup authentication tag is malformed.' }
+    $actual = Get-ChecksumHmac $Root $Image -ReadOnly
+    if ($actual -cne $expected) { Fail 'Backup authentication failed; SHA256SUMS or a backup payload may have been altered.' }
+}
+
+function Confirm-ReleaseConfigArchive([string]$Root, [string]$Image) {
+    $validation = 'sh /validator/validate-storage-archive.sh release-config /backup/release-config.tar.gz'
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+}
+
+function Confirm-BackupArchiveMembers([string]$Root, [string]$Image) {
+    $validation = @'
+secret_archive=$(mktemp /tmp/oscar-secrets.XXXXXX.tar.gz)
+trap 'rm -f -- "$secret_archive"' EXIT HUP INT TERM
+openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc -out "$secret_archive"
+sh /validator/validate-storage-archive.sh \
+    oscar-state /backup/oscar-state.tar.gz \
+    cold-archive /backup/archive.tar.gz \
+    wal-archive /backup/wal-archive.tar.gz \
+    release-config /backup/release-config.tar.gz \
+    deployment-secrets "$secret_archive"
+'@
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+}
+
+function Write-VerifiedMarker([string]$Root) {
+    $marker = Join-Path $Root 'VERIFIED'
+    $temporary = Join-Path $Root ('.VERIFIED.' + [Guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $marker) {
+        $markerItem = Get-Item -LiteralPath $marker -Force
+        if ($markerItem.PSIsContainer -or ($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "VERIFIED marker is not a regular, non-reparse-point file: $marker"
+        }
+    }
+    try {
+        $bytes = $Utf8NoBom.GetBytes([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ') + "`n")
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Protect-AdministratorFile $temporary
+        Move-DurableReplace $temporary $marker
+        Assert-AdministratorFile $marker 'VERIFIED marker'
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-JournalConfirmationHmac([string]$ReceiptPath, [string]$Image) {
+    $item = Get-Item -LiteralPath $ReceiptPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'Journal-confirmation receipt payload is missing or unsafe.'
+    }
+    $output = Get-ExternalOutput 'docker' @(
+        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh',
+        '--volume', "${ReceiptPath}:/journal-confirmation:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro",
+        $Image, '-eu', '-c', 'key=$(cat /backup-key.txt); head -n 4 /journal-confirmation | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A')
+    $tag = (($output -join '').Trim())
+    if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not authenticate the journal-confirmation receipt.' }
+    return $tag
+}
+
+function Write-JournalConfirmationReceipt(
+    [string]$Root,
+    [string]$Id,
+    [string]$OscarStateSha256,
+    [string]$Image
+) {
+    if (-not (Test-BackupId $Id) -or $OscarStateSha256 -notmatch '^[0-9a-f]{64}$') {
+        Fail 'Invalid journal-confirmation receipt identity.'
+    }
+    $receipt = Join-Path $Root 'JOURNAL_CONFIRMED'
+    if (Test-Path -LiteralPath $receipt) { Fail "Journal confirmation receipt already exists: $receipt" }
+    $temporary = Join-Path $Root ('.JOURNAL_CONFIRMED.' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $content = "format=oscar-journal-backup-confirmation`nversion=2`nbackup_id=$Id`noscar_state_sha256=$OscarStateSha256`n"
+        $initialBytes = $Utf8NoBom.GetBytes($content)
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        try { $stream.Write($initialBytes, 0, $initialBytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        $tag = Get-JournalConfirmationHmac $temporary $Image
+        $content += "hmac_sha256=$tag`n"
+        $bytes = $Utf8NoBom.GetBytes($content)
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::Truncate, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Protect-AdministratorFile $temporary
+        Move-DurableNoReplace $temporary $receipt
+        Assert-AdministratorFile $receipt 'journal-confirmation receipt'
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Confirm-JournalConfirmationReceipt(
+    [string]$Root,
+    [string]$Id,
+    [string]$OscarStateSha256,
+    [string]$Image
+) {
+    $receipt = Join-Path $Root 'JOURNAL_CONFIRMED'
+    Assert-AdministratorFile $receipt 'authenticated journal-confirmation receipt'
+    $lines = @([IO.File]::ReadAllLines($receipt))
+    if ($lines.Count -ne 5 -or
+        @($lines | Where-Object { $_ -ceq 'format=oscar-journal-backup-confirmation' }).Count -ne 1 -or
+        @($lines | Where-Object { $_ -ceq 'version=2' }).Count -ne 1 -or
+        @($lines | Where-Object { $_ -ceq "backup_id=$Id" }).Count -ne 1 -or
+        @($lines | Where-Object { $_ -ceq "oscar_state_sha256=$OscarStateSha256" }).Count -ne 1 -or
+        @($lines | Where-Object { $_ -cmatch '^hmac_sha256=[A-Za-z0-9+/]{43}=$' }).Count -ne 1) {
+        Fail 'Authenticated journal confirmation receipt does not match this recovery point.'
+    }
+    $expected = $lines[4].Substring('hmac_sha256='.Length)
+    if ((Get-JournalConfirmationHmac $receipt $Image) -cne $expected) {
+        Fail 'Journal-confirmation receipt authentication failed.'
+    }
+}
+
+function Get-ArchiveGenerationInventory([string]$Root) {
+    $path = Resolve-ConfinedStorageFile $Root 'archive-generation-ids.txt'
+    $bytes = [IO.File]::ReadAllBytes($path)
+    if ($bytes.Length -gt $MaxBackupArchiveGenerationInventoryBytes) {
+        Fail 'Authenticated archive-generation inventory exceeds its size limit.'
+    }
+    if ($bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -ne 10) {
+        Fail 'Authenticated archive-generation inventory is not canonically newline terminated.'
+    }
+    $text = $Utf8NoBom.GetString($bytes)
+    $lines = @()
+    if ($text.Length -gt 0) { $lines = @($text.Substring(0, $text.Length - 1) -split "`n") }
+    if ($lines.Count -gt $MaxBackupArchiveGenerationIds) {
+        Fail 'Authenticated archive-generation inventory exceeds its entry limit.'
+    }
+    $previous = $null
+    foreach ($line in $lines) {
+        if ($line -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') {
+            Fail 'Authenticated archive-generation inventory contains a noncanonical UUID.'
+        }
+        if ($null -ne $previous -and [string]::CompareOrdinal($previous, $line) -ge 0) {
+            Fail 'Authenticated archive-generation inventory is unsorted or contains duplicates.'
+        }
+        $previous = $line
+    }
+    return $lines
+}
+
+function Get-ArchiveGenerationIdsSql([string]$Root) {
+    $ids = @(Get-ArchiveGenerationInventory $Root)
+    return "'{$($ids -join ',')}'::uuid[]"
+}
+
+function Write-ArchiveGenerationInventory([string]$Root) {
+    $path = Join-Path $Root 'archive-generation-ids.txt'
+    $ids = @(Invoke-PsqlLines "SELECT id::text FROM oscar_archive_generation WHERE state IN ('ACTIVE','SEALED') ORDER BY id;")
+    $content = ''
+    if ($ids.Count -gt 0) { $content = ($ids -join "`n") + "`n" }
+    [IO.File]::WriteAllText($path, $content, $Utf8NoBom)
+    [void](Get-ArchiveGenerationInventory $Root)
+}
+
+function Set-VerifiedBackupEpochReceipt(
+    [string]$Root,
+    [string]$Id,
+    [string]$EpochId,
+    [string]$PostgresLsn
+) {
+    if (-not (Test-BackupId $Id) -or -not (Test-Uuid $EpochId) -or $PostgresLsn -notmatch '^[0-9A-F]+/[0-9A-F]+$') {
+        Fail 'Authenticated backup epoch fields are invalid for the live verification receipt.'
+    }
+    $epochHash = (Get-FileHash -LiteralPath (Join-Path $Root 'epoch.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $generationIdsSql = Get-ArchiveGenerationIdsSql $Root
+    Assert-DeploymentVolumeOwnership
+    $sql = @"
+WITH upserted AS (
+INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_ids,manifest_path,sha256,verified_at)
+VALUES ('$EpochId','VERIFIED','$PostgresLsn',$generationIdsSql,'$Id/epoch.json','$epochHash',now())
+ON CONFLICT (id) DO UPDATE SET
+ state='VERIFIED',
+ verified_at=CASE WHEN oscar_backup_epoch.state='VERIFIED' THEN oscar_backup_epoch.verified_at ELSE now() END
+WHERE oscar_backup_epoch.state IN ('CREATED','VERIFIED')
+  AND oscar_backup_epoch.postgres_lsn IS NOT DISTINCT FROM EXCLUDED.postgres_lsn
+  AND oscar_backup_epoch.archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids
+  AND oscar_backup_epoch.manifest_path IS NOT DISTINCT FROM EXCLUDED.manifest_path
+  AND oscar_backup_epoch.sha256 IS NOT DISTINCT FROM EXCLUDED.sha256
+RETURNING id::text||'|'||state
+)
+SELECT * FROM upserted;
+"@
+    $receipt = Invoke-PsqlScript $sql
+    if ($receipt -cne "$EpochId|VERIFIED") {
+        Fail 'Backup epoch UUID already exists with a foreign identity/state; no catalog row was changed.'
+    }
+}
+
+function Get-ReleaseConfigVersion([string]$Root, [string]$Image) {
+    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", $Image, '-eu', '-c', "tar -xOzf /backup/release-config.tar.gz .env.example | sed -n 's/^OSCAR_VERSION=//p' | head -n 1")
+    return (($output -join "`n").Trim())
+}
+
+function Assert-RestoreCompatibility([string]$Root) {
+    $current = Get-EnvValue 'OSCAR_VERSION' 'unknown'
+    $image = "oscar:$current"
+    Assert-LocalImage $image
+    Confirm-ReleaseConfigArchive $Root $image
+    $releaseConfig = Get-ReleaseConfigVersion $Root $image
+    $epoch = Get-Content -LiteralPath (Join-Path $Root 'epoch.json') -Raw | ConvertFrom-Json
+    $backup = [string]$epoch.oscarVersion
+    if ($current -cne $RequiredReleaseVersion -or $backup -cne $RequiredReleaseVersion -or $releaseConfig -cne $RequiredReleaseVersion) {
+        Fail "Destructive restore requires exact $RequiredReleaseVersion identity (current=$current, backup=$backup, release-config=$releaseConfig)."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Root 'SHA256SUMS.hmac') -PathType Leaf)) {
+        Fail "OSCAR $RequiredReleaseVersion restore requires SHA256SUMS.hmac; this backup is legacy or incomplete."
+    }
+    foreach ($requiredImage in @(Get-ComposeOutput @('config', '--images') | Sort-Object -Unique)) {
+        if ($requiredImage) { Assert-LocalImage $requiredImage }
+    }
+    Confirm-ImageInventory $Root -CompareCurrent
+}
+
+function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, [string]$OscarStateSha256) {
+    if ($OscarStateSha256 -notmatch '^[0-9a-f]{64}$') { Fail 'Authenticated oscar-state.tar.gz SHA-256 is missing.' }
+    $snapshot = Join-Path $BackupDirectory ".journal-confirm-$Id-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $snapshot | Out-Null
+    Protect-DockerStorageDirectory $snapshot 'ReadWrite'
+    $running = @(Get-ComposeOutput @('ps', '--status', 'running', '--services'))
+    $resumeOscar = $running -contains 'oscar'
+    $resumeGateway = $running -contains 'gateway'
+    $resumePostgres = $running -contains 'postgres'
+    if (-not $resumePostgres) { Fail 'PostgreSQL must be running to create a coordinated backup.' }
+    try {
+        if ($resumeGateway) { Invoke-Compose @('stop', 'gateway') }
+        if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-eu', '-c', 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz')
+        $extract = 'umask 077; tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz; find /snapshot -type d -exec chmod 0700 {} +; find /snapshot -type f -exec chmod 0600 {} +'
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-eu', '-c', $extract)
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshot}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)
+    } finally {
+        Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue
+        $services = @()
+        if ($resumeOscar) { $services += 'oscar' }
+        if ($resumeGateway) { $services += 'gateway' }
+        if ($services.Count -gt 0) {
+            try { Invoke-Compose (@('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300') + $services) }
+            catch { Write-Warning "Could not resume services after daily-file backup confirmation: $($_.Exception.Message)"; throw }
+        }
+    }
+}
+
+function Complete-NewBackupAcceptance([string]$Id, [string]$Root, [string]$Image, [string]$OscarStateSha256) {
+    # Retention authorization is last. The immutable core first passes every
+    # checksum/HMAC/archive/pg_verifybackup/image check and commits VERIFIED in
+    # both the filesystem and live catalog. The post-verification journal audit
+    # receipt is outside SHA256SUMS and authenticates itself with the backup key.
+    Confirm-Backup $Id
+    Confirm-DailyJournalBackup $Id $Root $Image $OscarStateSha256
+    Write-JournalConfirmationReceipt $Root $Id $OscarStateSha256 $Image
+    Confirm-JournalConfirmationReceipt $Root $Id $OscarStateSha256 $Image
+}
+
+function New-Backup {
+    Assert-Administrator; Assert-Configured
+    Assert-CanonicalCredentialBindings (Join-Path $ScriptRoot '.env')
+    Assert-BackupKey; Assert-DeploymentVolumeOwnership; Initialize-StorageDirectories
+    $version = Get-EnvValue 'OSCAR_VERSION' 'unknown'
+    $templateVersion = Get-ReleaseTemplateVersion
+    if ($version -cne $RequiredReleaseVersion -or $templateVersion -cne $RequiredReleaseVersion) {
+        Fail "Backup requires OSCAR $RequiredReleaseVersion in both .env and .env.example (current=$version, release-config=$templateVersion)."
+    }
+    $image = "oscar:$version"
+    $postgresImage = Get-PostgresImage
+    Assert-LocalImage $image
+    Assert-LocalImage $postgresImage
+    $timestamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+    $randomBytes = New-Object byte[] 4
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($randomBytes) } finally { $rng.Dispose() }
+    $suffix = ([BitConverter]::ToString($randomBytes)).Replace('-', '').ToLowerInvariant()
+    $id = "$timestamp-$suffix"
+    $work = Join-Path $BackupDirectory "$id.partial"
+    $final = Join-Path $BackupDirectory $id
+    if ((Test-Path -LiteralPath $work) -or (Test-Path -LiteralPath $final)) { Fail "Backup destination already exists: $id" }
+    New-Item -ItemType Directory -Path $work | Out-Null
+    Protect-DockerStorageDirectory $work 'ReadWrite'
+    New-Item -ItemType Directory -Path (Join-Path $work 'postgres') | Out-Null
+    foreach ($name in @('oscar-state.tar.gz', 'archive.tar.gz', 'wal-archive.tar.gz')) {
+        [IO.File]::WriteAllBytes((Join-Path $work $name), [byte[]]@())
+    }
+
+    $running = @(Get-ComposeOutput @('ps', '--status', 'running', '--services'))
+    $resumeOscar = $running -contains 'oscar'
+    $resumeGateway = $running -contains 'gateway'
+    $resumePostgres = $running -contains 'postgres'
+    if (-not $resumePostgres) { Fail 'PostgreSQL must be running to create a coordinated backup.' }
+    try {
+        if ($resumeGateway) { Invoke-Compose @('stop', 'gateway') }
+        if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
+        # Quiesce writers first, then require the catalog and every immutable
+        # archive object to agree before either side is snapshotted.
+        Confirm-ArchiveObjects -RejectPartials
+        Write-ArchiveGenerationInventory $work
+        $lsn = Invoke-Psql 'SELECT pg_current_wal_lsn();'
+        $epochId = Invoke-Psql 'SELECT gen_random_uuid();'
+        if (-not (Test-Uuid $epochId)) { Fail 'PostgreSQL did not return a valid backup epoch ID.' }
+        Invoke-Psql 'SELECT pg_switch_wal();' | Out-Null
+        $postgresContainers = @(Get-ComposeOutput @('ps', '--quiet', 'postgres'))
+        if ($postgresContainers.Count -ne 1 -or $postgresContainers[0] -notmatch '^[0-9a-f]{12,64}$') {
+            Fail 'Could not resolve the running PostgreSQL container for pg_basebackup.'
+        }
+        $postgresContainer = $postgresContainers[0]
+        $basebackup = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); export PGPASSWORD; exec pg_basebackup --pgdata=/backup --username=oscar_bootstrap --dbname="host=127.0.0.1 port=5432 dbname=gis" --format=plain --wal-method=stream --checkpoint=fast'
+        Invoke-External 'docker' @('run', '--rm', '--network', "container:$postgresContainer", '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '999:999', '--entrypoint', 'sh', '--volume', "$(Join-Path $work 'postgres'):/backup", '--volume', "$(Join-Path $ScriptRoot 'secrets/postgres-bootstrap-password.txt'):/run/secrets/postgres_bootstrap_password:ro", $postgresImage, '-eu', '-c', $basebackup)
+        Invoke-Compose @('stop', 'postgres')
+        $stateArchive = @'
+for entry in lib web rules documentation trusted_certificates config logback.xml; do
+    if [ -L "/state/$entry" ]; then
+        [ "$(readlink "/state/$entry")" = "/opt/oscar/$entry" ] || { echo "Unexpected OSCAR state symlink target: $entry" >&2; exit 1; }
+    elif [ -e "/state/$entry" ]; then
+        echo "Reserved OSCAR image-owned state path is not the expected symlink: $entry" >&2; exit 1
+    fi
+done
+tar --exclude='./archive' --exclude='./backups' --exclude='./lib' --exclude='./web' --exclude='./rules' --exclude='./documentation' --exclude='./trusted_certificates' --exclude='./config' --exclude='./logback.xml' -C /state -czf /output.tar.gz .
+'@
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state:ro', '--volume', "$(Join-Path $work 'oscar-state.tar.gz'):/output.tar.gz", $image, '-eu', '-c', $stateArchive)
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive:ro", '--volume', "$(Join-Path $work 'archive.tar.gz'):/output.tar.gz", $image, '-eu', '-c', "tar --exclude='./.oscar-storage-root' -C /archive -czf /output.tar.gz .")
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', "${WalArchiveDirectory}:/wal-archive:ro", '--volume', "$(Join-Path $work 'wal-archive.tar.gz'):/output.tar.gz", $postgresImage, '-eu', '-c', "if find /wal-archive -type f -name '*.partial*' -print -quit | grep -q .; then echo 'WAL archive contains a .partial file while backup writers are quiesced.' >&2; exit 1; fi; tar --exclude='./.oscar-storage-root' -C /wal-archive -czf /output.tar.gz .")
+
+    $encryptedSecrets = Join-Path $work 'deployment-secrets.tar.gz.enc'
+    [IO.File]::WriteAllBytes($encryptedSecrets, [byte[]]@())
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${encryptedSecrets}:/deployment-secrets.tar.gz.enc", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'tar -C /deployment -czf - .env secrets tls | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/backup-key.txt -out /deployment-secrets.tar.gz.enc')
+    $releaseConfigFiles = @(
+        '.dockerignore', '.env.example', 'DEPLOYMENT.md', 'QUICKSTART.md', 'compose.yaml',
+        'docker/gateway/default.conf', 'docker/oscar/archive-object-helper.sh', 'docker/oscar/atomic-publish.c', 'docker/oscar/Dockerfile', 'docker/oscar/entrypoint.sh',
+        'oscar-setup.ps1', 'oscar-setup.sh', 'oscar-storage.ps1', 'oscar-storage.sh', 'oscar.bat', 'oscar.sh',
+        'postgis/Dockerfile', 'postgis/archive-wal.sh', 'postgis/merge-wal-restore.sh', 'postgis/prepare-restore.sh', 'postgis/init-app-role.sh', 'postgis/init-extensions.sql', 'validate-storage-archive.sh'
+    )
+    $releaseConfigArchive = Join-Path $work 'release-config.tar.gz'
+    [IO.File]::WriteAllBytes($releaseConfigArchive, [byte[]]@())
+    Invoke-External 'docker' (@('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'tar', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${releaseConfigArchive}:/release-config.tar.gz", $image, '-C', '/deployment', '-czf', '/release-config.tar.gz') + $releaseConfigFiles)
+
+    $epoch = [ordered]@{
+        format = 'oscar-backup-epoch'; version = 1; backupEpochId = $epochId; backupId = $id
+        createdAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); oscarVersion = $version
+        postgresLsn = $lsn; archiveRoot = '/var/lib/oscar/archive'; secrets = 'AES-256-CBC/PBKDF2 with HMAC-SHA-256 manifest authentication; key stored separately'; state = 'CREATED'
+    }
+    [IO.File]::WriteAllText((Join-Path $work 'epoch.json'), ($epoch | ConvertTo-Json) + "`n", $Utf8NoBom)
+    Write-ImageInventory $work
+    $oscarStateSha256 = (Get-FileHash -LiteralPath (Join-Path $work 'oscar-state.tar.gz') -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Checksums $work
+    Write-ChecksumHmac $work $image
+    Protect-DockerStorageDirectory $work 'ReadOnly'
+    Sync-DurableTree $work
+    Move-DurableNoReplace $work $final
+    if ($resumePostgres) {
+        Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'postgres')
+        $resumePostgres = $false
+    }
+    $epochHash = (Get-FileHash -LiteralPath (Join-Path $final 'epoch.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $generationIdsSql = Get-ArchiveGenerationIdsSql $final
+    try {
+        Assert-DeploymentVolumeOwnership
+        Invoke-PsqlScript "INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_ids,manifest_path,sha256) VALUES ('$epochId','CREATED','$lsn',$generationIdsSql,'$id/epoch.json','$epochHash');" | Out-Null
+    } catch {
+        Write-Warning "Backup payload is complete, but its live catalog receipt could not be inserted: $($_.Exception.Message)"
+    }
+    Write-Host "Backup created: $final" -ForegroundColor Green
+    Write-Host "Store $BackupKeyFile separately from the backup media; it is required to restore encrypted credentials."
+    Complete-NewBackupAcceptance $id $final $image $oscarStateSha256
+    } finally {
+        $services = @()
+        if ($resumePostgres) { $services += 'postgres' }
+        if ($resumeOscar) { $services += 'oscar' }
+        if ($resumeGateway) { $services += 'gateway' }
+        if ($services.Count -gt 0) { Invoke-Compose (@('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300') + $services) }
+    }
+    if ((Get-EnvValue 'OSCAR_BACKUP_AUTO_PRUNE' 'true') -ceq 'true') { Remove-ExpiredBackups 0 }
+}
+
+function Confirm-BackupManifestInventory([string]$Root, [string[]]$ManifestPaths) {
+    if (@($ManifestPaths | Sort-Object -Unique).Count -ne $ManifestPaths.Count) {
+        Fail 'Authenticated checksum manifest contains duplicate paths.'
+    }
+    $actual = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(Get-ChildItem -LiteralPath $Root -Force -Recurse)) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Backup contains a reparse point: $($item.FullName)"
+        }
+        if ($item.PSIsContainer) { continue }
+        if ($item -isnot [IO.FileInfo]) { Fail "Backup contains a non-regular entry: $($item.FullName)" }
+        $relative = $item.FullName.Substring($Root.Length).TrimStart('\', '/').Replace('\', '/')
+        if ($relative -in @('VERIFIED','JOURNAL_CONFIRMED','SHA256SUMS','SHA256SUMS.hmac')) { continue }
+        if (-not (Test-RelativeObjectPath $relative)) { Fail "Unsafe backup filesystem path: $relative" }
+        $actual.Add($relative)
+    }
+    $expectedSorted = @($ManifestPaths | Sort-Object)
+    $actualSorted = @($actual | Sort-Object)
+    if ($expectedSorted.Count -ne $actualSorted.Count -or
+        [string]::Join("`n", $expectedSorted) -cne [string]::Join("`n", $actualSorted)) {
+        Fail 'Authenticated checksum manifest does not exactly cover every backup payload file.'
+    }
+}
+
+function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
+    Assert-Administrator; Assert-Configured; Assert-BackupKey
+    if (-not (Test-BackupId $Id)) { Fail 'A valid backup ID is required.' }
+    $root = Join-Path $BackupDirectory $Id
+    $checksumFile = Join-Path $root 'SHA256SUMS'
+    if (-not (Test-Path -LiteralPath $checksumFile -PathType Leaf)) { Fail "Backup is incomplete: $root" }
+    $image = Get-OscarImage
+    $postgresImage = Get-PostgresImage
+    Assert-LocalImage $image
+    Assert-LocalImage $postgresImage
+    Confirm-ChecksumHmac $root $image
+    $manifestPaths = New-Object System.Collections.Generic.List[string]
+    $oscarStateSha256 = $null
+    $oscarStateEntries = 0
+    $requiredPayloadCounts = @{
+        'archive.tar.gz' = 0; 'archive-generation-ids.txt' = 0; 'deployment-secrets.tar.gz.enc' = 0; 'epoch.json' = 0
+        'image-inventory.txt' = 0; 'oscar-state.tar.gz' = 0; 'release-config.tar.gz' = 0
+        'wal-archive.tar.gz' = 0
+    }
+    foreach ($line in [IO.File]::ReadAllLines($checksumFile)) {
+        if ($line -notmatch '^([0-9a-f]{64})  \./(.+)$') { Fail "Invalid checksum entry: $line" }
+        $manifestPaths.Add($Matches[2])
+        $path = Resolve-ConfinedStorageFile $root $Matches[2]
+        $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -cne $Matches[1]) { Fail "Backup checksum mismatch: $($Matches[2])" }
+        if ($Matches[2] -ceq 'oscar-state.tar.gz') {
+            $oscarStateSha256 = $Matches[1]
+            $oscarStateEntries++
+        }
+        if ($requiredPayloadCounts.ContainsKey($Matches[2])) { $requiredPayloadCounts[$Matches[2]]++ }
+    }
+    foreach ($payload in $requiredPayloadCounts.Keys) {
+        if ($requiredPayloadCounts[$payload] -ne 1) { Fail "Authenticated checksum manifest must contain $payload exactly once." }
+    }
+    [void](Get-ArchiveGenerationInventory $root)
+    Confirm-BackupManifestInventory $root $manifestPaths
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'pg_verifybackup', '--volume', "$(Join-Path $root 'postgres'):/backup:ro", $postgresImage, '/backup')
+    Confirm-ReleaseConfigArchive $root $image
+    Confirm-BackupArchiveMembers $root $image
+    Confirm-ImageInventory $root
+    $epochRaw = Get-Content -LiteralPath (Join-Path $root 'epoch.json') -Raw
+    $epoch = $epochRaw | ConvertFrom-Json
+    $epochKeys = @('format','version','backupEpochId','backupId','createdAt','oscarVersion','postgresLsn','archiveRoot','secrets','state')
+    if (@($epoch.PSObject.Properties).Count -ne $epochKeys.Count) { Fail 'Backup epoch must contain exactly the version-1 field set.' }
+    foreach ($epochKey in $epochKeys) {
+        if (@($epoch.PSObject.Properties | Where-Object Name -CEQ $epochKey).Count -ne 1 -or
+            ([regex]::Matches($epochRaw, '(?m)^\s*"' + [regex]::Escape($epochKey) + '"\s*:')).Count -ne 1) {
+            Fail "Backup epoch must contain exactly one $epochKey field."
+        }
+    }
+    if (-not (Test-Uuid $epoch.backupEpochId)) { Fail 'Backup epoch manifest is invalid.' }
+    if ([string]$epoch.format -cne 'oscar-backup-epoch' -or [int]$epoch.version -ne 1 -or
+        [string]$epoch.backupId -cne $Id -or [string]$epoch.state -cne 'CREATED') {
+        Fail 'Backup epoch identity, format version, or creation state does not match this recovery-point directory.'
+    }
+    if ([string]$epoch.oscarVersion -cne $RequiredReleaseVersion) { Fail "Backup epoch must identify OSCAR $RequiredReleaseVersion." }
+    if ([string]$epoch.postgresLsn -notmatch '^[0-9A-F]+/[0-9A-F]+$') { Fail 'Backup epoch PostgreSQL LSN is invalid.' }
+    $journalReceipt = Join-Path $root 'JOURNAL_CONFIRMED'
+    if (Test-Path -LiteralPath $journalReceipt) {
+        try { Confirm-JournalConfirmationReceipt $root $Id $oscarStateSha256 $image }
+        catch { Write-Warning "Post-verification journal-confirmation audit sidecar is invalid; the authenticated recovery core remains usable: $($_.Exception.Message)" }
+    }
+    if (-not $ReadOnly) {
+        $postgresRunning = $false
+        try { $postgresRunning = @(Get-ComposeOutput @('ps', '--status', 'running', '--services')) -contains 'postgres' }
+        catch { Write-Warning "Could not query the optional live backup-verification catalog: $($_.Exception.Message)" }
+        if ($postgresRunning) {
+            # Offline verification is allowed, but a discovered fixed-name
+            # project must prove deployment ownership before either acceptance
+            # state or the live catalog can be changed.
+            Assert-DeploymentVolumeOwnership
+        }
+        Write-VerifiedMarker $root
+        if ($postgresRunning) {
+            try {
+                Set-VerifiedBackupEpochReceipt $root $Id ([string]$epoch.backupEpochId) ([string]$epoch.postgresLsn)
+            } catch {
+                Remove-Item -LiteralPath (Join-Path $root 'VERIFIED') -Force -ErrorAction SilentlyContinue
+                Sync-DurableMetadata $root
+                Fail "The live backup-verification catalog receipt could not be committed; VERIFIED was removed: $($_.Exception.Message)"
+            }
+        }
+        Protect-DockerStorageDirectory $root 'ReadOnly'
+        Write-Host "Backup verified: $root" -ForegroundColor Green
+    }
+}
+
+function Get-AuthenticatedBackupLabelBoundary([string]$Root) {
+    $checksumPath = Join-Path $Root 'SHA256SUMS'
+    $matches = @([IO.File]::ReadAllLines($checksumPath) | Where-Object { $_ -cmatch '^[0-9a-f]{64}  \./postgres/backup_label$' })
+    if ($matches.Count -ne 1) { Fail "Authenticated manifest must contain postgres/backup_label exactly once: $Root" }
+    $label = Resolve-ConfinedStorageFile $Root 'postgres/backup_label'
+    $actual = (Get-FileHash -LiteralPath $label -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -cne $matches[0].Substring(0, 64)) { Fail "Authenticated PostgreSQL backup_label checksum mismatch: $Root" }
+    $boundaryMatch = [Regex]::Match([IO.File]::ReadAllText($label), '\(file ([0-9A-F]{24})\)')
+    if (-not $boundaryMatch.Success) { Fail "Could not determine the safe WAL boundary from authenticated backup_label: $Root" }
+    return $boundaryMatch.Groups[1].Value
+}
+
+function Get-PruneIntentHmac([string]$FileName, [string]$Image) {
+    if ($FileName -cne '.oscar-backup-prune-intent') { Fail 'Unsafe backup prune intent filename.' }
+    $intentPath = Join-Path $BackupDirectory $FileName
+    $output = Get-ExternalOutput 'docker' @(
+        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${intentPath}:/prune-intent:ro",
+        '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-eu', '-c',
+        'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /prune-intent | openssl base64 -A')
+    $tag = (($output -join '').Trim())
+    if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not calculate a valid backup prune intent authentication tag.' }
+    return $tag
+}
+
+function Read-PruneIntent {
+    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
+    $tagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
+    Assert-AdministratorFile $intentPath 'Backup prune recovery intent'
+    Assert-AdministratorFile $tagPath 'Backup prune recovery intent authentication tag'
+    $expected = [IO.File]::ReadAllText($tagPath).Trim()
+    if ($expected -notmatch '^[A-Za-z0-9+/]{43}=$' -or (Get-PruneIntentHmac '.oscar-backup-prune-intent' (Get-OscarImage)) -cne $expected) {
+        Fail 'Backup prune recovery intent authentication failed; no deletion was attempted.'
+    }
+    $lines = @([IO.File]::ReadAllLines($intentPath))
+    $scalar = @{}
+    $deleteBackups = New-Object System.Collections.Generic.List[string]
+    $deleteWal = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        if ($line -cmatch '^delete_backup=([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$') { $deleteBackups.Add($Matches[1]); continue }
+        if ($line -cmatch '^delete_wal=([0-9A-F]{24})$') { $deleteWal.Add($Matches[1]); continue }
+        if ($line -notmatch '^([^=]+)=(.*)$' -or $scalar.ContainsKey($Matches[1])) { Fail 'Backup prune recovery intent is malformed.' }
+        $scalar[$Matches[1]] = $Matches[2]
+    }
+    $keys = @('format','version','deployment_id','retention','oldest_retained','wal_boundary','created_at')
+    if ($scalar.Count -ne $keys.Count -or @($keys | Where-Object { -not $scalar.ContainsKey($_) }).Count -ne 0 -or
+        $scalar.format -cne 'oscar-backup-prune-intent' -or $scalar.version -cne '1' -or
+        $scalar.deployment_id -cne (Get-EnvValue 'OSCAR_DEPLOYMENT_ID' '') -or
+        $scalar.retention -notmatch '^(?:[1-9][0-9]{0,3}|10000)$' -or
+        -not (Test-BackupId $scalar.oldest_retained) -or $scalar.wal_boundary -notmatch '^[0-9A-F]{24}$' -or
+        $scalar.created_at -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' -or
+        @($deleteBackups | Sort-Object -Unique).Count -ne $deleteBackups.Count -or
+        @($deleteWal | Sort-Object -Unique).Count -ne $deleteWal.Count) {
+        Fail 'Backup prune recovery intent is malformed, foreign, or internally inconsistent.'
+    }
+    return [pscustomobject]@{
+        Path = $intentPath; TagPath = $tagPath; Retention = [int]$scalar.retention
+        OldestRetained = $scalar.oldest_retained; WalBoundary = $scalar.wal_boundary
+        DeleteBackups = @($deleteBackups); DeleteWal = @($deleteWal)
+    }
+}
+
+function Write-PruneIntent([int]$Retention, [string]$OldestRetained, [string]$WalBoundary, [string[]]$DeleteBackups, [string[]]$DeleteWal) {
+    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
+    $tagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
+    if ((Test-Path -LiteralPath $intentPath) -or (Test-Path -LiteralPath $tagPath)) {
+        Fail 'A backup prune recovery intent already exists and must be recovered before starting another prune.'
+    }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @(
+        'format=oscar-backup-prune-intent', 'version=1', "deployment_id=$(Get-EnvValue 'OSCAR_DEPLOYMENT_ID' '')",
+        "retention=$Retention", "oldest_retained=$OldestRetained", "wal_boundary=$WalBoundary",
+        "created_at=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))")) { $lines.Add($line) }
+    foreach ($id in $DeleteBackups) { $lines.Add("delete_backup=$id") }
+    foreach ($name in $DeleteWal) { $lines.Add("delete_wal=$name") }
+    $temporary = Join-Path $BackupDirectory ('.oscar-backup-prune-intent.tmp.' + [Guid]::NewGuid().ToString('N'))
+    $tagTemporary = Join-Path $BackupDirectory ('.oscar-backup-prune-intent.hmac.tmp.' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $bytes = $Utf8NoBom.GetBytes(([string]::Join("`n", $lines) + "`n"))
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Protect-DockerReadableAdministratorFile $temporary
+        Move-DurableNoReplace $temporary $intentPath
+        Sync-DurableMetadata $BackupDirectory
+        $tag = Get-PruneIntentHmac '.oscar-backup-prune-intent' (Get-OscarImage)
+        $tagBytes = $Utf8NoBom.GetBytes("$tag`n")
+        $stream = [IO.FileStream]::new($tagTemporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        try { $stream.Write($tagBytes, 0, $tagBytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Protect-AdministratorFile $tagTemporary
+        Move-DurableNoReplace $tagTemporary $tagPath
+        Sync-DurableMetadata $BackupDirectory
+        [void](Read-PruneIntent)
+    } finally {
+        foreach ($path in @($temporary, $tagTemporary)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Complete-PruneIntent {
+    $intent = Read-PruneIntent
+    $retained = Join-Path $BackupDirectory $intent.OldestRetained
+    if (-not (Test-Path -LiteralPath $retained -PathType Container)) { Fail 'Oldest retained backup named by prune intent is missing; WAL was not touched.' }
+    Confirm-Backup $intent.OldestRetained -ReadOnly
+    if ((Get-AuthenticatedBackupLabelBoundary $retained) -cne $intent.WalBoundary) { Fail 'Authenticated WAL boundary changed after prune intent was written.' }
+    foreach ($id in $intent.DeleteBackups) {
+        $path = Join-Path $BackupDirectory $id
+        $deleting = Join-Path $BackupDirectory ".deleting-$id"
+        if ((Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $deleting)) { Fail "Both live and deleting backup paths exist for intent candidate: $id" }
+        if (Test-Path -LiteralPath $path) { Confirm-Backup $id -ReadOnly }
+    }
+    foreach ($name in $intent.DeleteWal) {
+        $path = Join-Path $WalArchiveDirectory $name
+        $deleting = Join-Path $WalArchiveDirectory ".deleting-$name"
+        if ((Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $deleting)) { Fail "Both live and deleting WAL paths exist for intent candidate: $name" }
+        foreach ($candidate in @($path, $deleting)) {
+            if (Test-Path -LiteralPath $candidate) {
+                $item = Get-Item -LiteralPath $candidate -Force
+                if ($item.PSIsContainer -or $item -isnot [IO.FileInfo] -or
+                    ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    Fail "WAL prune candidate is unsafe: $candidate"
+                }
+            }
+        }
+    }
+    foreach ($id in $intent.DeleteBackups) {
+        $path = Join-Path $BackupDirectory $id
+        $deleting = Join-Path $BackupDirectory ".deleting-$id"
+        if (Test-Path -LiteralPath $path) {
+            Move-DurableNoReplace $path $deleting
+            Sync-DurableMetadata $BackupDirectory
+        }
+        if (Test-Path -LiteralPath $deleting) {
+            Remove-Item -LiteralPath $deleting -Recurse -Force
+            Sync-DurableMetadata $BackupDirectory
+        }
+        Add-DurableLogLine (Join-Path $BackupDirectory 'retention.log') "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) deleted authenticated backup $id"
+    }
+    Confirm-Backup $intent.OldestRetained -ReadOnly
+    if ((Get-AuthenticatedBackupLabelBoundary $retained) -cne $intent.WalBoundary) { Fail 'Oldest retained backup failed revalidation; WAL was not touched.' }
+    foreach ($name in $intent.DeleteWal) {
+        $path = Join-Path $WalArchiveDirectory $name
+        $deleting = Join-Path $WalArchiveDirectory ".deleting-$name"
+        if ((Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $deleting)) { Fail "Both live and deleting WAL paths exist for intent candidate: $name" }
+        if (Test-Path -LiteralPath $path) {
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "WAL prune candidate is unsafe: $path" }
+            Move-DurableNoReplace $path $deleting
+            Sync-DurableMetadata $WalArchiveDirectory
+        }
+        if (Test-Path -LiteralPath $deleting) {
+            $item = Get-Item -LiteralPath $deleting -Force
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "WAL prune recovery candidate is unsafe: $deleting" }
+            Remove-Item -LiteralPath $deleting -Force
+            Sync-DurableMetadata $WalArchiveDirectory
+            Add-DurableLogLine (Join-Path $BackupDirectory 'retention.log') "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) deleted archived WAL $name (oldest retained start WAL=$($intent.WalBoundary))"
+        }
+    }
+    Remove-Item -LiteralPath $intent.TagPath -Force
+    Sync-DurableMetadata $BackupDirectory
+    Remove-Item -LiteralPath $intent.Path -Force
+    Sync-DurableMetadata $BackupDirectory
+}
+
+function Resume-OrDiscardPruneIntent {
+    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
+    $tagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
+    $hasIntent = Test-Path -LiteralPath $intentPath
+    $hasTag = Test-Path -LiteralPath $tagPath
+    if ($hasIntent -and $hasTag) { Complete-PruneIntent; return }
+    if ($hasIntent -or $hasTag) {
+        $orphan = if ($hasIntent) { $intentPath } else { $tagPath }
+        Assert-AdministratorFile $orphan 'Incomplete backup prune publication'
+        Remove-Item -LiteralPath $orphan -Force
+        Sync-DurableMetadata $BackupDirectory
+        Write-Host 'Discarded an incomplete authenticated-prune publication; no backup or WAL payload was deleted.'
+    }
+}
+
+function Remove-ExpiredBackups([int]$RequestedKeep) {
+    Assert-Administrator; Assert-Configured; Assert-BackupKey
+    $retention = $RequestedKeep
+    if ($retention -eq 0) {
+        $configured = Get-EnvValue 'OSCAR_BACKUP_RETENTION_COUNT' '14'
+        if ($configured -notmatch '^(?:[1-9][0-9]{0,3}|10000)$') { Fail 'OSCAR_BACKUP_RETENTION_COUNT must be between 1 and 10000.' }
+        $retention = [int]$configured
+    }
+    Assert-LocalImage (Get-OscarImage)
+    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
+    $intentTagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
+    if ((Test-Path -LiteralPath $intentPath) -or (Test-Path -LiteralPath $intentTagPath)) { Resume-OrDiscardPruneIntent }
+    $verified = @(Get-ChildItem -LiteralPath $BackupDirectory -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            $marker = Join-Path $_.FullName 'VERIFIED'
+            (Test-BackupId $_.Name) -and (Test-Path -LiteralPath $marker -PathType Leaf) -and
+                (((Get-Item -LiteralPath $marker -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+        } |
+        Sort-Object Name -Descending)
+    foreach ($candidate in $verified) { Confirm-Backup $candidate.Name -ReadOnly }
+    if ($verified.Count -eq 0) { Write-Host 'No authenticated, verified backups exist; WAL archive was not pruned.'; return }
+    $deleteBackups = @($verified | Select-Object -Skip $retention | ForEach-Object Name)
+    $retainedCount = [Math]::Min($verified.Count, $retention)
+    $oldestRetained = $verified[$retainedCount - 1]
+    $boundary = Get-AuthenticatedBackupLabelBoundary $oldestRetained.FullName
+    $deleteWal = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(Get-ChildItem -LiteralPath $WalArchiveDirectory -Force -ErrorAction SilentlyContinue)) {
+        if ($item.Name -notmatch '^[0-9A-F]{24}$') { continue }
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "WAL prune candidate is unsafe: $($item.FullName)" }
+        if ([String]::CompareOrdinal($item.Name, $boundary) -lt 0) { $deleteWal.Add($item.Name) }
+    }
+    if ($deleteBackups.Count -eq 0 -and $deleteWal.Count -eq 0) {
+        Write-Host "Backup retention complete; $($verified.Count) authenticated recovery point(s) remain and no WAL was eligible." -ForegroundColor Green
+        return
+    }
+    Write-PruneIntent $retention $oldestRetained.Name $boundary $deleteBackups @($deleteWal)
+    Complete-PruneIntent
+    Write-Host "Backup retention complete; kept $retention newest authenticated recovery point(s). WAL history required by the oldest retained backup was preserved." -ForegroundColor Green
+}
+
+function Get-RestoreLocalEnvironmentKeys {
+    return @(
+        'OSCAR_DEPLOYMENT_ID',
+        'OSCAR_POSTGIS_PLATFORM',
+        'OSCAR_HTTPS_PORT',
+        'OSCAR_HOSTNAME',
+        'OSCAR_SECRETS_DIR',
+        'OSCAR_TLS_DIR',
+        'OSCAR_ARCHIVE_DIR',
+        'OSCAR_WAL_ARCHIVE_DIR',
+        'OSCAR_BACKUP_DIR',
+        'OSCAR_BACKUP_KEY_FILE'
+    )
+}
+
+function Assert-CanonicalCredentialBindings([string]$EnvironmentFile) {
+    if (-not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf) -or
+        ((Get-Item -LiteralPath $EnvironmentFile -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "Deployment environment is not a regular file: $EnvironmentFile"
+    }
+    $lines = [IO.File]::ReadAllLines($EnvironmentFile)
+    $expectedBindings = [ordered]@{
+        OSCAR_SECRETS_DIR = './secrets'
+        OSCAR_TLS_DIR = './tls'
+        OSCAR_BACKUP_KEY_FILE = './secrets/backup-key.txt'
+    }
+    foreach ($entry in $expectedBindings.GetEnumerator()) {
+        $matches = @($lines | Where-Object { $_ -match "^$([Regex]::Escape($entry.Key))=" })
+        $value = if ($matches.Count -eq 1) { $matches[0].Substring($entry.Key.Length + 1) } else { $null }
+        if ($matches.Count -ne 1 -or $value -cne $entry.Value) {
+            Fail "$($entry.Key) must use the canonical supported binding $($entry.Value); no storage data or credentials were changed."
+        }
+    }
+}
+
+function Merge-RestoredEnvironment([string]$Restored, [string]$Target) {
+    foreach ($path in @($Restored, $Target)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Restore environment is not a regular file: $path"
+        }
+    }
+    Assert-CanonicalCredentialBindings $Target
+    $targetLines = [IO.File]::ReadAllLines($Target)
+    $bindings = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($name in @(Get-RestoreLocalEnvironmentKeys)) {
+        $matches = @($targetLines | Where-Object { $_ -match "^$([Regex]::Escape($name))=" })
+        if ($matches.Count -ne 1) { Fail "Target .env must contain exactly one $name binding before restore." }
+        $value = $matches[0].Substring($name.Length + 1)
+        if (-not $value) { Fail "Target .env has an empty $name binding; restore was not installed." }
+        if ($name -in @('OSCAR_ARCHIVE_DIR', 'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR') -and
+            -not [IO.Path]::IsPathRooted($value)) {
+            Fail "Target $name must be an absolute path before restore: $value"
+        }
+        $bindings.Add($name, $matches[0])
+    }
+    $deploymentId = $bindings['OSCAR_DEPLOYMENT_ID'].Substring('OSCAR_DEPLOYMENT_ID='.Length)
+    if (-not (Test-ValidDeploymentId $deploymentId)) {
+        Fail 'Target OSCAR_DEPLOYMENT_ID is invalid; restore was not installed.'
+    }
+    $merged = New-Object 'Collections.Generic.List[string]'
+    $written = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($line in [IO.File]::ReadAllLines($Restored)) {
+        $equals = $line.IndexOf('=')
+        $name = if ($equals -gt 0) { $line.Substring(0, $equals) } else { '' }
+        if ($bindings.ContainsKey($name)) {
+            if ($written.Add($name)) { $merged.Add($bindings[$name]) }
+        } else {
+            $merged.Add($line)
+        }
+    }
+    foreach ($name in @(Get-RestoreLocalEnvironmentKeys)) {
+        if ($written.Add($name)) { $merged.Add($bindings[$name]) }
+    }
+    [IO.File]::WriteAllLines($Restored, $merged, $Utf8NoBom)
+    Assert-CanonicalCredentialBindings $Restored
+}
+
+function Assert-RestoredDeploymentCredentials([string]$Source) {
+    $sourceItem = Get-Item -LiteralPath $Source -Force -ErrorAction Stop
+    if (-not $sourceItem.PSIsContainer -or
+        ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "Restored credential staging directory is invalid: $Source"
+    }
+
+    $environmentFile = Join-Path $Source '.env'
+    $secretDirectory = Join-Path $Source 'secrets'
+    $tlsDirectory = Join-Path $Source 'tls'
+    if (-not (Test-Path -LiteralPath $environmentFile -PathType Leaf) -or
+        ((Get-Item -LiteralPath $environmentFile -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'Restored credentials do not contain a regular .env file.'
+    }
+    foreach ($directory in @($secretDirectory, $tlsDirectory)) {
+        if (-not (Test-Path -LiteralPath $directory -PathType Container) -or
+            ((Get-Item -LiteralPath $directory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Restored credentials do not contain a regular $((Split-Path -Leaf $directory)) directory."
+        }
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -Recurse)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail 'Restored credential trees contain a reparse point.'
+            }
+        }
+    }
+}
+
+function Prepare-RestoredDeploymentCredentials([string]$Source, [string]$Destination) {
+    $destinationItem = Get-Item -LiteralPath $Destination -Force -ErrorAction Stop
+    if (-not $destinationItem.PSIsContainer -or
+        ($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "Deployment directory is invalid: $Destination"
+    }
+    Merge-RestoredEnvironment (Join-Path $Source '.env') (Join-Path $Destination '.env')
+    Assert-RestoredDeploymentCredentials $Source
+}
+
+function Install-PreparedDeploymentCredentials([string]$Source, [string]$Destination) {
+    $destinationItem = Get-Item -LiteralPath $Destination -Force -ErrorAction Stop
+    if (-not $destinationItem.PSIsContainer -or
+        ($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "Deployment directory is invalid: $Destination"
+    }
+    Assert-CanonicalCredentialBindings (Join-Path $Destination '.env')
+    Assert-RestoredDeploymentCredentials $Source
+    Assert-CanonicalCredentialBindings (Join-Path $Source '.env')
+    $environmentFile = Join-Path $Source '.env'
+    $secretDirectory = Join-Path $Source 'secrets'
+    $tlsDirectory = Join-Path $Source 'tls'
+
+    # Stage every validated replacement beside the live paths before deleting
+    # anything. A failed install deliberately leaves this private directory and
+    # the pre-restore safety copy available for operator recovery.
+    $stage = Join-Path $Destination ".credential-install-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $stage | Out-Null
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Protect-PrivateDirectory $stage
+    }
+    $complete = $false
+    try {
+        Move-Item -LiteralPath $environmentFile, $secretDirectory, $tlsDirectory -Destination $stage
+        foreach ($name in @('.env', 'secrets', 'tls')) {
+            $live = Join-Path $Destination $name
+            if (Test-Path -LiteralPath $live) {
+                Remove-Item -LiteralPath $live -Recurse -Force
+            }
+        }
+        Move-Item -LiteralPath (Join-Path $stage '.env'), (Join-Path $stage 'secrets'), (Join-Path $stage 'tls') -Destination $Destination
+        $complete = $true
+    } finally {
+        if ($complete -and (Test-Path -LiteralPath $stage)) {
+            Remove-Item -LiteralPath $stage -Recurse -Force
+        }
+    }
+}
+
+function Clear-RestoreRecoverySettings {
+    foreach ($setting in @('restore_command', 'recovery_target', 'recovery_target_timeline', 'recovery_target_action')) {
+        [void](Invoke-Psql "ALTER SYSTEM RESET $setting;")
+    }
+    [void](Invoke-Psql 'SELECT pg_reload_conf();')
+}
+
+function Assert-RestoreSettingsRemovedFromDataVolume {
+    Invoke-External 'docker' @(
+        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh',
+        '--volume', 'oscar_postgres_data:/data:ro', (Get-PostgresImage), '-eu', '-c',
+        'test ! -e /data/recovery.signal; test ! -e /data/standby.signal; test ! -e /data/postgresql.auto.conf || ! grep -Eq "^[[:space:]]*(restore_command|recovery_target|recovery_target_timeline|recovery_target_action)[[:space:]]*=" /data/postgresql.auto.conf'
+    )
+}
+
+function Confirm-CleanRestoredPostgresRuntime([UInt64]$ExpectedTimeline, [UInt64]$ExpectedFailedCount) {
+    $status = @((Invoke-Psql "SELECT CASE WHEN pg_is_in_recovery() THEN '1' ELSE '0' END||'|'||timeline_id FROM pg_control_checkpoint();") -split '\|')
+    [UInt64]$timeline = 0
+    if ($status.Count -ne 2 -or $status[0] -cne '0' -or
+        -not [UInt64]::TryParse($status[1], [ref]$timeline) -or $timeline -ne $ExpectedTimeline) {
+        Fail "Restored PostgreSQL did not retain its promoted timeline across recovery cleanup (expected=$ExpectedTimeline, status=$($status -join '|'))."
+    }
+
+    $settings = Invoke-Psql "SELECT count(*) FILTER (WHERE (name='restore_command' AND setting='') OR (name='recovery_target' AND setting='') OR (name='recovery_target_timeline' AND setting='latest') OR (name='recovery_target_action' AND setting='pause'))||'|'||CASE WHEN bool_and(NOT pending_restart) THEN '1' ELSE '0' END FROM pg_settings WHERE name IN ('restore_command','recovery_target','recovery_target_timeline','recovery_target_action');"
+    if ($settings -cne '4|1') {
+        Fail "Restored PostgreSQL retained recovery settings after its cleanup restart: $settings"
+    }
+
+    $stats = @((Invoke-Psql "SELECT failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;") -split '\|')
+    [UInt64]$failed = 0
+    if ($stats.Count -ne 2 -or -not [UInt64]::TryParse($stats[0], [ref]$failed) -or
+        $failed -ne $ExpectedFailedCount -or $stats[1] -cne '0') {
+        Fail "PostgreSQL WAL archival health changed during the recovery-settings cleanup restart: $($stats -join '|')"
+    }
+}
+
+function Confirm-RestoredPostgresTimeline(
+    [UInt64]$SourceTimeline,
+    [string]$Root,
+    [string]$Id,
+    [object]$Epoch
+) {
+    $status = Invoke-Psql "SELECT CASE WHEN pg_is_in_recovery() THEN '1' ELSE '0' END||'|'||timeline_id FROM pg_control_checkpoint();"
+    $fields = @($status -split '\|')
+    [UInt64]$currentTimeline = 0
+    if ($fields.Count -ne 2 -or $fields[0] -cne '0' -or
+        -not [UInt64]::TryParse($fields[1], [ref]$currentTimeline) -or $currentTimeline -le $SourceTimeline) {
+        Fail "Restored PostgreSQL did not promote onto a fresh timeline (source=$SourceTimeline, status=$status)."
+    }
+
+    $stats = @((Invoke-Psql "SELECT archived_count||'|'||failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;") -split '\|')
+    [UInt64]$archivedBefore = 0
+    [UInt64]$failedBefore = 0
+    if ($stats.Count -ne 3 -or -not [UInt64]::TryParse($stats[0], [ref]$archivedBefore) -or
+        -not [UInt64]::TryParse($stats[1], [ref]$failedBefore) -or $stats[2] -cne '0') {
+        Fail 'PostgreSQL reported a WAL archival failure during restore promotion.'
+    }
+
+    # Recreate the authenticated VERIFIED row missing from the historical base
+    # backup, then prove that semantic write can be archived on the promoted
+    # timeline without colliding with preserved pre-restore WAL.
+    Set-VerifiedBackupEpochReceipt $Root $Id ([string]$Epoch.backupEpochId) ([string]$Epoch.postgresLsn)
+    $segment = Invoke-Psql 'SELECT pg_walfile_name(pg_switch_wal());'
+    if ($segment -notmatch '^[0-9A-F]{24}$' -or [Convert]::ToUInt64($segment.Substring(0, 8), 16) -ne $currentTimeline) {
+        Fail "Post-restore WAL segment did not use the promoted timeline: $segment"
+    }
+    [void](Invoke-Psql 'CHECKPOINT;')
+    $history = ('{0:X8}.history' -f $currentTimeline)
+    for ($attempt = 1; $attempt -le 30; $attempt++) {
+        $currentStats = @((Invoke-Psql "SELECT archived_count||'|'||failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;") -split '\|')
+        [UInt64]$archivedNow = 0
+        [UInt64]$failedNow = 0
+        if ($currentStats.Count -ne 3 -or -not [UInt64]::TryParse($currentStats[0], [ref]$archivedNow) -or
+            -not [UInt64]::TryParse($currentStats[1], [ref]$failedNow) -or $failedNow -ne $failedBefore -or $currentStats[2] -cne '0') {
+            Fail "PostgreSQL WAL archival failed after restore promotion (segment=$segment)."
+        }
+        $segmentPath = Join-Path $WalArchiveDirectory $segment
+        $historyPath = Join-Path $WalArchiveDirectory $history
+        if ($archivedNow -gt $archivedBefore -and
+            (Test-Path -LiteralPath $segmentPath -PathType Leaf) -and
+            (Test-Path -LiteralPath $historyPath -PathType Leaf) -and
+            ((Get-Item -LiteralPath $segmentPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
+            ((Get-Item -LiteralPath $historyPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+            Clear-RestoreRecoverySettings
+            return [pscustomobject]@{
+                Timeline = $currentTimeline
+                FailedCount = $failedNow
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+    Fail "PostgreSQL did not durably archive the promoted timeline history and test segment ($history, $segment)."
+}
+
+function Restore-Backup([string]$Id, [string]$Confirmation) {
+    Assert-Administrator; Assert-Configured; Assert-BackupKey
+    if (-not (Test-BackupId $Id) -or $Confirmation -cne $Id) { Fail "Restore is destructive. Supply -BackupId ID -Confirm ID with the same valid backup ID." }
+    Assert-DeploymentVolumeOwnership
+    $root = Join-Path $BackupDirectory $Id
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { Fail "Backup does not exist: $root" }
+    Assert-RestoreCompatibility $root
+    Confirm-Backup $Id
+    Assert-RestoreCompatibility $root
+    Assert-DeploymentVolumeOwnership
+    $restoreTemp = Join-Path $ScriptRoot ".restore-secrets-$([Guid]::NewGuid().ToString('N'))"
+    $restoreStage = Join-Path $BackupDirectory ".restore-payload-$Id-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Force -Path $restoreTemp | Out-Null
+    New-Item -ItemType Directory -Path $restoreStage | Out-Null
+    Protect-DockerStorageDirectory $restoreTemp 'ReadWrite'
+    Protect-PrivateDirectory $restoreStage
+    Copy-Item -LiteralPath (Join-Path $root 'postgres') -Destination $restoreStage -Recurse
+    $walMergeStage = Join-Path $restoreStage 'wal-merge'
+    New-Item -ItemType Directory -Path $walMergeStage | Out-Null
+    foreach ($name in @('oscar-state.tar.gz', 'archive.tar.gz', 'wal-archive.tar.gz')) {
+        Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $restoreStage $name)
+    }
+    Protect-DockerStorageDirectory $restoreStage 'ReadOnly'
+    Protect-DockerStorageDirectory $walMergeStage 'ReadWrite'
+    try {
+        $image = "oscar:$RequiredReleaseVersion"
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${root}:/backup:ro", '--volume', "${restoreTemp}:/restore", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -')
+        Prepare-RestoredDeploymentCredentials $restoreTemp $ScriptRoot
+        # Complete the authenticated WAL collision/type preflight and
+        # append-only merge before a safety copy, service stop, or replacement
+        # of any live deployment state. A collision therefore fails with all
+        # replaceable state untouched.
+        Assert-StorageRootIdentities
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', '/usr/local/bin/oscar-merge-wal-restore', '--volume', "${WalArchiveDirectory}:/wal-archive", '--volume', "${walMergeStage}:/wal-merge", '--volume', "$(Join-Path $restoreStage 'wal-archive.tar.gz'):/restore-wal.tar.gz:ro", (Get-PostgresImage), '/restore-wal.tar.gz', '/wal-archive', '/wal-merge')
+        Assert-StorageRootIdentities
+    } catch {
+        Remove-Item -LiteralPath $restoreTemp -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $restoreStage -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    try {
+        $safety = Join-Path $ScriptRoot "pre-restore-$Id"
+        if (Test-Path -LiteralPath $safety) { Fail "Pre-restore safety directory already exists; preserve or move it before retrying: $safety" }
+        New-Item -ItemType Directory -Path $safety | Out-Null
+        Protect-PrivateDirectory $safety
+        Copy-Item -LiteralPath (Join-Path $ScriptRoot '.env'), (Join-Path $ScriptRoot 'secrets'), (Join-Path $ScriptRoot 'tls') -Destination $safety -Recurse -Force
+        Assert-DeploymentVolumeOwnership
+        Invoke-Compose @('stop', 'gateway', 'oscar', 'postgres')
+        $sourceTimelineOutput = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', 'oscar_postgres_data:/data', '--volume', "$(Join-Path $restoreStage 'postgres'):/restore-source:ro", (Get-PostgresImage), '-eu', '-c', 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; cp -a /restore-source/. /data/; exec /usr/local/bin/oscar-prepare-restore /data')
+        $sourceTimelineText = (($sourceTimelineOutput -join '').Trim())
+        [UInt64]$sourceTimeline = 0
+        if (-not [UInt64]::TryParse($sourceTimelineText, [ref]$sourceTimeline) -or $sourceTimeline -eq 0) {
+            Fail 'PostgreSQL restore preparation did not emit the authenticated source timeline.'
+        }
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', '--volume', "$(Join-Path $restoreStage 'oscar-state.tar.gz'):/restore-state.tar.gz:ro", $image, '-eu', '-c', "find /state -mindepth 1 -maxdepth 1 ! -name archive -exec rm -rf -- {} +; tar --no-same-owner -C /state -xzf /restore-state.tar.gz")
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive", '--volume', "$(Join-Path $restoreStage 'archive.tar.gz'):/restore-archive.tar.gz:ro", $image, '-eu', '-c', "find /archive -mindepth 1 -maxdepth 1 ! -name .oscar-storage-root -exec rm -rf -- {} +; tar --no-same-owner -C /archive -xzf /restore-archive.tar.gz")
+        Assert-StorageRootIdentities
+        Install-PreparedDeploymentCredentials $restoreTemp $ScriptRoot
+        Assert-DeploymentVolumeOwnership
+    } finally {
+        Remove-Item -LiteralPath $restoreTemp -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $restoreStage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $restoredPostgresRunning = $false
+    try {
+        Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'postgres')
+        $restoredPostgresRunning = $true
+        $restoreEpoch = Get-Content -LiteralPath (Join-Path $root 'epoch.json') -Raw | ConvertFrom-Json
+        if (-not (Test-Uuid ([string]$restoreEpoch.backupEpochId)) -or
+            ([string]$restoreEpoch.postgresLsn) -notmatch '^[0-9A-F]+/[0-9A-F]+$') {
+            Fail 'Authenticated restore epoch fields are invalid.'
+        }
+        $restoreProof = Confirm-RestoredPostgresTimeline $sourceTimeline $root $Id $restoreEpoch
+        Invoke-Compose @('stop', 'postgres')
+        $restoredPostgresRunning = $false
+        Assert-RestoreSettingsRemovedFromDataVolume
+        Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'postgres')
+        $restoredPostgresRunning = $true
+        Confirm-CleanRestoredPostgresRuntime ([UInt64]$restoreProof.Timeline) ([UInt64]$restoreProof.FailedCount)
+        $restoredPostgresRunning = $false
+        Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'oscar', 'gateway')
+    } catch {
+        if ($restoredPostgresRunning) {
+            try { Invoke-Compose @('stop', 'postgres') } catch { Write-Warning "Could not stop PostgreSQL after restore validation failed: $($_.Exception.Message)" }
+        }
+        throw
+    }
+    Write-Host "Restore complete. Pre-restore credentials were preserved at $safety" -ForegroundColor Green
+}
+
+function Show-ArchiveStatus {
+    Assert-Configured
+    Invoke-Psql "SELECT store_key,id_scope,state,profile,count(*) generations,coalesce(sum(row_count),0) rows,pg_size_pretty(coalesce(sum(o.bytes),0)) bytes FROM oscar_archive_generation g LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.kind='OBSERVATIONS_PARQUET' GROUP BY store_key,id_scope,state,profile ORDER BY store_key,id_scope,state,profile;" -Table
+    Invoke-Psql "SELECT store_key,id_scope,count(*) active_holds FROM oscar_retention_hold WHERE released_at IS NULL GROUP BY store_key,id_scope ORDER BY store_key,id_scope;" -Table
+    Test-ArchiveFilesystemRegistration
+}
+
+function Invoke-RetentionHold([string]$Mode) {
+    Assert-Administrator; Assert-Configured
+    switch ($Mode) {
+        'list' {
+            Invoke-Psql "SELECT id,store_key,id_scope,subject_type,subject_id,reason,created_by,created_at,released_at,released_by FROM oscar_retention_hold ORDER BY (released_at IS NULL) DESC,store_key,id_scope,created_at DESC;" -Table
+        }
+        'create' {
+            $subjectType = $null
+            $subjectId = $null
+            if ($Generation -and -not $Observation) { $subjectType = 'ARCHIVE_GENERATION'; $subjectId = $Generation }
+            if ($Observation -and -not $Generation) { $subjectType = 'OBSERVATION'; $subjectId = $Observation }
+            if (($subjectType -eq 'ARCHIVE_GENERATION' -and -not (Test-Uuid $subjectId)) -or
+                ($subjectType -eq 'OBSERVATION' -and -not (Test-ObservationId $subjectId)) -or -not $subjectType) {
+                Fail 'Specify exactly one valid -Generation UUID or -Observation numeric ID.'
+            }
+            if (-not (Test-StoreKey $StoreKey)) { Fail '-StoreKey must be the archive store/table identifier shown by archive status.' }
+            if (-not (Test-IdScope $IdScope)) { Fail '-IdScope must be a signed 32-bit integer shown by archive status.' }
+            if (-not $Reason -or $Reason -notmatch '^[A-Za-z0-9][A-Za-z0-9\s._,:/@+()=-]{0,255}$') { Fail 'Reason contains unsupported characters or exceeds 256 characters.' }
+            $creator = if ($CreatedBy) { $CreatedBy } else { [Environment]::UserName }
+            if ($creator -notmatch '^[A-Za-z0-9_.@-]{1,128}$') { Fail 'Invalid creator.' }
+            $safeReason = $Reason.Replace("'", "''")
+            $numericSubject = if ($subjectType -eq 'OBSERVATION') { $subjectId } else { '0' }
+            $generationSubject = if ($subjectType -eq 'ARCHIVE_GENERATION') { $subjectId } else { '00000000-0000-4000-8000-000000000000' }
+            $sql = @"
+BEGIN;
+LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE;
+WITH eligible AS (
+    SELECT 1 WHERE
+        ('$subjectType'='ARCHIVE_GENERATION' AND EXISTS (
+            SELECT 1 FROM oscar_archive_generation
+             WHERE id='$generationSubject' AND store_key='$StoreKey' AND id_scope=$IdScope
+               AND state IN ('ACTIVE','SEALED')
+        )) OR
+        ('$subjectType'='OBSERVATION' AND
+            (EXISTS (
+                SELECT 1 FROM "$StoreKey" observation_row
+                 WHERE observation_row.id='$numericSubject'::numeric
+                   AND (observation_row.archivegenerationid IS NULL OR EXISTS (
+                       SELECT 1 FROM oscar_archive_generation owner
+                        WHERE owner.id=observation_row.archivegenerationid
+                          AND owner.store_key='$StoreKey' AND owner.id_scope=$IdScope
+                          AND owner.state IN ('ACTIVE','SEALED')
+                   ))
+            ) OR EXISTS (
+                SELECT 1 FROM oscar_archive_id_block b
+                JOIN oscar_archive_generation g ON g.id=b.generation_id
+                 WHERE '$numericSubject'::numeric BETWEEN b.min_id AND b.max_id
+                   AND g.store_key='$StoreKey' AND g.id_scope=$IdScope
+                   AND g.state IN ('ACTIVE','SEALED')
+            )) AND
+            NOT EXISTS (
+                SELECT 1 FROM oscar_archive_id_block b
+                JOIN oscar_archive_generation g ON g.id=b.generation_id
+                 WHERE '$numericSubject'::numeric BETWEEN b.min_id AND b.max_id
+                   AND g.store_key='$StoreKey' AND g.id_scope=$IdScope
+                   AND g.state IN ('DELETING','PURGED')
+            ) AND NOT EXISTS (
+                SELECT 1 FROM oscar_tombstone
+                 WHERE subject_type='OBSERVATION' AND store_key='$StoreKey' AND id_scope=$IdScope
+                   AND subject_id='$subjectId'
+            ))
+), inserted AS (
+    INSERT INTO oscar_retention_hold(id,store_key,id_scope,subject_type,subject_id,reason,created_by)
+    SELECT gen_random_uuid(),'$StoreKey',$IdScope,'$subjectType','$subjectId','$safeReason','$creator' FROM eligible
+    RETURNING id
+)
+SELECT coalesce((SELECT id::text FROM inserted),'REJECTED');
+COMMIT;
+"@
+            $id = Invoke-Psql $sql
+            if ($id -ceq 'REJECTED') { Fail 'The hold target is unknown, already purged/tombstoned, or currently being deleted.' }
+            if (-not (Test-Uuid $id)) { Fail 'PostgreSQL did not return a valid hold ID.' }
+            Write-Host "Retention hold created: $id (store=$StoreKey, id-scope=$IdScope)" -ForegroundColor Green
+        }
+        'release' {
+            if (-not (Test-Uuid $HoldId)) { Fail 'A valid -HoldId UUID is required.' }
+            $releaser = if ($ReleasedBy) { $ReleasedBy } else { [Environment]::UserName }
+            if ($releaser -notmatch '^[A-Za-z0-9_.@-]{1,128}$') { Fail 'Invalid releaser.' }
+            $changed = Invoke-Psql "BEGIN; LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE; WITH changed AS (UPDATE oscar_retention_hold SET released_at=now(),released_by='$releaser' WHERE id='$HoldId' AND released_at IS NULL RETURNING 1) SELECT count(*) FROM changed; COMMIT;"
+            if ($changed -ne '1') { Fail 'Hold is unknown or already released.' }
+            Write-Host "Retention hold released: $HoldId" -ForegroundColor Green
+        }
+        default { Fail "Unknown archive hold action: $Mode" }
+    }
+}
+
+function Confirm-ArchiveObjects([switch]$RejectPartials) {
+    Assert-Configured
+    $lines = @(Invoke-PsqlLines "SELECT relative_path||E'\\t'||sha256 FROM oscar_archive_object WHERE state='ACTIVE' ORDER BY relative_path;")
+    foreach ($line in $lines) {
+        if (-not $line) { continue }
+        $fields = $line -split "`t", 2
+        if ($fields.Count -ne 2) { Fail "Unsafe catalog row: $line" }
+        $path = Resolve-ConfinedArchivePath $fields[0]
+        $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -cne $fields[1]) { Fail "Archive checksum mismatch: $($fields[0])" }
+    }
+    Test-ArchiveFilesystemRegistration -RejectPartials:$RejectPartials
+    Write-Host 'All cataloged active archive objects passed checksum verification.' -ForegroundColor Green
+}
+
+function New-DeletionPlan([string]$Cutoff, [string]$Requester) {
+    Assert-Administrator; Assert-Configured
+    if (-not (Test-UtcCutoff $Cutoff)) { Fail '-Before must be UTC YYYY-MM-DDTHH:MM:SSZ.' }
+    if (-not (Test-StoreKey $StoreKey)) { Fail '-StoreKey must be the archive store/table identifier shown by archive status.' }
+    if (-not (Test-IdScope $IdScope)) { Fail '-IdScope must be a signed 32-bit integer shown by archive status.' }
+    if (-not $Requester) { $Requester = [Environment]::UserName }
+    if ($Requester -notmatch '^[A-Za-z0-9_.@-]{1,128}$') { Fail 'Invalid requester.' }
+    $id = Invoke-Psql 'SELECT gen_random_uuid();'
+    $tokenBytes = New-Object byte[] 24
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($tokenBytes) } finally { $rng.Dispose() }
+    $confirmationToken = ([BitConverter]::ToString($tokenBytes)).Replace('-', '').ToLowerInvariant()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $tokenHash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($confirmationToken)))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    $sql = @"
+BEGIN;
+WITH candidate AS (
+    SELECT g.id,g.row_count,coalesce(sum(o.bytes),0) bytes,
+           EXISTS (SELECT 1 FROM oscar_retention_hold h
+                    WHERE h.released_at IS NULL AND h.store_key=g.store_key AND h.id_scope=g.id_scope
+                      AND ((h.subject_type='ARCHIVE_GENERATION' AND h.subject_id=g.id::text) OR
+                           (h.subject_type='OBSERVATION' AND h.subject_id~'^[0-9]+$' AND EXISTS (
+                               SELECT 1 FROM oscar_archive_id_block held_block
+                                WHERE held_block.generation_id=g.id
+                                  AND h.subject_id::numeric BETWEEN held_block.min_id AND held_block.max_id)))) held
+      FROM oscar_archive_generation g
+      LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.state='ACTIVE'
+     WHERE g.store_key='$StoreKey' AND g.id_scope=$IdScope
+       AND g.state='SEALED' AND g.window_end<'$Cutoff'::timestamptz
+     GROUP BY g.id,g.store_key,g.id_scope,g.row_count
+), inserted AS (
+    INSERT INTO oscar_deletion_plan(id,store_key,id_scope,subject_type,subject_id,state,estimated_rows,estimated_bytes,hold_count,confirmation_hash,requested_by,expires_at)
+    SELECT '$id','$StoreKey',$IdScope,'ARCHIVE_BEFORE','$Cutoff','PLANNED',
+           coalesce(sum(row_count) FILTER (WHERE NOT held),0),
+           coalesce(sum(bytes) FILTER (WHERE NOT held),0),
+           count(*) FILTER (WHERE held),'$tokenHash','$Requester',now()+interval '24 hours'
+      FROM candidate RETURNING id
+)
+INSERT INTO oscar_deletion_plan_item(plan_id,generation_id)
+SELECT inserted.id,candidate.id FROM inserted CROSS JOIN candidate WHERE NOT candidate.held;
+COMMIT;
+"@
+    Invoke-Psql $sql | Out-Null
+    $summary = Invoke-Psql "SELECT estimated_rows||'|'||estimated_bytes||'|'||hold_count FROM oscar_deletion_plan WHERE id='$id';"
+    $fields = $summary -split '\|'
+    Write-Host "Deletion plan: $id`nStore: $StoreKey`nID scope: $IdScope`nEligible rows: $($fields[0])`nEligible bytes: $($fields[1])`nHeld generations: $($fields[2])"
+    Write-Host "Confirmation token (shown once): $confirmationToken" -ForegroundColor Yellow
+    Write-Host "Review this plan, then run: oscar.bat archive purge -StoreKey $StoreKey -IdScope $IdScope -Plan $id -Token <token>"
+}
+
+function Remove-ArchivePlan([string]$PlanId, [string]$ConfirmationToken) {
+    Assert-Administrator; Assert-Configured
+    if (-not (Test-StoreKey $StoreKey)) { Fail '-StoreKey must be the archive store/table identifier shown by archive status.' }
+    if (-not (Test-IdScope $IdScope)) { Fail '-IdScope must be a signed 32-bit integer shown by archive status.' }
+    if (-not (Test-Uuid $PlanId) -or $ConfirmationToken -notmatch '^[0-9a-f]{48}$') { Fail 'A valid plan ID and confirmation token are required.' }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $tokenHash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($ConfirmationToken)))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    $planState = Invoke-Psql "SELECT subject_id||'|'||state||'|'||confirmation_hash FROM oscar_deletion_plan WHERE id='$PlanId' AND store_key='$StoreKey' AND id_scope=$IdScope AND (state='CONFIRMED' OR expires_at>now());"
+    $planFields = $planState -split '\|'
+    if ($planFields.Count -ne 3 -or $planFields[1] -notin @('PLANNED','CONFIRMED') -or $planFields[2] -cne $tokenHash) { Fail 'Plan is missing, expired, completed, or token does not match.' }
+    $who = [Environment]::UserName
+    if ($who -notmatch '^[A-Za-z0-9_.@-]{1,128}$') { $who = 'administrator' }
+
+    $running = @(Get-ComposeOutput @('ps', '--status', 'running', '--services'))
+    $resumeOscar = $running -contains 'oscar'
+    try {
+        if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
+
+        # Validate every currently active object before changing catalog visibility. The transaction
+        # below rechecks holds under the same lock used by hold creation, then makes each complete
+        # generation non-queryable before any file is removed. OSCAR remains stopped across the
+        # verification/transition/delete sequence, closing the host path-swap window.
+        $preflight = @(Invoke-PsqlLines "SELECT g.id||E'\\t'||o.relative_path||E'\\t'||o.sha256||E'\\t'||o.state FROM oscar_deletion_plan_item i JOIN oscar_deletion_plan p ON p.id=i.plan_id JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope JOIN oscar_archive_object o ON o.generation_id=g.id WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='PLANNED' AND o.state IN ('ACTIVE','DELETING') ORDER BY g.id,o.relative_path;")
+        foreach ($line in $preflight) {
+            if (-not $line) { continue }
+            $fields = $line -split "`t", 4
+            if ($fields.Count -ne 4) { Fail "Unsafe catalog row: $line" }
+            if ($fields[3] -ceq 'ACTIVE') {
+                $null = Invoke-ArchiveObjectHelper 'verify' $fields[1] $fields[2] 'ro'
+            } else {
+                $path = Resolve-ConfinedArchivePath $fields[1] -AllowMissing
+                if (Test-Path -LiteralPath $path) {
+                    $null = Invoke-ArchiveObjectHelper 'verify' $fields[1] $fields[2] 'ro'
+                }
+            }
+        }
+
+        $transitionSql = @"
+BEGIN;
+LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE;
+UPDATE oscar_deletion_plan
+   SET state='CONFIRMED',confirmed_by='$who',confirmed_at=coalesce(confirmed_at,now())
+ WHERE id='$PlanId' AND store_key='$StoreKey' AND id_scope=$IdScope
+   AND state='PLANNED' AND expires_at>now();
+SELECT 1 / CASE WHEN EXISTS (SELECT 1 FROM oscar_deletion_plan WHERE id='$PlanId' AND store_key='$StoreKey' AND id_scope=$IdScope AND state='CONFIRMED') THEN 1 ELSE 0 END;
+UPDATE oscar_deletion_plan_item i
+   SET state='HELD',detail='A retention hold was active at purge time',updated_at=now()
+  FROM oscar_archive_generation g, oscar_deletion_plan p
+ WHERE i.plan_id='$PlanId' AND p.id=i.plan_id AND p.store_key='$StoreKey' AND p.id_scope=$IdScope
+   AND i.generation_id=g.id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+   AND i.state='PLANNED' AND g.state='SEALED'
+   AND EXISTS (SELECT 1 FROM oscar_retention_hold h WHERE h.released_at IS NULL AND
+       h.store_key=g.store_key AND h.id_scope=g.id_scope AND
+       ((h.subject_type='ARCHIVE_GENERATION' AND h.subject_id=g.id::text) OR
+        (h.subject_type='OBSERVATION' AND h.subject_id~'^[0-9]+$' AND EXISTS (
+            SELECT 1 FROM oscar_archive_id_block held_block
+             WHERE held_block.generation_id=g.id
+               AND h.subject_id::numeric BETWEEN held_block.min_id AND held_block.max_id))));
+SELECT 1 / CASE WHEN EXISTS (
+    SELECT 1 FROM oscar_deletion_plan_item i
+    JOIN oscar_deletion_plan p ON p.id=i.plan_id
+    JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+     WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='PLANNED'
+       AND NOT (g.state='SEALED' OR (g.state='DELETING' AND EXISTS (
+           SELECT 1 FROM oscar_deletion_ledger l
+            WHERE l.plan_id='$PlanId' AND l.store_key=p.store_key AND l.id_scope=p.id_scope
+              AND l.subject_type='ARCHIVE_GENERATION'
+              AND l.subject_id=g.id::text AND l.object_path IS NULL AND l.outcome='DELETING'
+       )))
+) THEN 0 ELSE 1 END;
+WITH changed AS (
+    UPDATE oscar_archive_generation g SET state='DELETING'
+      FROM oscar_deletion_plan_item i, oscar_deletion_plan p
+     WHERE i.plan_id='$PlanId' AND p.id=i.plan_id AND p.store_key='$StoreKey' AND p.id_scope=$IdScope
+       AND i.state='PLANNED' AND i.generation_id=g.id
+       AND g.store_key=p.store_key AND g.id_scope=p.id_scope AND g.state='SEALED'
+     RETURNING g.id
+)
+INSERT INTO oscar_deletion_ledger(plan_id,store_key,id_scope,subject_type,subject_id,object_path,outcome,detail)
+SELECT '$PlanId','$StoreKey',$IdScope,'ARCHIVE_GENERATION',id::text,NULL,'DELETING','Generation made non-queryable before filesystem deletion' FROM changed;
+WITH changed AS (
+    UPDATE oscar_archive_object o SET state='DELETING'
+      FROM oscar_deletion_plan_item i
+      JOIN oscar_deletion_plan p ON p.id=i.plan_id
+      JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+     WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope
+       AND i.state='PLANNED' AND o.generation_id=g.id
+       AND g.state='DELETING' AND o.state='ACTIVE'
+     RETURNING o.generation_id,o.relative_path
+)
+INSERT INTO oscar_deletion_ledger(plan_id,store_key,id_scope,subject_type,subject_id,object_path,outcome,detail)
+SELECT '$PlanId','$StoreKey',$IdScope,'ARCHIVE_GENERATION',generation_id::text,relative_path,'DELETING','Checksum verified; deletion intent persisted' FROM changed;
+COMMIT;
+"@
+        Invoke-Psql $transitionSql | Out-Null
+
+        $objects = @(Invoke-PsqlLines "SELECT g.id||E'\\t'||o.relative_path||E'\\t'||o.sha256||E'\\t'||o.state FROM oscar_deletion_plan_item i JOIN oscar_deletion_plan p ON p.id=i.plan_id JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope JOIN oscar_archive_object o ON o.generation_id=g.id WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='PLANNED' AND g.state='DELETING' AND o.state='DELETING' ORDER BY g.id,o.relative_path;")
+        foreach ($line in $objects) {
+            if (-not $line) { continue }
+            $fields = $line -split "`t", 4
+            if ($fields.Count -ne 4) { Fail "Unsafe catalog row: $line" }
+            $deleteOutcome = Invoke-ArchiveObjectHelper 'delete' $fields[1] $fields[2] 'rw'
+            if ($deleteOutcome -notin @('DELETED', 'ALREADY_ABSENT')) {
+                Fail "Archive deletion helper returned an invalid outcome for: $($fields[1])"
+            }
+            Invoke-Psql "WITH changed AS (UPDATE oscar_archive_object SET state='DELETED' WHERE generation_id='$($fields[0])' AND relative_path='$($fields[1])' AND state='DELETING' RETURNING 1) INSERT INTO oscar_deletion_ledger(plan_id,store_key,id_scope,subject_type,subject_id,object_path,outcome) SELECT '$PlanId','$StoreKey',$IdScope,'ARCHIVE_GENERATION','$($fields[0])','$($fields[1])','$deleteOutcome' FROM changed;" | Out-Null
+        }
+        $finalizeSql = @"
+BEGIN;
+UPDATE oscar_deletion_plan_item i SET state='COMPLETED',updated_at=now()
+ FROM oscar_deletion_plan p, oscar_archive_generation g
+ WHERE i.plan_id='$PlanId' AND p.id=i.plan_id AND p.store_key='$StoreKey' AND p.id_scope=$IdScope
+   AND g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+   AND i.state='PLANNED'
+   AND NOT EXISTS (SELECT 1 FROM oscar_archive_object o WHERE o.generation_id=i.generation_id AND o.state<>'DELETED');
+UPDATE oscar_archive_generation g SET state='PURGED'
+ FROM oscar_deletion_plan_item i, oscar_deletion_plan p
+ WHERE i.plan_id='$PlanId' AND p.id=i.plan_id AND p.store_key='$StoreKey' AND p.id_scope=$IdScope
+   AND i.generation_id=g.id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+   AND i.state='COMPLETED' AND g.state='DELETING';
+INSERT INTO oscar_tombstone(store_key,id_scope,subject_type,subject_id,reason,policy,generation_id)
+SELECT p.store_key,p.id_scope,'ARCHIVE_GENERATION',i.generation_id::text,'Cold archive generation deleted through confirmed plan','RETENTION_POLICY',i.generation_id
+  FROM oscar_deletion_plan_item i
+  JOIN oscar_deletion_plan p ON p.id=i.plan_id
+  JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+ WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='COMPLETED'
+ON CONFLICT (subject_type,store_key,id_scope,subject_id) DO NOTHING;
+DELETE FROM oscar_obs_overlay overlay_row
+ USING oscar_deletion_plan_item item, oscar_deletion_plan p, oscar_archive_generation g
+ WHERE item.plan_id='$PlanId' AND p.id=item.plan_id AND p.store_key='$StoreKey' AND p.id_scope=$IdScope
+   AND g.id=item.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+   AND item.state='COMPLETED' AND overlay_row.store_key=p.store_key AND overlay_row.id_scope=p.id_scope
+   AND overlay_row.generation_id=item.generation_id;
+DELETE FROM oscar_tombstone observation_tombstone
+ USING oscar_deletion_plan_item item, oscar_deletion_plan p, oscar_archive_generation g
+ WHERE item.plan_id='$PlanId' AND p.id=item.plan_id AND p.store_key='$StoreKey' AND p.id_scope=$IdScope
+   AND g.id=item.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope
+   AND item.state='COMPLETED' AND observation_tombstone.store_key=p.store_key AND observation_tombstone.id_scope=p.id_scope
+   AND observation_tombstone.subject_type='OBSERVATION'
+   AND observation_tombstone.generation_id=item.generation_id;
+UPDATE oscar_deletion_plan
+   SET state=CASE WHEN EXISTS (SELECT 1 FROM oscar_deletion_plan_item WHERE plan_id='$PlanId' AND state='HELD') THEN 'COMPLETED_WITH_HOLDS' ELSE 'COMPLETED' END
+ WHERE id='$PlanId' AND store_key='$StoreKey' AND id_scope=$IdScope
+   AND NOT EXISTS (SELECT 1 FROM oscar_deletion_plan_item WHERE plan_id='$PlanId' AND state='PLANNED');
+COMMIT;
+"@
+        Invoke-Psql $finalizeSql | Out-Null
+        $finished = Invoke-Psql "SELECT state FROM oscar_deletion_plan WHERE id='$PlanId' AND store_key='$StoreKey' AND id_scope=$IdScope;"
+        if ($finished -notmatch '^COMPLETED(_WITH_HOLDS)?$') { Fail "Deletion stopped with plan $PlanId in state $finished; rerun the same plan and token after correcting the reported problem." }
+    } finally {
+        if ($resumeOscar) {
+            Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'oscar')
+        }
+    }
+    Write-Host "Archive deletion plan $PlanId completed. Minimal catalog and deletion-ledger records were retained." -ForegroundColor Green
+}
+
+function Export-ArchiveGeneration([string]$GenerationId, [string]$Target) {
+    Assert-Configured
+    if (-not (Test-StoreKey $StoreKey)) { Fail '-StoreKey must be the archive store/table identifier shown by archive status.' }
+    if (-not (Test-IdScope $IdScope)) { Fail '-IdScope must be a signed 32-bit integer shown by archive status.' }
+    if (-not (Test-Uuid $GenerationId) -or -not $Target) { Fail 'A valid -Generation and -Destination are required.' }
+    $targetRoot = [IO.Path]::GetFullPath($Target)
+    foreach ($managedRoot in @($ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory, $ScriptRoot)) {
+        if (Test-PathContains $managedRoot $targetRoot) {
+            Fail "Archive export destination must be outside OSCAR managed and release roots: $targetRoot"
+        }
+    }
+    if (Test-Path -LiteralPath $targetRoot) { Fail "Archive export destination already exists: $targetRoot" }
+    $parent = Split-Path -Parent $targetRoot
+    if (-not $parent) { $parent = (Get-Location).Path }
+    $parent = [IO.Path]::GetFullPath($parent)
+    Assert-SafeCreatableDirectoryPath $parent
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    Assert-NoReparseComponents $parent
+    $targetRoot = Join-Path $parent ([IO.Path]::GetFileName($targetRoot))
+    foreach ($managedRoot in @($ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory, $ScriptRoot)) {
+        if (Test-PathContains $managedRoot $targetRoot) {
+            Fail "Archive export destination must be outside OSCAR managed and release roots: $targetRoot"
+        }
+    }
+    $partial = Join-Path $parent ('.' + [IO.Path]::GetFileName($targetRoot) + '.partial-' + [Guid]::NewGuid().ToString('N'))
+    $resumeOscar = $false
+    try {
+        New-Item -ItemType Directory -Path $partial | Out-Null
+        Protect-DockerStorageDirectory $partial 'ReadWrite'
+        Assert-NoReparseComponents $partial
+        $running = @(Get-ComposeOutput @('ps', '--status', 'running', '--services'))
+        $resumeOscar = $running -contains 'oscar'
+        if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
+        $objects = @(Invoke-PsqlLines "SELECT o.relative_path||E'\\t'||o.sha256 FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id WHERE o.generation_id='$GenerationId' AND g.store_key='$StoreKey' AND g.id_scope=$IdScope AND g.state IN ('ACTIVE','SEALED') AND o.state='ACTIVE' AND NOT EXISTS (SELECT 1 FROM oscar_archive_object unsafe WHERE unsafe.generation_id=g.id AND unsafe.state<>'ACTIVE') ORDER BY o.relative_path;")
+        $copied = 0
+        foreach ($line in $objects) {
+            if (-not $line) { continue }
+            $fields = $line -split "`t", 2
+            if ($fields.Count -ne 2) { Fail "Unsafe catalog row: $line" }
+            $null = Invoke-ArchiveObjectHelper 'copy' $fields[0] $fields[1] 'ro' $partial
+            $copied++
+        }
+        if ($copied -eq 0) { Fail "No active objects exist for archive generation $GenerationId" }
+        Protect-PrivateDirectory $partial
+        $catalog = Invoke-Psql "SELECT row_to_json(g) FROM oscar_archive_generation g WHERE id='$GenerationId' AND store_key='$StoreKey' AND id_scope=$IdScope AND state IN ('ACTIVE','SEALED');"
+        $objectCatalog = Invoke-Psql "SELECT coalesce(json_agg(row_to_json(o) ORDER BY relative_path),'[]'::json) FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id WHERE o.generation_id='$GenerationId' AND g.store_key='$StoreKey' AND g.id_scope=$IdScope;"
+        [IO.File]::WriteAllText((Join-Path $partial "catalog-$GenerationId.json"), $catalog + "`n", $Utf8NoBom)
+        [IO.File]::WriteAllText((Join-Path $partial "objects-$GenerationId.json"), $objectCatalog + "`n", $Utf8NoBom)
+        if ($resumeOscar) {
+            Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'oscar')
+            $resumeOscar = $false
+        }
+        [IO.File]::WriteAllLines((Join-Path $partial 'query.sql'), @(
+            '-- OSCAR portable observation archive (DuckDB)',
+            "SELECT * FROM read_parquet('datasets/observations/**/*.parquet', union_by_name=true)",
+            'ORDER BY datastream_id, phenomenon_time, result_time, id_value;'
+        ), $Utf8NoBom)
+        [IO.File]::WriteAllText((Join-Path $partial 'README.md'), @'
+# OSCAR portable archive export
+
+This directory is self-contained. Verify every file with `Get-FileHash -Algorithm SHA256` against `SHA256SUMS` (or an equivalent SHA-256 tool), then query the Parquet data with DuckDB by running `duckdb < query.sql` from this directory.
+
+The generation manifest defines column types, sort order, compression, row count, ID bounds, and the SHA-256 of each primary object. The gzip schema snapshot preserves the OSH datastream schema used to decode `result_json`. Catalog JSON is retained for provenance.
+'@, $Utf8NoBom)
+        Write-Checksums $partial
+        Sync-DurableTree $partial
+        Move-DurableNoReplace $partial $targetRoot
+    } finally {
+        if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Recurse -Force }
+        if ($resumeOscar) {
+            Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'oscar')
+        }
+    }
+    Write-Host "Portable archive generation exported to $targetRoot" -ForegroundColor Green
+}
+
+function Show-Help {
+    @'
+OSCAR storage administration (Administrator PowerShell)
+
+  oscar.bat backup
+  oscar.bat backup-verify -BackupId ID
+  oscar.bat backup-prune [-Keep COUNT]
+  oscar.bat restore -BackupId ID -Confirm ID
+  oscar.bat archive status
+  oscar.bat archive verify
+  oscar.bat archive hold list
+  oscar.bat archive hold create -StoreKey KEY -IdScope INT (-Generation UUID | -Observation ID) -Reason TEXT [-CreatedBy NAME]
+  oscar.bat archive hold release -HoldId UUID [-ReleasedBy NAME]
+  oscar.bat archive dry-run -StoreKey KEY -IdScope INT -Before YYYY-MM-DDTHH:MM:SSZ [-RequestedBy NAME]
+  oscar.bat archive purge -StoreKey KEY -IdScope INT -Plan UUID -Token TOKEN
+  oscar.bat archive export -StoreKey KEY -IdScope INT -Generation UUID -Destination PATH
+
+Restore and archive purge are destructive and require explicit confirmation.
+'@ | Write-Host
+}
+
+try {
+    if ($Command -ne 'help') {
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+            Fail 'The PowerShell OSCAR storage launcher is supported only on Windows; use the Bash launcher on Ubuntu 24.04.'
+        }
+        Assert-Administrator; Assert-Configured; Enter-StorageAdminLock
+    }
+    if ($Command -eq 'backup-verify') {
+        Assert-OfflineBackupDirectory
+    } elseif ($Command -notin @('help', 'prepare-directories')) {
+        Assert-StorageRootsReady
+        Assert-StorageRootIdentities
+        Assert-DeploymentVolumeOwnership
+    }
+    switch ($Command) {
+        'backup' { New-Backup }
+        'backup-verify' { Confirm-Backup $BackupId }
+        'backup-prune' { Remove-ExpiredBackups $Keep }
+        'restore' { Restore-Backup $BackupId $Confirm }
+        'prepare-directories' { Initialize-StorageDirectories -AdoptExisting:$AdoptExistingStorageRoots }
+        'archive' {
+            switch ($Action) {
+                'status' { Show-ArchiveStatus }
+                'verify' { Confirm-ArchiveObjects }
+                'hold' { Invoke-RetentionHold $HoldAction }
+                'dry-run' { New-DeletionPlan $Before $RequestedBy }
+                'purge' { Remove-ArchivePlan $Plan $Token }
+                'export' { Export-ArchiveGeneration $Generation $Destination }
+                default { Fail "Unknown archive action: $Action" }
+            }
+        }
+        default { Show-Help }
+    }
+} catch {
+    Write-Error $_.Exception.Message
+    exit 1
+} finally {
+    Exit-StorageAdminLock
+}

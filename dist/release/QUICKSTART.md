@@ -127,7 +127,10 @@ restore, archive mutation, verification, or export fails immediately with a clea
 wait for the active command rather than bypassing its crash-released, deployment-ID-keyed lock in
 the host's administrator-owned runtime/program-data directory. Live commands also reject missing,
 foreign, swapped, or unsafe archive/WAL/backup identities and mismatched Docker volumes. The sole
-exception is read-only `backup-verify`, which is designed to work with the live deployment offline.
+exception is offline-capable `backup-verify`, which does not depend on a running deployment or its
+live roots. It is an acceptance operation, not a read-only command: it atomically publishes or
+replaces the selected backup's `VERIFIED` marker and normalizes permissions. An optional live
+catalog update occurs only after deployment-volume ownership is proven.
 
 OSCAR 3.9.2's full storage profile is initialized with a new database and standard configuration.
 An upgrade preserves the old `config.json` and PostgreSQL volume, so it does not silently convert a

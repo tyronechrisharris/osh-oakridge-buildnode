@@ -1,0 +1,2606 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+script_path=${BASH_SOURCE[0]}
+repo_root=$(CDPATH= cd -- "${script_path%/*}/.." && pwd -P)
+shell_script="$repo_root/dist/release/oscar-storage.sh"
+powershell_script="$repo_root/dist/release/oscar-storage.ps1"
+setup_shell_script="$repo_root/dist/release/oscar-setup.sh"
+setup_powershell_script="$repo_root/dist/release/oscar-setup.ps1"
+archive_validator="$repo_root/dist/release/validate-storage-archive.sh"
+archive_object_helper="$repo_root/dist/release/docker/oscar/archive-object-helper.sh"
+test_root=$(mktemp -d "$repo_root/.storage-script-test.XXXXXX")
+
+cleanup() {
+    case $test_root in "$repo_root"/.storage-script-test.*) rm -rf -- "$test_root" ;; esac
+}
+trap cleanup EXIT
+
+assert_contains() {
+    local pattern=$1 file=$2
+    grep -Eq -- "$pattern" "$file" || { printf 'Missing required pattern %s in %s\n' "$pattern" "$file" >&2; exit 1; }
+}
+
+assert_not_contains() {
+    local pattern=$1 file=$2
+    if grep -Eq -- "$pattern" "$file"; then
+        printf 'Forbidden pattern %s found in %s\n' "$pattern" "$file" >&2
+        exit 1
+    fi
+}
+
+portable_mode() {
+    local path=$1 raw
+    if stat -c %a "$path" >/dev/null 2>&1; then
+        stat -c %a "$path"
+    else
+        raw=$(stat -f %p "$path")
+        printf '%o\n' "$((8#$raw & 07777))"
+    fi
+}
+
+sha256_path() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+    else shasum --algorithm 256 "$1" | awk '{print $1}'; fi
+}
+
+bash -n "$shell_script"
+bash -n "$setup_shell_script"
+sh -n "$archive_validator"
+sh -n "$archive_object_helper"
+
+# Target-side bundle verification must authenticate the exact inventory on
+# every run. A stale receipt, an extra privileged installer, a duplicate
+# manifest path, or a link/reparse entry must never be accepted.
+bundle_fixture="$test_root/offline-bundle"
+mkdir -p "$bundle_fixture"
+cp "$repo_root/dist/release/verify-bundle.sh" "$repo_root/dist/release/verify-bundle.ps1" "$bundle_fixture/"
+printf 'authenticated payload\n' >"$bundle_fixture/payload.txt"
+write_bundle_manifest() {
+    : >"$bundle_fixture/SHA256SUMS"
+    local relative
+    for relative in payload.txt verify-bundle.ps1 verify-bundle.sh; do
+        printf '%s *%s\n' "$(sha256_path "$bundle_fixture/$relative")" "$relative" >>"$bundle_fixture/SHA256SUMS"
+    done
+}
+write_bundle_manifest
+bash "$bundle_fixture/verify-bundle.sh" >/dev/null
+if command -v pwsh >/dev/null 2>&1; then
+    pwsh -NoLogo -NoProfile -File "$bundle_fixture/verify-bundle.ps1" >/dev/null
+fi
+printf 'corrupted after receipt\n' >"$bundle_fixture/payload.txt"
+if bash "$bundle_fixture/verify-bundle.sh" >/dev/null 2>&1; then
+    printf 'Bash bundle verifier trusted a stale receipt after payload mutation.\n' >&2; exit 1
+fi
+if command -v pwsh >/dev/null 2>&1 && pwsh -NoLogo -NoProfile -File "$bundle_fixture/verify-bundle.ps1" >/dev/null 2>&1; then
+    printf 'PowerShell bundle verifier trusted a stale receipt after payload mutation.\n' >&2; exit 1
+fi
+printf 'authenticated payload\n' >"$bundle_fixture/payload.txt"
+write_bundle_manifest
+printf 'unmanifested installer\n' >"$bundle_fixture/extra.deb"
+if bash "$bundle_fixture/verify-bundle.sh" >/dev/null 2>&1; then
+    printf 'Bash bundle verifier accepted an unmanifested payload.\n' >&2; exit 1
+fi
+if command -v pwsh >/dev/null 2>&1 && pwsh -NoLogo -NoProfile -File "$bundle_fixture/verify-bundle.ps1" >/dev/null 2>&1; then
+    printf 'PowerShell bundle verifier accepted an unmanifested payload.\n' >&2; exit 1
+fi
+rm -f -- "$bundle_fixture/extra.deb"
+cp "$bundle_fixture/SHA256SUMS" "$test_root/offline-manifest-clean"
+head -n 1 "$test_root/offline-manifest-clean" >>"$bundle_fixture/SHA256SUMS"
+if bash "$bundle_fixture/verify-bundle.sh" >/dev/null 2>&1; then
+    printf 'Bash bundle verifier accepted a duplicate manifest member.\n' >&2; exit 1
+fi
+if command -v pwsh >/dev/null 2>&1 && pwsh -NoLogo -NoProfile -File "$bundle_fixture/verify-bundle.ps1" >/dev/null 2>&1; then
+    printf 'PowerShell bundle verifier accepted a duplicate manifest member.\n' >&2; exit 1
+fi
+mv "$test_root/offline-manifest-clean" "$bundle_fixture/SHA256SUMS"
+ln -s payload.txt "$bundle_fixture/.bundle-verified.tmp.attacker"
+if bash "$bundle_fixture/verify-bundle.sh" >/dev/null 2>&1; then
+    printf 'Bash bundle verifier accepted a symlinked receipt temporary.\n' >&2; exit 1
+fi
+if command -v pwsh >/dev/null 2>&1 && pwsh -NoLogo -NoProfile -File "$bundle_fixture/verify-bundle.ps1" >/dev/null 2>&1; then
+    printf 'PowerShell bundle verifier accepted a reparse/symlink receipt temporary.\n' >&2; exit 1
+fi
+rm -f -- "$bundle_fixture/.bundle-verified.tmp.attacker"
+if command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$bundle_fixture/verify-bundle.ps1" >/dev/null
+fi
+
+bash "$repo_root/tools/test-archive-object-helper.sh"
+assert_contains 'LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE' "$shell_script"
+assert_contains "SET state='DELETING'" "$shell_script"
+assert_contains 'docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$shell_script"
+assert_contains '--user 0 --entrypoint pg_verifybackup' "$shell_script"
+assert_contains 'SHA256SUMS\.hmac' "$shell_script"
+assert_contains 'cannot be accepted as an authenticated \$required_release_version recovery point' "$shell_script"
+assert_contains 'required_release_version=\$\(awk .*OSCAR_VERSION' "$shell_script"
+assert_contains 'validate_backup_archive_members' "$shell_script"
+assert_contains '^[[:space:]]+archive_verify reject-partials$' "$shell_script"
+assert_contains 'validate_image_inventory "\$root" true' "$shell_script"
+assert_contains 'acquire_storage_admin_lock' "$shell_script"
+assert_contains 'Darwin\) lock_directory=/private/var/run/oscar-storage' "$shell_script"
+assert_contains 'run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$shell_script"
+assert_contains 'archive_object_helper copy "\$relative" "\$expected_sha" ro "\$partial"' "$shell_script"
+assert_contains 'archive_object_helper delete "\$relative" "\$expected_sha" rw' "$shell_script"
+assert_contains 'compose stop oscar' "$shell_script"
+assert_contains 'compose up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 oscar' "$shell_script"
+assert_contains 'DELETE FROM oscar_obs_overlay' "$shell_script"
+assert_contains "subject_type='OBSERVATION'" "$shell_script"
+assert_contains 'overlay_row\.generation_id=item\.generation_id' "$shell_script"
+assert_contains 'DailyFileBackupConfirmationCli' "$shell_script"
+assert_contains "state IN \('ACTIVE','DELETING'\)" "$shell_script"
+assert_contains '\[\[ -f \$path/VERIFIED && ! -L \$path/VERIFIED \]\]' "$shell_script"
+assert_contains 'validate_storage_directories' "$shell_script"
+assert_contains 'prepare_restored_credentials_exact' "$shell_script"
+assert_contains 'install_prepared_credentials_exact' "$shell_script"
+assert_contains 'INSERT INTO oscar_retention_hold\(id,store_key,id_scope' "$shell_script"
+assert_contains 'INSERT INTO oscar_deletion_plan\(id, store_key, id_scope' "$shell_script"
+assert_contains 'JOIN oscar_deletion_plan p ON p\.id=i\.plan_id' "$shell_script"
+assert_contains 'g\.store_key=p\.store_key AND g\.id_scope=p\.id_scope' "$shell_script"
+assert_contains 'ON CONFLICT \(subject_type,store_key,id_scope,subject_id\)' "$shell_script"
+assert_contains 'archive purge --store-key %s --id-scope %s' "$shell_script"
+assert_not_contains 'h\.subject_id::numeric BETWEEN g\.min_id AND g\.max_id' "$shell_script"
+assert_contains 'assert_deployment_volume_ownership "\$adopt_legacy_volumes"' "$setup_shell_script"
+assert_contains 'require_upgrade_environment_keys' "$setup_shell_script"
+assert_contains 'ensure_fresh_init_volumes' "$setup_shell_script"
+assert_contains 'preserve \.oscar-volume-adoption' "$setup_shell_script"
+assert_contains 'normalize_legacy_backup_key_binding' "$setup_shell_script"
+assert_contains 'require_canonical_credential_bindings' "$setup_shell_script"
+assert_contains 'Initialize-LegacyBackupKeyBinding' "$setup_powershell_script"
+assert_contains 'Assert-UpgradeableEnvironmentBindings' "$setup_powershell_script"
+assert_contains 'Initialize-FreshDeploymentVolumes' "$setup_powershell_script"
+assert_contains 'docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$setup_shell_script"
+assert_contains '--tmpfs /tmp:rw,noexec,nosuid,nodev --user 0:0 --entrypoint sh --volume "\$\{tls_dir\}:/tls:ro"' "$setup_shell_script"
+assert_contains 'case \$output in \*" does match certificate"\)' "$setup_shell_script"
+assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges'.*'--user', '0:0', '--entrypoint', 'sh'.*tlsDirectory.*:/tls:ro" "$setup_powershell_script"
+assert_contains '\$nameCommand = .*does match certificate' "$setup_powershell_script"
+assert_contains 'for attempt in \{1\.\.30\}' "$setup_shell_script"
+assert_contains 'after 30 seconds' "$setup_shell_script"
+assert_contains 'grep -Fq "\\"objClass\\": \\"com\.botts\.impl\.service\.dailyfile\.DailyFileJournalServiceConfig\\""' "$setup_shell_script"
+assert_not_contains "grep -Fq '\"objClass" "$setup_shell_script"
+assert_contains 'for \(\$attempt = 1; \$attempt -le 30; \$attempt\+\+\)' "$setup_powershell_script"
+assert_contains 'after 30 seconds' "$setup_powershell_script"
+
+# A real pre-3.9.2 deployment does not have the backup-key binding. Upgrade may
+# add only that missing canonical binding; custom, duplicate, and current-release
+# omissions remain hard failures under the strict credential-binding validator.
+write_391_env_fixture() {
+    local destination=$1
+    cat >"$destination" <<'EOF'
+OSCAR_VERSION=3.9.1
+OSCAR_POSTGIS_VERSION=16-3.5
+OSCAR_POSTGIS_PLATFORM=linux/amd64
+OSCAR_HTTPS_PORT=443
+OSCAR_HOSTNAME=oscar.local
+OSCAR_SECRETS_DIR=./secrets
+OSCAR_TLS_DIR=./tls
+OSCAR_JAVA_OPTS=-Xms1g -Xmx6g -Xss256k -XX:ReservedCodeCacheSize=512m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError
+EOF
+}
+
+legacy_binding_bash="$test_root/legacy-binding-bash"
+legacy_custom_bash="$test_root/legacy-binding-custom-bash"
+legacy_duplicate_bash="$test_root/legacy-binding-duplicate-bash"
+current_missing_bash="$test_root/current-binding-missing-bash"
+mkdir -p "$legacy_binding_bash" "$legacy_custom_bash" "$legacy_duplicate_bash" "$current_missing_bash"
+write_391_env_fixture "$legacy_binding_bash/.env"
+write_391_env_fixture "$legacy_custom_bash/.env"
+write_391_env_fixture "$legacy_duplicate_bash/.env"
+write_391_env_fixture "$current_missing_bash/.env"
+printf 'OSCAR_BACKUP_KEY_FILE=/source/keys/backup-key.txt\n' >>"$legacy_custom_bash/.env"
+printf 'OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\nOSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\n' >>"$legacy_duplicate_bash/.env"
+sed -i.bak 's/^OSCAR_VERSION=3\.9\.1$/OSCAR_VERSION=3.9.2/' "$current_missing_bash/.env"
+rm -f "$current_missing_bash/.env.bak"
+
+bash -c '
+    setup_script=$1; fixture=$2
+    set -- help
+    source "$setup_script" >/dev/null
+    script_dir=$fixture
+    normalize_legacy_backup_key_binding
+    require_canonical_credential_bindings
+' _ "$setup_shell_script" "$legacy_binding_bash" >/dev/null
+[[ $(grep -Fxc 'OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt' "$legacy_binding_bash/.env") == 1 ]] || {
+    printf 'Bash upgrade did not add exactly one canonical backup-key binding to a 3.9.1 environment.\n' >&2
+    exit 1
+}
+
+for unsafe_fixture in "$legacy_custom_bash" "$legacy_duplicate_bash" "$current_missing_bash"; do
+    if bash -c '
+        setup_script=$1; fixture=$2
+        set -- help
+        source "$setup_script" >/dev/null
+        script_dir=$fixture
+        normalize_legacy_backup_key_binding
+        require_canonical_credential_bindings
+    ' _ "$setup_shell_script" "$unsafe_fixture" >/dev/null 2>&1; then
+        printf 'Bash upgrade accepted an unsafe or non-legacy backup-key binding fixture: %s\n' "$unsafe_fixture" >&2
+        exit 1
+    fi
+done
+[[ $(grep -Fxc 'OSCAR_BACKUP_KEY_FILE=/source/keys/backup-key.txt' "$legacy_custom_bash/.env") == 1 &&
+   $(grep -Fc 'OSCAR_BACKUP_KEY_FILE=' "$legacy_duplicate_bash/.env") == 2 &&
+   $(grep -Fc 'OSCAR_BACKUP_KEY_FILE=' "$current_missing_bash/.env" || true) == 0 ]] || {
+    printf 'Bash legacy normalization overwrote, collapsed, or inserted a forbidden backup-key binding.\n' >&2
+    exit 1
+}
+
+# Exercise the actual normalization order for a real 3.9.1 environment: the
+# preliminary validator accepts absent new-schema keys, explicit adoption adds
+# the deployment identity, storage initialization adds all three roots, and the
+# strict validator then accepts the resulting 3.9.2 schema.
+legacy_upgrade_path_bash="$test_root/legacy-upgrade-path-bash"
+mkdir -p "$legacy_upgrade_path_bash"
+write_391_env_fixture "$legacy_upgrade_path_bash/.env"
+bash -c '
+    setup_script=$1; fixture=$2
+    set -- help
+    source "$setup_script" >/dev/null
+    script_dir=$fixture
+    docker() {
+        if [[ $1 == volume && $2 == inspect && ${3:-} == --format ]]; then
+            case $4 in
+                *CreatedAt*) [[ $5 == oscar_oscar_state ]] && printf "2026-01-01T00:00:00Z" || printf "2026-01-02T00:00:00Z" ;;
+                *) printf "<no value>" ;;
+            esac
+            return 0
+        fi
+        [[ $1 == volume && $2 == inspect ]]
+    }
+    require_upgrade_environment_keys
+    normalize_legacy_backup_key_binding
+    require_canonical_credential_bindings
+    assert_deployment_volume_ownership true
+    configure_storage_paths
+    require_unique_literal_environment_keys
+    set_env_value OSCAR_VERSION 3.9.2
+    require_managed_environment_bindings
+' _ "$setup_shell_script" "$legacy_upgrade_path_bash" >/dev/null
+for binding in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
+    [[ $(grep -c "^${binding}=" "$legacy_upgrade_path_bash/.env") == 1 ]] || {
+        printf 'Bash legacy upgrade did not normalize exactly one %s binding.\n' "$binding" >&2
+        exit 1
+    }
+done
+
+legacy_duplicate_root_bash="$test_root/legacy-duplicate-root-bash"
+mkdir -p "$legacy_duplicate_root_bash"
+write_391_env_fixture "$legacy_duplicate_root_bash/.env"
+printf 'OSCAR_ARCHIVE_DIR=/one\nOSCAR_ARCHIVE_DIR=/two\n' >>"$legacy_duplicate_root_bash/.env"
+if bash -c '
+    setup_script=$1; fixture=$2
+    set -- help
+    source "$setup_script" >/dev/null
+    script_dir=$fixture
+    require_upgrade_environment_keys
+' _ "$setup_shell_script" "$legacy_duplicate_root_bash" >/dev/null 2>&1; then
+    printf 'Bash preliminary upgrade validation accepted duplicate optional storage bindings.\n' >&2
+    exit 1
+fi
+
+# `init --skip-start` must leave exact deployment-labelled named volumes so a
+# later start can pass the same ownership gate without special-case weakening.
+skip_start_bash="$test_root/skip-start-bash"
+mkdir -p "$skip_start_bash/mock-volumes"
+skip_start_deployment=12345678-1234-4234-8234-123456789abc
+printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$skip_start_deployment" >"$skip_start_bash/.env"
+printf 'format=oscar-init-state\nversion=1\ndeployment_id=%s\nstate=INITIALIZING\n' "$skip_start_deployment" >"$skip_start_bash/.oscar-init-state"
+bash -c '
+    setup_script=$1; fixture=$2; deployment=$3
+    set -- help
+    source "$setup_script" >/dev/null
+    script_dir=$fixture
+    docker() {
+        if [[ $1 == volume && $2 == inspect && ${3:-} == --format ]]; then
+            [[ -f $fixture/mock-volumes/$5 ]] || return 1
+            printf "%s" "$deployment"
+            return 0
+        fi
+        if [[ $1 == volume && $2 == inspect ]]; then
+            [[ -f $fixture/mock-volumes/$3 ]]
+            return
+        fi
+        if [[ $1 == volume && $2 == create && $3 == --label && $4 == "com.botts.oscar.deployment-id=$deployment" ]]; then
+            : >"$fixture/mock-volumes/$5"
+            printf "%s\n" "$5"
+            return 0
+        fi
+        return 1
+    }
+    ensure_fresh_init_volumes
+    assert_deployment_volume_ownership false
+    ensure_fresh_init_volumes
+    [[ -f $fixture/mock-volumes/oscar_oscar_state && -f $fixture/mock-volumes/oscar_postgres_data ]]
+' _ "$setup_shell_script" "$skip_start_bash" "$skip_start_deployment" >/dev/null
+
+mkdir -p "$test_root/version-invalid-bash"
+cp "$shell_script" "$test_root/version-invalid-bash/oscar-storage.sh"
+printf 'OSCAR_VERSION=not-a-version\n' >"$test_root/version-invalid-bash/.env.example"
+if bash "$test_root/version-invalid-bash/oscar-storage.sh" help >/dev/null 2>&1; then
+    printf 'Bash storage CLI accepted a malformed packaged release version.\n' >&2
+    exit 1
+fi
+
+# A visible tag and release label are insufficient after a same-tag rebuild.
+# The authenticated backup inventory must bind restore to the exact image ID.
+inventory_fixture="$test_root/image-inventory-retag"
+inventory_version=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }' "$repo_root/dist/release/.env.example")
+mkdir -p "$inventory_fixture"
+cat >"$inventory_fixture/image-inventory.txt" <<EOF
+format=oscar-image-inventory
+version=1
+application_name=oscar:$inventory_version
+application_id=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+application_repo_digests=null
+application_version_label=$inventory_version
+postgres_name=oscar-postgis:$inventory_version
+postgres_id=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+postgres_repo_digests=null
+postgres_version_label=$inventory_version
+postgres_storage_profile_label=$inventory_version
+gateway_name=nginxinc/nginx-unprivileged:1.28.1-alpine
+gateway_id=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+gateway_repo_digests=null
+created_at=2026-10-17T12:00:00Z
+EOF
+if bash -c '
+    storage_script=$1; fixture=$2; version=$3
+    set -- help
+    source "$storage_script" >/dev/null
+    resolve_release_images() { printf "%s\n%s\n%s\n" "oscar:$version" "oscar-postgis:$version" "nginxinc/nginx-unprivileged:1.28.1-alpine"; }
+    image_inspect_value() {
+        case "$1|$2" in
+            "oscar:$version|{{.Id}}") printf "sha256:%064d" 0 | tr 0 b ;;
+            "oscar-postgis:$version|{{.Id}}") printf "sha256:%064d" 0 | tr 0 c ;;
+            "nginxinc/nginx-unprivileged:1.28.1-alpine|{{.Id}}") printf "sha256:%064d" 0 | tr 0 d ;;
+            *"|{{json .RepoDigests}}") printf null ;;
+            *"org.opencontainers.image.version"*) printf "%s" "$version" ;;
+            *"com.botts.oscar.storage-profile"*) printf "%s" "$version" ;;
+            *) return 1 ;;
+        esac
+    }
+    validate_image_inventory "$fixture" false
+    validate_image_inventory "$fixture" true
+' _ "$shell_script" "$inventory_fixture" "$inventory_version" >/dev/null 2>&1; then
+    printf 'Bash restore accepted a same-name image whose immutable ID changed.\n' >&2
+    exit 1
+fi
+
+# docker save/load preserves the content-addressed image ID and labels but may
+# discard registry RepoDigests. Provenance drift must warn, not make an exact
+# offline backup unrestorable.
+portable_inventory_fixture="$test_root/image-inventory-portable"
+mkdir -p "$portable_inventory_fixture"
+cat >"$portable_inventory_fixture/image-inventory.txt" <<EOF
+format=oscar-image-inventory
+version=1
+application_name=oscar:$inventory_version
+application_id=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+application_repo_digests=["oscar@sha256:1111111111111111111111111111111111111111111111111111111111111111"]
+application_version_label=$inventory_version
+postgres_name=oscar-postgis:$inventory_version
+postgres_id=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+postgres_repo_digests=["oscar-postgis@sha256:2222222222222222222222222222222222222222222222222222222222222222"]
+postgres_version_label=$inventory_version
+postgres_storage_profile_label=$inventory_version
+gateway_name=nginxinc/nginx-unprivileged:1.28.1-alpine
+gateway_id=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+gateway_repo_digests=["nginxinc/nginx-unprivileged@sha256:3333333333333333333333333333333333333333333333333333333333333333"]
+created_at=2026-10-17T12:00:00Z
+EOF
+bash -c '
+    storage_script=$1; fixture=$2; version=$3
+    set -- help
+    source "$storage_script" >/dev/null
+    resolve_release_images() { printf "%s\n%s\n%s\n" "oscar:$version" "oscar-postgis:$version" "nginxinc/nginx-unprivileged:1.28.1-alpine"; }
+    image_inspect_value() {
+        case "$1|$2" in
+            "oscar:$version|{{.Id}}") printf "sha256:%064d" 0 | tr 0 a ;;
+            "oscar-postgis:$version|{{.Id}}") printf "sha256:%064d" 0 | tr 0 c ;;
+            "nginxinc/nginx-unprivileged:1.28.1-alpine|{{.Id}}") printf "sha256:%064d" 0 | tr 0 d ;;
+            *"|{{json .RepoDigests}}") printf null ;;
+            *"org.opencontainers.image.version"*) printf "%s" "$version" ;;
+            *"com.botts.oscar.storage-profile"*) printf "%s" "$version" ;;
+            *) return 1 ;;
+        esac
+    }
+    validate_image_inventory "$fixture" true
+' _ "$shell_script" "$portable_inventory_fixture" "$inventory_version" >/dev/null
+
+deployment_id=12345678-1234-4234-8234-123456789abc
+volume_fixture="$test_root/volume-ownership-bash"
+mkdir -p "$volume_fixture"
+printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$volume_fixture/.env"
+
+# Matching labels are accepted.
+bash -c '
+    setup_script=$1; fixture=$2; deployment=$3
+    set -- help
+    source "$setup_script" >/dev/null
+    script_dir=$fixture
+    docker() {
+        if [[ $1 == volume && $2 == inspect && ${3:-} == --format ]]; then
+            case $4 in
+                *CreatedAt*) printf "2026-01-01T00:00:00Z" ;;
+                *) printf "%s" "$deployment" ;;
+            esac
+            return 0
+        fi
+        [[ $1 == volume && $2 == inspect ]]
+    }
+    assert_deployment_volume_ownership false
+' _ "$setup_shell_script" "$volume_fixture" "$deployment_id"
+
+# Missing, mixed, and unacknowledged legacy volumes must all fail closed.
+for volume_case in missing mixed legacy; do
+    if bash -c '
+        setup_script=$1; fixture=$2; deployment=$3; scenario=$4
+        set -- help
+        source "$setup_script" >/dev/null
+        script_dir=$fixture
+        docker() {
+            if [[ $1 == volume && $2 == inspect && ${3:-} != --format ]]; then
+                [[ $scenario != missing || $3 != oscar_postgres_data ]]
+                return
+            fi
+            if [[ $1 == volume && $2 == inspect && ${3:-} == --format ]]; then
+                volume=$5
+                case $4 in
+                    *CreatedAt*) printf "2026-01-01T00:00:00Z" ;;
+                    *)
+                        case $scenario:$volume in
+                            mixed:oscar_postgres_data) printf "87654321-4321-4321-8321-cba987654321" ;;
+                            mixed:*) printf "%s" "$deployment" ;;
+                            legacy:*) printf "<no value>" ;;
+                        esac
+                        ;;
+                esac
+                return 0
+            fi
+            return 1
+        }
+        assert_deployment_volume_ownership false
+    ' _ "$setup_shell_script" "$volume_fixture" "$deployment_id" "$volume_case" >/dev/null 2>&1; then
+        printf 'Bash volume ownership accepted unsafe %s state.\n' "$volume_case" >&2
+        exit 1
+    fi
+done
+
+# Explicit legacy adoption records both immutable creation identities; the
+# receipt works on later runs and fails if either volume identity changes.
+rm -f "$volume_fixture/.oscar-volume-adoption"
+bash -c '
+    setup_script=$1; fixture=$2
+    set -- help
+    source "$setup_script" >/dev/null
+    script_dir=$fixture
+    mock_state_created=2026-01-01T00:00:00Z
+    mock_postgres_created=2026-01-02T00:00:00Z
+    docker() {
+        if [[ $1 == volume && $2 == inspect && ${3:-} != --format ]]; then return 0; fi
+        if [[ $1 == volume && $2 == inspect && ${3:-} == --format ]]; then
+            case $4 in
+                *CreatedAt*) [[ $5 == oscar_oscar_state ]] && printf "%s" "$mock_state_created" || printf "%s" "$mock_postgres_created" ;;
+                *) printf "<no value>" ;;
+            esac
+            return 0
+        fi
+        return 1
+    }
+    assert_deployment_volume_ownership true
+    [[ -f $fixture/.oscar-volume-adoption && ! -L $fixture/.oscar-volume-adoption ]]
+    assert_deployment_volume_ownership false
+    mock_postgres_created=2026-01-03T00:00:00Z
+    if validate_volume_adoption_receipt "$(get_env_value OSCAR_DEPLOYMENT_ID)"; then
+        exit 42
+    fi
+' _ "$setup_shell_script" "$volume_fixture"
+[[ -f $volume_fixture/.oscar-volume-adoption ]] || {
+    printf 'Bash legacy-volume adoption did not create its audit receipt.\n' >&2
+    exit 1
+}
+
+# Storage administration is intentionally destructive. Prove that its path
+# guard rejects a filesystem root, nested managed roots, and symlinked path
+# components before an archive, purge, backup, or restore can be dispatched.
+if bash -c '
+    storage_script=$1
+    set -- help
+    source "$storage_script" >/dev/null
+    validate_storage_path_shape OSCAR_ARCHIVE_DIR /
+' _ "$shell_script" >/dev/null 2>&1; then
+    printf 'Bash accepted the filesystem root as managed storage.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/storage-roots/archive/backups" "$test_root/storage-roots/wal"
+if bash -c '
+    storage_script=$1; fixture=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$fixture/archive
+    backup_dir=$fixture/archive/backups
+    wal_archive_dir=$fixture/wal
+    validate_storage_directories
+' _ "$shell_script" "$test_root/storage-roots" >/dev/null 2>&1; then
+    printf 'Bash accepted overlapping managed storage roots.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/storage-real/archive" "$test_root/storage-real/backups" "$test_root/storage-real/wal"
+ln -s "$test_root/storage-real" "$test_root/storage-link"
+if bash -c '
+    storage_script=$1; fixture=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$fixture/archive
+    backup_dir=$fixture/backups
+    wal_archive_dir=$fixture/wal
+    validate_storage_directories
+' _ "$shell_script" "$test_root/storage-link" >/dev/null 2>&1; then
+    printf 'Bash accepted a symlink component in managed storage roots.\n' >&2
+    exit 1
+fi
+
+# Root identities are deployment- and kind-bound, durably created without
+# replacing an existing name, and explicit adoption is required for nonempty
+# legacy storage. Numeric service groups are mocked because this suite is also
+# run by an unprivileged macOS release builder.
+identity_fixture="$test_root/root-identity-bash"
+identity_release="$identity_fixture/release"
+identity_roots="$identity_fixture/roots"
+mkdir -p "$identity_release" "$identity_roots/archive" "$identity_roots/backups" "$identity_roots/wal"
+printf 'legacy archive payload\n' >"$identity_roots/archive/existing.parquet"
+printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$identity_release/.env"
+bash -c '
+    storage_script=$1; release_root=$2; roots=$3
+    set -- help
+    source "$storage_script" >/dev/null
+    script_dir=$release_root
+    archive_dir=$roots/archive
+    backup_dir=$roots/backups
+    wal_archive_dir=$roots/wal
+    require_admin() { :; }
+    chown() { :; }
+    file_group_id() {
+        case $1 in
+            "$archive_dir") printf 10001 ;;
+            "$backup_dir") printf 0 ;;
+            "$wal_archive_dir") printf 999 ;;
+            *) command stat -f %g "$1" ;;
+        esac
+    }
+    prepare_storage_directories --adopt-existing
+' _ "$shell_script" "$identity_release" "$identity_roots" >/dev/null
+
+[[ $(wc -l <"$identity_roots/archive/.oscar-storage-root" | tr -d '[:space:]') == 8 &&
+   $(grep -Fxc 'format=oscar-storage-root-identity' "$identity_roots/archive/.oscar-storage-root") == 1 &&
+   $(grep -Fxc 'version=1' "$identity_roots/archive/.oscar-storage-root") == 1 &&
+   $(grep -Fxc "deployment_id=$deployment_id" "$identity_roots/archive/.oscar-storage-root") == 1 &&
+   $(grep -Fxc 'root_kind=archive' "$identity_roots/archive/.oscar-storage-root") == 1 &&
+   $(grep -Fxc 'adoption=explicit-existing' "$identity_roots/archive/.oscar-storage-root") == 1 &&
+   $(grep -Fxc 'adoption=new' "$identity_roots/backups/.oscar-storage-root") == 1 ]] || {
+    printf 'Bash storage-root identities do not contain the exact version-1/adoption schema.\n' >&2
+    exit 1
+}
+archive_root_mode=$(portable_mode "$identity_roots/archive")
+wal_root_mode=$(portable_mode "$identity_roots/wal")
+backup_root_mode=$(portable_mode "$identity_roots/backups")
+[[ $archive_root_mode == 1770 && $wal_root_mode == 1770 && $backup_root_mode == 700 ]] || {
+    printf 'Bash storage roots do not have sticky service-writer/private backup modes.\n' >&2
+    exit 1
+}
+
+cp "$identity_roots/archive/.oscar-storage-root" "$identity_fixture/valid-marker"
+sed 's/^root_kind=archive$/root_kind=backup/' "$identity_fixture/valid-marker" >"$identity_roots/archive/.oscar-storage-root"
+if bash -c '
+    storage_script=$1; release_root=$2; archive_root=$3
+    set -- help; source "$storage_script" >/dev/null
+    script_dir=$release_root
+    file_group_id() { printf 10001; }
+    assert_storage_root_identity "$archive_root" archive
+' _ "$shell_script" "$identity_release" "$identity_roots/archive" >/dev/null 2>&1; then
+    printf 'Bash accepted a storage root carrying the wrong root kind.\n' >&2
+    exit 1
+fi
+cp "$identity_fixture/valid-marker" "$identity_roots/archive/.oscar-storage-root"
+sed "s/^deployment_id=.*/deployment_id=87654321-4321-4321-8321-cba987654321/" \
+    "$identity_fixture/valid-marker" >"$identity_roots/archive/.oscar-storage-root"
+if bash -c '
+    storage_script=$1; release_root=$2; archive_root=$3
+    set -- help; source "$storage_script" >/dev/null
+    script_dir=$release_root
+    file_group_id() { printf 10001; }
+    assert_storage_root_identity "$archive_root" archive
+' _ "$shell_script" "$identity_release" "$identity_roots/archive" >/dev/null 2>&1; then
+    printf 'Bash accepted a foreign-deployment storage root.\n' >&2
+    exit 1
+fi
+rm -f "$identity_roots/archive/.oscar-storage-root"
+ln -s "$identity_fixture/valid-marker" "$identity_roots/archive/.oscar-storage-root"
+if bash -c '
+    storage_script=$1; release_root=$2; archive_root=$3
+    set -- help; source "$storage_script" >/dev/null
+    script_dir=$release_root
+    file_group_id() { printf 10001; }
+    assert_storage_root_identity "$archive_root" archive
+' _ "$shell_script" "$identity_release" "$identity_roots/archive" >/dev/null 2>&1; then
+    printf 'Bash accepted a symlinked storage-root identity marker.\n' >&2
+    exit 1
+fi
+
+unclaimed_fixture="$test_root/unclaimed-root-bash"
+mkdir -p "$unclaimed_fixture/release" "$unclaimed_fixture/roots/archive" \
+    "$unclaimed_fixture/roots/backups" "$unclaimed_fixture/roots/wal"
+printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$unclaimed_fixture/release/.env"
+printf 'unclaimed payload\n' >"$unclaimed_fixture/roots/archive/object"
+if bash -c '
+    storage_script=$1; release_root=$2; roots=$3; mutation_log=$4
+    set -- help; source "$storage_script" >/dev/null
+    script_dir=$release_root
+    archive_dir=$roots/archive; backup_dir=$roots/backups; wal_archive_dir=$roots/wal
+    require_admin() { :; }
+    chown() { printf "%s\n" "$*" >>"$mutation_log"; }
+    prepare_storage_directories
+' _ "$shell_script" "$unclaimed_fixture/release" "$unclaimed_fixture/roots" \
+    "$unclaimed_fixture/mutations" >/dev/null 2>&1; then
+    printf 'Bash implicitly adopted a nonempty unclaimed storage root.\n' >&2
+    exit 1
+fi
+[[ ! -e $unclaimed_fixture/mutations ]] || {
+    printf 'Bash changed root ownership before rejecting unclaimed storage.\n' >&2
+    exit 1
+}
+
+repair_fixture="$test_root/interrupted-backup-root-bash"
+mkdir -p "$repair_fixture/release" "$repair_fixture/backups"
+printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$repair_fixture/release/.env"
+cp "$identity_roots/backups/.oscar-storage-root" "$repair_fixture/backups/.oscar-storage-root"
+chmod 0710 "$repair_fixture/backups"
+bash -c '
+    storage_script=$1; release_root=$2; backup_root=$3
+    set -- help; source "$storage_script" >/dev/null
+    script_dir=$release_root
+    mock_group=999
+    file_group_id() { printf "%s" "$mock_group"; }
+    chown() { mock_group=0; }
+    fsync_path() { :; }
+    assert_storage_root_identity "$backup_root" backup
+    [[ $mock_group == 0 && $(file_mode "$backup_root") == 700 ]]
+' _ "$shell_script" "$repair_fixture/release" "$repair_fixture/backups" || {
+    printf 'Bash did not normalize the exact interrupted-backup root permission state.\n' >&2
+    exit 1
+}
+
+# Restored credentials are a replacement set, not an overlay. Exercise the
+# helper directly so stale keys and certificates cannot survive a restore.
+# The source fixture deliberately represents another host: host-local identity,
+# endpoint, platform, and paths must remain target values, while portable
+# source configuration still travels.
+credential_live="$test_root/credential-install-bash"
+credential_restore="$credential_live/restore"
+mkdir -p "$credential_live/secrets" "$credential_live/tls" \
+    "$credential_restore/secrets" "$credential_restore/tls"
+target_deployment_id=12345678-1234-4234-8234-123456789abc
+source_deployment_id=87654321-4321-4321-8321-cba987654321
+cat >"$credential_live/.env" <<EOF
+OSCAR_VERSION=$inventory_version
+OSCAR_DEPLOYMENT_ID=$target_deployment_id
+OSCAR_POSTGIS_PLATFORM=linux/arm64
+OSCAR_HTTPS_PORT=9443
+OSCAR_HOSTNAME=restore-target.example
+OSCAR_SECRETS_DIR=./secrets
+OSCAR_TLS_DIR=./tls
+OSCAR_ARCHIVE_DIR=$test_root/target-storage/archive
+OSCAR_WAL_ARCHIVE_DIR=$test_root/target-storage/wal
+OSCAR_BACKUP_DIR=$test_root/target-storage/backups
+OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt
+OSCAR_BACKUP_RETENTION_COUNT=7
+EOF
+printf 'stale\n' >"$credential_live/secrets/stale.key"
+printf 'stale\n' >"$credential_live/tls/stale.crt"
+cat >"$credential_restore/.env" <<EOF
+OSCAR_VERSION=$inventory_version
+OSCAR_DEPLOYMENT_ID=$source_deployment_id
+OSCAR_POSTGIS_PLATFORM=linux/amd64
+OSCAR_HTTPS_PORT=443
+OSCAR_HOSTNAME=backup-source.example
+OSCAR_SECRETS_DIR=/source/release-secrets
+OSCAR_TLS_DIR=/source/release-tls
+OSCAR_ARCHIVE_DIR=/source/storage/archive
+OSCAR_WAL_ARCHIVE_DIR=/source/storage/wal
+OSCAR_BACKUP_DIR=/source/storage/backups
+OSCAR_BACKUP_KEY_FILE=/source/keys/backup-key.txt
+OSCAR_BACKUP_RETENTION_COUNT=99
+EOF
+printf 'new\n' >"$credential_restore/secrets/current.key"
+printf 'new\n' >"$credential_restore/tls/current.crt"
+bash -c '
+    storage_script=$1; source_dir=$2; destination=$3; deployment=$4
+    set -- help
+    source "$storage_script" >/dev/null
+    prepare_restored_credentials_exact "$source_dir" "$destination"
+    install_prepared_credentials_exact "$source_dir" "$destination"
+    script_dir=$destination
+    docker() {
+        if [[ $1 == volume && $2 == inspect && ${3:-} == --format ]]; then
+            printf "%s" "$deployment"
+            return 0
+        fi
+        [[ $1 == volume && $2 == inspect ]]
+    }
+    assert_deployment_volume_ownership
+' _ "$shell_script" "$credential_restore" "$credential_live" "$target_deployment_id"
+for expected_binding in \
+    "OSCAR_DEPLOYMENT_ID=$target_deployment_id" \
+    'OSCAR_POSTGIS_PLATFORM=linux/arm64' \
+    'OSCAR_HTTPS_PORT=9443' \
+    'OSCAR_HOSTNAME=restore-target.example' \
+    'OSCAR_SECRETS_DIR=./secrets' \
+    'OSCAR_TLS_DIR=./tls' \
+    "OSCAR_ARCHIVE_DIR=$test_root/target-storage/archive" \
+    "OSCAR_WAL_ARCHIVE_DIR=$test_root/target-storage/wal" \
+    "OSCAR_BACKUP_DIR=$test_root/target-storage/backups" \
+    'OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt'; do
+    grep -Fxq "$expected_binding" "$credential_live/.env" || {
+        printf 'Bash cross-host restore did not preserve target binding: %s\n' "$expected_binding" >&2
+        exit 1
+    }
+done
+[[ $(grep -Fxc 'OSCAR_BACKUP_RETENTION_COUNT=99' "$credential_live/.env") == 1 &&
+   -f $credential_live/secrets/current.key && ! -e $credential_live/secrets/stale.key &&
+   -f $credential_live/tls/current.crt && ! -e $credential_live/tls/stale.crt ]] || {
+    printf 'Bash restore did not merge portable configuration or replace credential and TLS trees exactly.\n' >&2
+    exit 1
+}
+
+credential_unsafe_target="$test_root/credential-unsafe-target-bash"
+credential_unsafe_source="$credential_unsafe_target/restore"
+mkdir -p "$credential_unsafe_target/secrets" "$credential_unsafe_target/tls" \
+    "$credential_unsafe_source/secrets" "$credential_unsafe_source/tls"
+grep -v '^OSCAR_BACKUP_DIR=' "$credential_live/.env" >"$credential_unsafe_target/.env"
+cp "$credential_live/.env" "$credential_unsafe_source/.env"
+printf 'must survive\n' >"$credential_unsafe_target/secrets/live-sentinel.key"
+printf 'replacement\n' >"$credential_unsafe_source/secrets/source.key"
+printf 'replacement\n' >"$credential_unsafe_source/tls/source.crt"
+if bash -c '
+    storage_script=$1; source_dir=$2; destination=$3
+    set -- help
+    source "$storage_script" >/dev/null
+    prepare_restored_credentials_exact "$source_dir" "$destination"
+    install_prepared_credentials_exact "$source_dir" "$destination"
+' _ "$shell_script" "$credential_unsafe_source" "$credential_unsafe_target" >/dev/null 2>&1; then
+    printf 'Bash restore accepted a target missing a host-local binding.\n' >&2
+    exit 1
+fi
+[[ -f $credential_unsafe_target/secrets/live-sentinel.key ]] || {
+    printf 'Bash restore changed live credentials before rejecting an unsafe target environment.\n' >&2
+    exit 1
+}
+
+# The complete restore entry point must decrypt, merge, and validate before it
+# can stop services or dispatch any destructive Compose run.
+preflight_backup_id=20261017T130000Z-deadbeef
+preflight_root="$credential_live/preflight-backups/$preflight_backup_id"
+preflight_payload="$test_root/invalid-restored-credentials-bash"
+preflight_compose_marker="$test_root/preflight-compose-bash"
+mkdir -p "$preflight_root" "$preflight_payload/secrets"
+cp "$credential_live/.env" "$preflight_payload/.env"
+printf 'incomplete\n' >"$preflight_payload/secrets/source.key"
+if bash -c '
+    storage_script=$1; destination=$2; backups=$3; backup_id=$4; payload=$5; marker=$6
+    set -- help
+    source "$storage_script" >/dev/null
+    script_dir=$destination
+    backup_dir=$backups
+    backup_key_file=$destination/secrets/backup-key.txt
+    require_admin() { :; }
+    require_configured() { :; }
+    require_backup_key() { :; }
+    assert_deployment_volume_ownership() { :; }
+    require_restore_compatibility() { :; }
+    verify_backup() { :; }
+    compose() { : >"$marker"; }
+    docker() {
+        local argument restore_path
+        for argument in "$@"; do
+            case $argument in
+                *:/restore)
+                    restore_path=${argument%:/restore}
+                    cp "$payload/.env" "$restore_path/.env"
+                    cp -R "$payload/secrets" "$restore_path/secrets"
+                    return 0
+                    ;;
+            esac
+        done
+        return 1
+    }
+    restore_backup --backup "$backup_id" --confirm "$backup_id"
+' _ "$shell_script" "$credential_live" "${preflight_root%/$preflight_backup_id}" \
+    "$preflight_backup_id" "$preflight_payload" "$preflight_compose_marker" >/dev/null 2>&1; then
+    printf 'Bash restore accepted an incomplete staged credential set.\n' >&2
+    exit 1
+fi
+[[ ! -e $preflight_compose_marker && ! -e $credential_live/pre-restore-$preflight_backup_id ]] || {
+    printf 'Bash restore reached a destructive operation before credential preflight completed.\n' >&2
+    exit 1
+}
+
+# A WAL collision must abort before the safety copy, service stop, or any live
+# database/state/archive replacement. The merge helper is append-only, so it is
+# safe to run as the final preflight while the current deployment remains live.
+wal_preflight_id=20261017T131000Z-deadbeef
+wal_preflight_root="$credential_live/wal-preflight-backups/$wal_preflight_id"
+wal_preflight_payload="$test_root/valid-restored-credentials-bash"
+wal_preflight_destructive="$test_root/UNSAFE-WAL-PREFLIGHT-DESTRUCTIVE"
+mkdir -p "$wal_preflight_root/postgres" "$wal_preflight_payload/secrets" "$wal_preflight_payload/tls"
+cp "$credential_live/.env" "$wal_preflight_payload/.env"
+printf 'replacement\n' >"$wal_preflight_payload/secrets/source.key"
+printf 'replacement\n' >"$wal_preflight_payload/tls/source.crt"
+for payload_name in oscar-state.tar.gz archive.tar.gz wal-archive.tar.gz; do
+    printf 'staged %s\n' "$payload_name" >"$wal_preflight_root/$payload_name"
+done
+if bash -c '
+    storage_script=$1; destination=$2; backups=$3; backup_id=$4; payload=$5; destructive=$6
+    set -- help; source "$storage_script" >/dev/null
+    script_dir=$destination; backup_dir=$backups; wal_archive_dir=$destination/wal
+    backup_key_file=$destination/secrets/backup-key.txt
+    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
+    assert_deployment_volume_ownership() { :; }; require_restore_compatibility() { :; }
+    verify_backup() { :; }; assert_storage_root_identities() { :; }
+    postgres_image() { printf "%s" postgres:test; }; chown() { :; }
+    compose() { : >"$destructive"; }
+    docker() {
+        local argument restore_path
+        for argument in "$@"; do
+            case $argument in
+                *:/restore)
+                    restore_path=${argument%:/restore}
+                    cp "$payload/.env" "$restore_path/.env"
+                    cp -R "$payload/secrets" "$payload/tls" "$restore_path/"
+                    return 0
+                    ;;
+            esac
+        done
+        if [[ " $* " == *" /usr/local/bin/oscar-merge-wal-restore "* ]]; then
+            return 73
+        fi
+        : >"$destructive"
+    }
+    restore_backup --backup "$backup_id" --confirm "$backup_id"
+' _ "$shell_script" "$credential_live" "${wal_preflight_root%/$wal_preflight_id}" \
+    "$wal_preflight_id" "$wal_preflight_payload" "$wal_preflight_destructive" >/dev/null 2>&1; then
+    printf 'Bash restore ignored a WAL collision preflight failure.\n' >&2
+    exit 1
+fi
+[[ ! -e $wal_preflight_destructive && ! -e $credential_live/pre-restore-$wal_preflight_id ]] || {
+    printf 'Bash restore mutated replaceable deployment state before WAL collision preflight completed.\n' >&2
+    exit 1
+}
+
+ps_restore_body=$(awk '/^function Restore-Backup\(/,/^function Show-ArchiveStatus/' "$powershell_script")
+ps_merge_line=$(grep -n -m1 'oscar-merge-wal-restore' <<<"$ps_restore_body" | cut -d: -f1)
+ps_safety_line=$(grep -n -m1 'pre-restore-' <<<"$ps_restore_body" | cut -d: -f1)
+ps_stop_line=$(grep -n -m1 "'stop', 'gateway', 'oscar', 'postgres'" <<<"$ps_restore_body" | cut -d: -f1)
+[[ -n $ps_merge_line && -n $ps_safety_line && -n $ps_stop_line &&
+   $ps_merge_line -lt $ps_safety_line && $ps_merge_line -lt $ps_stop_line ]] || {
+    printf 'PowerShell restore does not complete WAL merge preflight before safety copy and service stop.\n' >&2
+    exit 1
+}
+
+credential_invalid="$credential_live/invalid"
+mkdir -p "$credential_invalid/secrets"
+printf 'INVALID=true\n' >"$credential_invalid/.env"
+printf 'must survive\n' >"$credential_live/secrets/live-sentinel.key"
+if bash -c '
+    storage_script=$1; source_dir=$2; destination=$3
+    set -- help
+    source "$storage_script" >/dev/null
+    prepare_restored_credentials_exact "$source_dir" "$destination"
+    install_prepared_credentials_exact "$source_dir" "$destination"
+' _ "$shell_script" "$credential_invalid" "$credential_live" >/dev/null 2>&1; then
+    printf 'Bash restore accepted an incomplete credential replacement set.\n' >&2
+    exit 1
+fi
+[[ -f $credential_live/secrets/live-sentinel.key ]] || {
+    printf 'Bash restore changed live credentials before validating the replacement set.\n' >&2
+    exit 1
+}
+
+mkdir -p "$test_root/tar-good/data" "$test_root/tar-bad-link" "$test_root/tar-bad-fifo"
+printf 'safe payload\n' >"$test_root/tar-good/data/value.txt"
+tar -czf "$test_root/good.tar.gz" -C "$test_root/tar-good" .
+sh "$archive_validator" good "$test_root/good.tar.gz"
+
+ln -s /etc/passwd "$test_root/tar-bad-link/link"
+tar -czf "$test_root/link.tar.gz" -C "$test_root/tar-bad-link" .
+if sh "$archive_validator" malicious-link "$test_root/link.tar.gz" >/dev/null 2>&1; then
+    printf 'Archive validator accepted a symbolic link.\n' >&2
+    exit 1
+fi
+mkfifo "$test_root/tar-bad-fifo/pipe"
+tar -czf "$test_root/fifo.tar.gz" -C "$test_root/tar-bad-fifo" . 2>/dev/null
+if sh "$archive_validator" malicious-fifo "$test_root/fifo.tar.gz" >/dev/null 2>&1; then
+    printf 'Archive validator accepted a FIFO.\n' >&2
+    exit 1
+fi
+if ! tar -czf "$test_root/traversal.tar.gz" -s ',^\./data/value.txt$,../escape,' \
+        -C "$test_root/tar-good" ./data/value.txt 2>/dev/null ||
+        ! tar -tzf "$test_root/traversal.tar.gz" 2>/dev/null | grep -Fxq '../escape'; then
+    command -v python3 >/dev/null 2>&1 || { printf 'Python is required to build the traversal test fixture on this tar implementation.\n' >&2; exit 1; }
+    python3 - "$test_root/traversal.tar.gz" <<'PY'
+import io
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    member = tarfile.TarInfo("../escape")
+    payload = b"unsafe"
+    member.size = len(payload)
+    archive.addfile(member, io.BytesIO(payload))
+PY
+fi
+if sh "$archive_validator" malicious-traversal "$test_root/traversal.tar.gz" >/dev/null 2>&1; then
+    printf 'Archive validator accepted a parent-directory traversal.\n' >&2
+    exit 1
+fi
+
+# Duplicate and aliased names are rejected for every payload label, and state
+# backups can never address the external archive or legacy backup mount paths.
+mkdir -p "$test_root/tar-state-good/data" "$test_root/tar-state-reserved/backups"
+printf 'state\n' >"$test_root/tar-state-good/data/state.bin"
+printf 'recovery media\n' >"$test_root/tar-state-reserved/backups/point.bin"
+tar -czf "$test_root/oscar-state-good.tar.gz" -C "$test_root/tar-state-good" .
+sh "$archive_validator" oscar-state "$test_root/oscar-state-good.tar.gz"
+tar -czf "$test_root/oscar-state-reserved.tar.gz" -C "$test_root/tar-state-reserved" .
+if sh "$archive_validator" oscar-state "$test_root/oscar-state-reserved.tar.gz" >/dev/null 2>&1; then
+    printf 'OSCAR-state validator accepted a reserved backups path.\n' >&2
+    exit 1
+fi
+tar -czf "$test_root/oscar-state-duplicate.tar.gz" -C "$test_root/tar-state-good" \
+    ./data/state.bin ./data/state.bin
+if sh "$archive_validator" oscar-state "$test_root/oscar-state-duplicate.tar.gz" >/dev/null 2>&1; then
+    printf 'OSCAR-state validator accepted duplicate members.\n' >&2
+    exit 1
+fi
+python3 - "$test_root/oscar-state-alias.tar.gz" <<'PY'
+import io
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    for name in ("./data/value", "data/value"):
+        member = tarfile.TarInfo(name)
+        payload = b"alias"
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+PY
+if sh "$archive_validator" oscar-state "$test_root/oscar-state-alias.tar.gz" >/dev/null 2>&1; then
+    printf 'OSCAR-state validator accepted extraction-path aliases.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/tar-cold/datasets/observations/date=2026-10-17/profile=RAW_GATED" "$test_root/tar-wal"
+printf 'parquet\n' >"$test_root/tar-cold/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet"
+printf 'wal\n' >"$test_root/tar-wal/000000010000000000000001"
+tar -czf "$test_root/cold-good.tar.gz" -C "$test_root/tar-cold" .
+tar -czf "$test_root/wal-good.tar.gz" -C "$test_root/tar-wal" .
+sh "$archive_validator" cold-archive "$test_root/cold-good.tar.gz"
+sh "$archive_validator" wal-archive "$test_root/wal-good.tar.gz"
+printf 'unexpected\n' >"$test_root/tar-wal/not-a-wal-segment"
+tar -czf "$test_root/wal-bad-name.tar.gz" -C "$test_root/tar-wal" .
+if sh "$archive_validator" wal-archive "$test_root/wal-bad-name.tar.gz" >/dev/null 2>&1; then
+    printf 'WAL validator accepted a filename outside the PostgreSQL archive grammar.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/marker-archive"
+printf 'must remain host-local\n' >"$test_root/marker-archive/.oscar-storage-root"
+tar -C "$test_root/marker-archive" -czf "$test_root/marker-archive.tar.gz" .
+for archive_label in cold-archive wal-archive; do
+    if sh "$archive_validator" "$archive_label" "$test_root/marker-archive.tar.gz" >/dev/null 2>&1; then
+        printf '%s validator accepted a source storage-root identity marker.\n' "$archive_label" >&2
+        exit 1
+    fi
+done
+
+release_config_files=(
+    .dockerignore .env.example DEPLOYMENT.md QUICKSTART.md compose.yaml
+    docker/gateway/default.conf docker/oscar/archive-object-helper.sh docker/oscar/atomic-publish.c docker/oscar/Dockerfile docker/oscar/entrypoint.sh
+    oscar-setup.ps1 oscar-setup.sh oscar-storage.ps1 oscar-storage.sh oscar.bat oscar.sh
+    postgis/Dockerfile postgis/archive-wal.sh postgis/merge-wal-restore.sh postgis/prepare-restore.sh postgis/init-app-role.sh postgis/init-extensions.sql validate-storage-archive.sh
+)
+tar -C "$repo_root/dist/release" -czf "$test_root/release-config-good.tar.gz" "${release_config_files[@]}"
+sh "$archive_validator" release-config "$test_root/release-config-good.tar.gz"
+
+mkdir -p "$test_root/release-config-fixture/postgis/pgdata"
+for relative in "${release_config_files[@]}"; do
+    parent=${relative%/*}
+    [[ $parent == "$relative" ]] && parent=.
+    mkdir -p "$test_root/release-config-fixture/$parent"
+    cp "$repo_root/dist/release/$relative" "$test_root/release-config-fixture/$relative"
+done
+printf 'must never be archived\n' >"$test_root/release-config-fixture/postgis/pgdata/SENTINEL"
+tar -C "$test_root/release-config-fixture" -czf "$test_root/release-config-pgdata.tar.gz" \
+    "${release_config_files[@]}" postgis/pgdata/SENTINEL
+if sh "$archive_validator" release-config "$test_root/release-config-pgdata.tar.gz" >/dev/null 2>&1; then
+    printf 'Release-config validator accepted a pgdata sentinel.\n' >&2
+    exit 1
+fi
+
+tar -C "$repo_root/dist/release" -czf "$test_root/release-config-duplicate.tar.gz" \
+    "${release_config_files[@]}" compose.yaml
+if sh "$archive_validator" release-config "$test_root/release-config-duplicate.tar.gz" >/dev/null 2>&1; then
+    printf 'Release-config validator accepted a duplicate member.\n' >&2
+    exit 1
+fi
+
+# Exercise the actual nonblocking Bash lock implementation. On Linux the sourced
+# process holds flock directly; on BSD/macOS lockf holds the helper invocation.
+lock_root="$test_root/lock"
+mkdir -p "$lock_root"
+lock_ready="$lock_root/ready"
+lock_helper="$lock_root/helper.sh"
+printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$lock_root/.env"
+printf '%s\n' '#!/bin/sh' ': >"$STORAGE_LOCK_READY"' 'sleep 3' >"$lock_helper"
+chmod 0700 "$lock_helper"
+(
+    OSCAR_STORAGE_TEST_MODE=1 STORAGE_LOCK_READY="$lock_ready" bash -c '
+        storage_script=$1
+        lock_directory=$2
+        helper_script=$3
+        ready_file=$4
+        set -- help
+        source "$storage_script" >/dev/null
+        script_dir=$lock_directory
+        script_path=$helper_script
+        storage_command=backup
+        storage_original_args=(test)
+        OSCAR_STORAGE_LOCK_DIR="$lock_directory/stable-locks" acquire_storage_admin_lock
+        : >"$ready_file"
+        sleep 3
+    ' _ "$shell_script" "$lock_root" "$lock_helper" "$lock_ready"
+) &
+lock_holder=$!
+for _ in {1..50}; do [[ -e $lock_ready ]] && break; sleep 0.1; done
+[[ -e $lock_ready ]] || { printf 'Bash lock holder did not start.\n' >&2; exit 1; }
+if OSCAR_STORAGE_TEST_MODE=1 bash -c '
+    storage_script=$1
+    lock_directory=$2
+    helper_script=$3
+    set -- help
+    source "$storage_script" >/dev/null
+    script_dir=$lock_directory
+    script_path=$helper_script
+    storage_command=backup
+    storage_original_args=(test)
+    OSCAR_STORAGE_LOCK_DIR="$lock_directory/stable-locks" acquire_storage_admin_lock
+' _ "$shell_script" "$lock_root" "$lock_helper" >/dev/null 2>&1; then
+    printf 'Bash storage lock allowed a concurrent command.\n' >&2
+    exit 1
+fi
+
+# Journal confirmation is a separately HMAC-authenticated post-verification
+# audit sidecar. It is excluded from the immutable core manifest; corruption
+# warns but cannot invalidate or manufacture authenticated core acceptance.
+acceptance_id=20261017T120000Z-1234abcd
+release_version=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }' "$repo_root/dist/release/.env.example")
+acceptance_root="$test_root/acceptance/backups/$acceptance_id"
+mkdir -p "$acceptance_root"
+printf 'authenticated OSCAR state fixture\n' >"$acceptance_root/oscar-state.tar.gz"
+for recovery_payload in archive.tar.gz deployment-secrets.tar.gz.enc image-inventory.txt release-config.tar.gz wal-archive.tar.gz; do
+    printf 'authenticated %s fixture\n' "$recovery_payload" >"$acceptance_root/$recovery_payload"
+done
+printf '%s\n' \
+    11111111-1111-4111-8111-111111111111 \
+    22222222-2222-4222-8222-222222222222 >"$acceptance_root/archive-generation-ids.txt"
+acceptance_sha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$acceptance_root/oscar-state.tar.gz" | awk '{print $1}'; else shasum --algorithm 256 "$acceptance_root/oscar-state.tar.gz" | awk '{print $1}'; fi)
+acceptance_tag=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+printf '%s\n' \
+    'format=oscar-journal-backup-confirmation' \
+    'version=2' \
+    "backup_id=$acceptance_id" \
+    "oscar_state_sha256=$acceptance_sha" \
+    "hmac_sha256=$acceptance_tag" >"$acceptance_root/JOURNAL_CONFIRMED"
+printf '%s\n' \
+    '{' \
+    '  "format": "oscar-backup-epoch",' \
+    '  "version": 1,' \
+    '  "backupEpochId": "12345678-1234-4123-8123-123456789abc",' \
+    '  "backupId": "20261017T120000Z-1234abcd",' \
+    '  "createdAt": "2026-10-17T12:00:00Z",' \
+    "  \"oscarVersion\": \"$release_version\"," \
+    '  "postgresLsn": "0/12345678",' \
+    '  "archiveRoot": "/var/lib/oscar/archive",' \
+    '  "secrets": "test fixture",' \
+    '  "state": "CREATED"' \
+    '}' >"$acceptance_root/epoch.json"
+(
+    cd "$acceptance_root"
+    find . -type f ! -name JOURNAL_CONFIRMED ! -name SHA256SUMS ! -name SHA256SUMS.hmac -print0 | sort -z |
+        while IFS= read -r -d '' recovery_file; do
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$recovery_file"; else shasum --algorithm 256 "$recovery_file"; fi
+        done >SHA256SUMS
+)
+printf 'authenticated-for-test\n' >"$acceptance_root/SHA256SUMS.hmac"
+printf 'test key\n' >"$test_root/acceptance/backup-key.txt"
+printf 'corrupt receipt\n' >"$acceptance_root/JOURNAL_CONFIRMED"
+bash -c '
+    storage_script=$1
+    fixture_root=$2
+    fixture_key=$3
+    backup_id=$4
+    set -- help
+    source "$storage_script" >/dev/null
+    backup_dir=$fixture_root
+    backup_key_file=$fixture_key
+    require_admin() { :; }
+    require_configured() { :; }
+    require_backup_key() { :; }
+    oscar_image() { printf "%s" oscar:test; }
+    postgres_image() { printf "%s" postgres:test; }
+    require_local_image() { :; }
+    verify_checksum_hmac() { :; }
+    docker() { :; }
+    compose() { :; }
+    validate_release_config_archive() { :; }
+    validate_backup_archive_members() { :; }
+    validate_image_inventory() { :; }
+    calculate_journal_confirmation_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
+    psql_admin() { :; }
+    verify_backup "$backup_id"
+' _ "$shell_script" "$test_root/acceptance/backups" "$test_root/acceptance/backup-key.txt" "$acceptance_id" >/dev/null 2>&1
+[[ -f $acceptance_root/VERIFIED && ! -L $acceptance_root/VERIFIED ]] || {
+    printf 'Bash audit-sidecar corruption incorrectly blocked authenticated core recovery acceptance.\n' >&2
+    exit 1
+}
+rm -f -- "$acceptance_root/VERIFIED"
+printf '%s\n' \
+    'format=oscar-journal-backup-confirmation' \
+    'version=2' \
+    "backup_id=$acceptance_id" \
+    "oscar_state_sha256=$acceptance_sha" \
+    "hmac_sha256=$acceptance_tag" >"$acceptance_root/JOURNAL_CONFIRMED"
+bash -c '
+    storage_script=$1; fixture_root=$2; fixture_key=$3; backup_id=$4
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root; backup_key_file=$fixture_key
+    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
+    oscar_image() { printf "%s" oscar:test; }; postgres_image() { printf "%s" postgres:test; }
+    require_local_image() { :; }; verify_checksum_hmac() { :; }; docker() { :; }; compose() { :; }
+    validate_release_config_archive() { :; }; validate_backup_archive_members() { :; }; validate_image_inventory() { :; }
+    calculate_journal_confirmation_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
+    verify_backup "$backup_id"
+' _ "$shell_script" "$test_root/acceptance/backups" "$test_root/acceptance/backup-key.txt" "$acceptance_id" >/dev/null
+[[ -f $acceptance_root/VERIFIED && ! -L $acceptance_root/VERIFIED ]] || {
+    printf 'Bash authenticated core with a valid journal audit sidecar did not produce VERIFIED.\n' >&2
+    exit 1
+}
+rm -f -- "$acceptance_root/VERIFIED"
+bash -c '
+    storage_script=$1; fixture_root=$2; fixture_key=$3; backup_id=$4
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root; backup_key_file=$fixture_key
+    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
+    oscar_image() { printf "%s" oscar:test; }; postgres_image() { printf "%s" postgres:test; }
+    require_local_image() { :; }; verify_checksum_hmac() { :; }; docker() { :; }
+    validate_release_config_archive() { :; }; validate_backup_archive_members() { :; }; validate_image_inventory() { :; }
+    calculate_journal_confirmation_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
+    write_verified_marker() { : >"$fixture_root/UNSAFE-VERIFIED"; }
+    upsert_verified_backup_epoch() { : >"$fixture_root/UNSAFE-CATALOG"; }
+    verify_backup "$backup_id" read-only
+' _ "$shell_script" "$test_root/acceptance/backups" "$test_root/acceptance/backup-key.txt" "$acceptance_id" >/dev/null
+[[ ! -e $test_root/acceptance/backups/UNSAFE-VERIFIED && ! -e $test_root/acceptance/backups/UNSAFE-CATALOG ]] || {
+    printf 'Bash read-only verification mutated acceptance state.\n' >&2
+    exit 1
+}
+
+# The authenticated generation set is canonical, bounded, and independent of
+# later live-catalog drift. Reject aliases/order changes before constructing SQL.
+generation_inventory_fixture="$test_root/generation-inventory-bash"
+mkdir -p "$generation_inventory_fixture"
+cp "$acceptance_root/archive-generation-ids.txt" "$generation_inventory_fixture/archive-generation-ids.txt"
+bash -c '
+    storage_script=$1; root=$2
+    set -- help; source "$storage_script" >/dev/null
+    expected="'"'"'{11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222}'"'"'::uuid[]"
+    [[ $(archive_generation_ids_sql "$root") == "$expected" ]]
+' _ "$shell_script" "$generation_inventory_fixture"
+for invalid_inventory in duplicate unsorted uppercase unterminated; do
+    case $invalid_inventory in
+        duplicate)
+            printf '%s\n%s\n' 11111111-1111-4111-8111-111111111111 11111111-1111-4111-8111-111111111111 \
+                >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
+        unsorted)
+            printf '%s\n%s\n' 22222222-2222-4222-8222-222222222222 11111111-1111-4111-8111-111111111111 \
+                >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
+        uppercase)
+            printf '%s\n' AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
+        unterminated)
+            printf '%s' 11111111-1111-4111-8111-111111111111 >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
+    esac
+    if bash -c '
+        storage_script=$1; root=$2
+        set -- help; source "$storage_script" >/dev/null
+        validate_archive_generation_inventory "$root"
+    ' _ "$shell_script" "$generation_inventory_fixture" >/dev/null 2>&1; then
+        printf 'Bash accepted a noncanonical %s archive-generation inventory.\n' "$invalid_inventory" >&2
+        exit 1
+    fi
+done
+cp "$acceptance_root/archive-generation-ids.txt" "$generation_inventory_fixture/archive-generation-ids.txt"
+
+# No failure before immutable-core acceptance may reach the live daily-journal
+# confirmation bridge. This explicitly injects a full-verifier failure into the
+# creation completion phase and requires zero confirmation side effects.
+if bash -c '
+    storage_script=$1; marker=$2
+    set -- help; source "$storage_script" >/dev/null
+    verify_backup() { fail "injected immutable-core verification failure"; }
+    confirm_daily_journal_backup() { : >"$marker"; }
+    write_journal_confirmation_receipt() { : >"$marker.receipt"; }
+    accept_and_confirm_created_backup 20261017T120000Z-1234abcd /unused oscar:test aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+' _ "$shell_script" "$test_root/UNSAFE-LIVE-JOURNAL-CONFIRMATION" >/dev/null 2>&1; then
+    printf 'Bash backup acceptance ignored an injected core-verification failure.\n' >&2
+    exit 1
+fi
+[[ ! -e $test_root/UNSAFE-LIVE-JOURNAL-CONFIRMATION &&
+   ! -e $test_root/UNSAFE-LIVE-JOURNAL-CONFIRMATION.receipt ]] || {
+    printf 'Bash backup confirmed live journal retention before core VERIFIED acceptance.\n' >&2
+    exit 1
+}
+bash -c '
+    storage_script=$1; root=$2; backup_id=$3; capture=$4
+    set -- help; source "$storage_script" >/dev/null
+    mock_receipt=12345678-1234-4123-8123-123456789abc\|VERIFIED
+    assert_deployment_volume_ownership() { :; }
+    psql_admin() { sql=$(cat); printf "%s\n" "$sql" >"$capture"; printf "%s\n" "$mock_receipt"; }
+    upsert_verified_backup_epoch "$root" "$backup_id" 12345678-1234-4123-8123-123456789abc 0/12345678
+    mock_receipt=
+    if (upsert_verified_backup_epoch "$root" "$backup_id" 12345678-1234-4123-8123-123456789abc 0/12345678); then
+        printf "foreign epoch collision was accepted\n" >&2; exit 1
+    fi
+' _ "$shell_script" "$acceptance_root" "$acceptance_id" "$test_root/acceptance/catalog-sql" >/dev/null 2>&1
+grep -Fq "oscar_backup_epoch.state IN ('CREATED','VERIFIED')" "$test_root/acceptance/catalog-sql" &&
+grep -Fq 'postgres_lsn IS NOT DISTINCT FROM EXCLUDED.postgres_lsn' "$test_root/acceptance/catalog-sql" &&
+grep -Fq 'archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids' "$test_root/acceptance/catalog-sql" &&
+grep -Fq "'{11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222}'::uuid[]" "$test_root/acceptance/catalog-sql" &&
+! grep -Fq 'FROM oscar_archive_generation' "$test_root/acceptance/catalog-sql" &&
+grep -Fq 'sha256 IS NOT DISTINCT FROM EXCLUDED.sha256' "$test_root/acceptance/catalog-sql" || {
+    printf 'Bash VERIFIED epoch upsert is not bound to the authenticated backup-time generation set.\n' >&2
+    exit 1
+}
+
+# Offline verification remains valid, but discovery of a running foreign
+# fixed-name project must fail before either acceptance marker or catalog write.
+rm -f -- "$acceptance_root/VERIFIED" "$test_root/acceptance/UNSAFE-FOREIGN-VERIFIED" \
+    "$test_root/acceptance/UNSAFE-FOREIGN-CATALOG" "$test_root/acceptance/FOREIGN-GUARD-RAN"
+if bash -c '
+    storage_script=$1; fixture_root=$2; fixture_key=$3; backup_id=$4; markers=$5
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root; backup_key_file=$fixture_key
+    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
+    oscar_image() { printf "%s" oscar:test; }; postgres_image() { printf "%s" postgres:test; }
+    require_local_image() { :; }; verify_checksum_hmac() { :; }; docker() { :; }
+    validate_release_config_archive() { :; }; validate_backup_archive_members() { :; }; validate_image_inventory() { :; }
+    calculate_journal_confirmation_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
+    compose() { [[ " $* " == *" ps --status running --services "* ]] && printf "postgres\n"; }
+    assert_deployment_volume_ownership() { : >"$markers/FOREIGN-GUARD-RAN"; fail "foreign deployment"; }
+    write_verified_marker() { : >"$markers/UNSAFE-FOREIGN-VERIFIED"; }
+    upsert_verified_backup_epoch() { : >"$markers/UNSAFE-FOREIGN-CATALOG"; }
+    verify_backup "$backup_id"
+' _ "$shell_script" "$test_root/acceptance/backups" "$test_root/acceptance/backup-key.txt" "$acceptance_id" "$test_root/acceptance" >/dev/null 2>&1; then
+    printf 'Bash backup verification accepted a running foreign deployment.\n' >&2
+    exit 1
+fi
+[[ -e $test_root/acceptance/FOREIGN-GUARD-RAN &&
+   ! -e $test_root/acceptance/UNSAFE-FOREIGN-VERIFIED &&
+   ! -e $test_root/acceptance/UNSAFE-FOREIGN-CATALOG ]] || {
+    printf 'Bash foreign-volume guard ran after acceptance/catalog mutation.\n' >&2
+    exit 1
+}
+
+# A malicious state tar rejected by the scoped validator must never reach the
+# extraction container used by the daily-journal bridge.
+if bash -c '
+    storage_script=$1; fixture_root=$2; backup_id=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root; script_dir=$fixture_root
+    mkdir -p "$fixture_root/$backup_id"
+    : >"$fixture_root/$backup_id/oscar-state.tar.gz"
+    chown() { :; }; chmod() { :; }; compose() { :; }
+    docker() {
+        if [[ " $* " == *" /validate-storage-archive.sh oscar-state "* ]]; then return 42; fi
+        : >"$fixture_root/UNSAFE-EXTRACTION"
+    }
+    confirm_daily_journal_backup "$backup_id" "$fixture_root/$backup_id" oscar:test aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+' _ "$shell_script" "$test_root/journal-prevalidation-bash" "$acceptance_id" >/dev/null 2>&1; then
+    printf 'Bash journal bridge ignored scoped archive validation failure.\n' >&2
+    exit 1
+fi
+[[ ! -e $test_root/journal-prevalidation-bash/UNSAFE-EXTRACTION ]] || {
+    printf 'Bash journal bridge extracted before archive validation.\n' >&2
+    exit 1
+}
+
+journal_isolation_root="$test_root/journal-isolation-bash"
+journal_isolation_capture="$journal_isolation_root/java.args"
+mkdir -p "$journal_isolation_root/$acceptance_id"
+: >"$journal_isolation_root/$acceptance_id/oscar-state.tar.gz"
+bash -c '
+    storage_script=$1; fixture_root=$2; backup_id=$3; capture=$4
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root; script_dir=$fixture_root
+    chown() { :; }; chmod() { :; }
+    compose() {
+        [[ ${1:-} != run ]] || { : >"$fixture_root/UNSAFE-COMPOSE-RUN"; return 1; }
+        return 0
+    }
+    docker() {
+        if [[ " $* " == *" --entrypoint java "* ]]; then printf "%s\n" "$*" >"$capture"; fi
+        return 0
+    }
+    confirm_daily_journal_backup "$backup_id" "$fixture_root/$backup_id" oscar:test aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+' _ "$shell_script" "$journal_isolation_root" "$acceptance_id" "$journal_isolation_capture"
+[[ -s $journal_isolation_capture && ! -e $journal_isolation_root/UNSAFE-COMPOSE-RUN ]] &&
+grep -Fq -- '--network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$journal_isolation_capture" &&
+grep -Fq -- '--tmpfs /tmp:rw,noexec,nosuid,nodev --user 10001:10001 --entrypoint java' "$journal_isolation_capture" &&
+grep -Fq -- '--volume oscar_oscar_state:/var/lib/oscar' "$journal_isolation_capture" || {
+    printf 'Bash journal confirmation is not confined to the state volume and offline hardened container.\n' >&2
+    exit 1
+}
+wait "$lock_holder"
+
+# Both retention-hold selector forms must survive Bash's AND/OR precedence.
+bash -c '
+    storage_script=$1; set -- help; source "$storage_script" >/dev/null
+    require_admin() { :; }; require_configured() { :; }
+    psql_admin() { printf "%s\n" 87654321-4321-4234-8234-cba987654321; }
+    archive_hold create --store-key observations --id-scope 1 \
+        --generation 12345678-1234-4234-8234-123456789abc --reason test --created-by tester
+    archive_hold create --store-key observations --id-scope 1 \
+        --observation 42 --reason test --created-by tester
+' _ "$shell_script" >/dev/null
+
+# Retention decisions are based on fully reverified usable recovery points. A
+# single corrupt candidate must prevent intent creation and every deletion.
+prune_fixture="$test_root/prune-preflight-bash"
+mkdir -p "$prune_fixture/backups" "$prune_fixture/wal"
+for backup_id in 20261017T130000Z-11111111 20261017T140000Z-22222222 20261017T150000Z-33333333; do
+    mkdir -p "$prune_fixture/backups/$backup_id"
+    printf 'verified\n' >"$prune_fixture/backups/$backup_id/VERIFIED"
+done
+if bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture/backups; wal_archive_dir=$fixture/wal
+    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
+    oscar_image() { printf oscar:test; }; require_local_image() { :; }
+    verify_backup() {
+        printf "%s\n" "$1" >>"$fixture/verified-before-failure"
+        [[ $1 != 20261017T140000Z-22222222 ]] || return 42
+    }
+    authenticated_backup_label_boundary() { printf 000000010000000000000010; }
+    write_prune_intent() { : >"$fixture/UNSAFE-INTENT"; }
+    finish_prune_intent() { : >"$fixture/UNSAFE-DELETE"; }
+    prune_backups --keep 2
+' _ "$shell_script" "$prune_fixture" >/dev/null 2>&1; then
+    printf 'Bash backup prune ignored a corrupt verified candidate.\n' >&2
+    exit 1
+fi
+[[ ! -e $prune_fixture/UNSAFE-INTENT && ! -e $prune_fixture/UNSAFE-DELETE &&
+   $(find "$prune_fixture/backups" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]') == 3 ]] || {
+    printf 'Bash backup prune changed data before all-candidate verification succeeded.\n' >&2
+    exit 1
+}
+
+bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture/backups; wal_archive_dir=$fixture/wal
+    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
+    oscar_image() { printf oscar:test; }; require_local_image() { :; }
+    verify_backup() { printf "%s\n" "$1" >>"$fixture/verified-success"; }
+    authenticated_backup_label_boundary() {
+        [[ $1 == "$fixture/backups/20261017T140000Z-22222222" ]]
+        printf 000000010000000000000010
+    }
+    write_prune_intent() { cp "$1" "$fixture/captured-intent"; }
+    finish_prune_intent() { :; }
+    prune_backups --keep 2
+' _ "$shell_script" "$prune_fixture" >/dev/null
+[[ $(wc -l <"$prune_fixture/verified-success" | tr -d '[:space:]') == 3 &&
+   $(grep -Fxc 'retention=2' "$prune_fixture/captured-intent") == 1 &&
+   $(grep -Fxc 'oldest_retained=20261017T140000Z-22222222' "$prune_fixture/captured-intent") == 1 &&
+   $(grep -Fxc 'delete_backup=20261017T130000Z-11111111' "$prune_fixture/captured-intent") == 1 ]] || {
+    printf 'Bash backup prune did not retain two newest fully verified recovery points.\n' >&2
+    exit 1
+}
+
+mkdir -p "$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED"
+printf 'registered' >"$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet"
+printf 'writing' >"$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-22222222-2222-4222-8222-222222222222.parquet.partial"
+printf 'helper writing' >"$test_root/reconcile-ok/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-44444444-4444-4444-8444-444444444444.parquet.partial.a1b2c3"
+bash -c '
+    storage_script=$1
+    test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    psql_admin() { printf "%s\n" "datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet"; }
+    audit_archive_filesystem
+' _ "$shell_script" "$test_root/reconcile-ok" >/dev/null
+
+if bash -c '
+    storage_script=$1
+    test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    psql_admin() { printf "%s\n" "datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet"; }
+    audit_archive_filesystem true
+' _ "$shell_script" "$test_root/reconcile-ok" >/dev/null 2>&1; then
+    printf 'Bash quiesced archive audit accepted a partial suffix variant.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/reconcile-partial-link/datasets/observations"
+ln -s "$test_root/archive/datasets/ok/object.parquet" \
+    "$test_root/reconcile-partial-link/datasets/observations/generation.partial.race"
+if bash -c '
+    storage_script=$1; test_archive=$2
+    set -- help; source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    psql_admin() { :; }
+    audit_archive_filesystem true
+' _ "$shell_script" "$test_root/reconcile-partial-link" >/dev/null 2>&1; then
+    printf 'Bash quiesced archive audit accepted a symlinked partial suffix variant.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/reconcile-orphan/datasets/observations"
+printf 'orphan' >"$test_root/reconcile-orphan/datasets/observations/generation-orphan.parquet"
+if bash -c '
+    storage_script=$1
+    test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    psql_admin() { :; }
+    audit_archive_filesystem
+' _ "$shell_script" "$test_root/reconcile-orphan" >/dev/null 2>&1; then
+    printf 'Bash archive reconciliation accepted an unregistered final object.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/reconcile-stale/datasets/observations/date=2026-10-17/profile=RAW_GATED"
+printf 'stale' >"$test_root/reconcile-stale/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-33333333-3333-4333-8333-333333333333.parquet.partial"
+touch -t 202001010000 "$test_root/reconcile-stale/datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-33333333-3333-4333-8333-333333333333.parquet.partial"
+if bash -c '
+    storage_script=$1
+    test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    psql_admin() { :; }
+    audit_archive_filesystem
+' _ "$shell_script" "$test_root/reconcile-stale" >/dev/null 2>&1; then
+    printf 'Bash archive reconciliation accepted a stale partial.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$test_root/archive/datasets/ok"
+printf 'ok' >"$test_root/archive/datasets/ok/object.parquet"
+ln -s /etc/passwd "$test_root/archive/datasets/ok/escape.parquet"
+expected=$(realpath "$test_root/archive/datasets/ok/object.parquet")
+actual=$(bash -c '
+    storage_script=$1; test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    archive_object_path datasets/ok/object.parquet false
+' _ "$shell_script" "$test_root/archive")
+[[ $actual == "$expected" ]] || { printf 'Bash valid-path resolution mismatch.\n' >&2; exit 1; }
+
+if bash -c '
+    storage_script=$1; test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    archive_object_path datasets/ok/escape.parquet false
+' _ "$shell_script" "$test_root/archive" >/dev/null 2>&1; then
+    printf 'Bash accepted a symlink archive object.\n' >&2
+    exit 1
+fi
+
+if bash -c '
+    storage_script=$1; test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    archive_object_path ../etc/passwd false
+' _ "$shell_script" "$test_root/archive" >/dev/null 2>&1; then
+    printf 'Bash accepted archive traversal.\n' >&2
+    exit 1
+fi
+
+missing=$(bash -c '
+    storage_script=$1; test_archive=$2
+    set -- help
+    source "$storage_script" >/dev/null
+    archive_dir=$test_archive
+    archive_object_path datasets/ok/already-deleted.parquet true
+' _ "$shell_script" "$test_root/archive")
+expected_missing="$(realpath "$test_root/archive/datasets/ok")/already-deleted.parquet"
+[[ $missing == "$expected_missing" ]] || { printf 'Bash purge-resume path mismatch.\n' >&2; exit 1; }
+
+# Archive export must quiesce only OSCAR, move bytes through the locked-down
+# helper, and restore the prior OSCAR state on both success and helper failure.
+archive_export_fixture="$test_root/archive-export-bash"
+mkdir -p "$archive_export_fixture/archive" "$archive_export_fixture/success-parent" \
+    "$archive_export_fixture/failure-parent"
+bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    archive_dir=$fixture/archive
+    require_configured() { :; }
+    chown() { :; }
+    publish_export_directory() { mv "$1" "$2"; }
+    compose() {
+        if [[ $1 == ps ]]; then printf "oscar\n"; return; fi
+        printf "%s\n" "$*" >>"$fixture/compose-success.log"
+    }
+    psql_admin() {
+        case "$*" in
+            *"SELECT o.relative_path,o.sha256"*) printf "datasets/ok/object.parquet\t%064d\n" 0 | tr 0 a ;;
+            *"row_to_json"*) printf "{\"id\":\"generation\"}\n" ;;
+            *"json_agg"*) printf "[]\n" ;;
+        esac
+    }
+    archive_object_helper() {
+        [[ $1 == copy && $3 =~ ^a{64}$ && $4 == ro && -d $5 ]]
+        mkdir -p "$5/${2%/*}"
+        printf "copied through helper\n" >"$5/$2"
+    }
+    archive_export --store-key obs --id-scope 1 \
+        --generation 12345678-1234-4234-8234-123456789abc \
+        --destination "$fixture/success-parent/export"
+' _ "$shell_script" "$archive_export_fixture" >/dev/null
+grep -Fxq 'stop oscar' "$archive_export_fixture/compose-success.log"
+grep -Fxq 'up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 oscar' \
+    "$archive_export_fixture/compose-success.log"
+[[ -f $archive_export_fixture/success-parent/export/datasets/ok/object.parquet ]] || {
+    printf 'Bash archive export did not publish the helper-created copy.\n' >&2
+    exit 1
+}
+
+if bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    archive_dir=$fixture/archive
+    require_configured() { :; }
+    chown() { :; }
+    compose() {
+        if [[ $1 == ps ]]; then printf "oscar\n"; return; fi
+        printf "%s\n" "$*" >>"$fixture/compose-failure.log"
+    }
+    psql_admin() {
+        case "$*" in *"SELECT o.relative_path,o.sha256"*) printf "datasets/ok/object.parquet\t%064d\n" 0 | tr 0 a ;; esac
+    }
+    archive_object_helper() { return 71; }
+    archive_export --store-key obs --id-scope 1 \
+        --generation 12345678-1234-4234-8234-123456789abc \
+        --destination "$fixture/failure-parent/export"
+' _ "$shell_script" "$archive_export_fixture" >/dev/null 2>&1; then
+    printf 'Bash archive export ignored a helper failure.\n' >&2
+    exit 1
+fi
+grep -Fxq 'stop oscar' "$archive_export_fixture/compose-failure.log"
+grep -Fxq 'up --detach --no-deps --no-build --pull never oscar' \
+    "$archive_export_fixture/compose-failure.log"
+[[ ! -e $archive_export_fixture/failure-parent/export &&
+   -z $(find "$archive_export_fixture/failure-parent" -maxdepth 1 -name '.export.partial.*' -print -quit) ]] || {
+    printf 'Bash failed archive export left a partial or final destination.\n' >&2
+    exit 1
+}
+
+helper_wrapper_fixture="$test_root/archive-helper-wrapper-bash"
+mkdir -p "$helper_wrapper_fixture/archive" "$helper_wrapper_fixture/export"
+bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    archive_dir=$fixture/archive
+    oscar_image() { printf oscar:test; }
+    docker() { printf "%s\n" "$@" >"$fixture/copy.args"; }
+    archive_object_helper copy datasets/ok/object.parquet "$(printf "%064d" 0 | tr 0 a)" ro "$fixture/export"
+    docker() { printf "%s\n" "$@" >"$fixture/delete.args"; printf "DELETED\n"; }
+    [[ $(archive_object_helper delete datasets/ok/object.parquet "$(printf "%064d" 0 | tr 0 a)" rw) == DELETED ]]
+' _ "$shell_script" "$helper_wrapper_fixture"
+for required_arg in run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    /usr/local/bin/oscar-archive-object "$helper_wrapper_fixture/archive:/archive:ro" \
+    "$helper_wrapper_fixture/export:/export" oscar:test copy; do
+    grep -Fxq -- "$required_arg" "$helper_wrapper_fixture/copy.args" || {
+        printf 'Bash archive helper wrapper omitted locked-down copy argument: %s\n' "$required_arg" >&2
+        exit 1
+    }
+done
+grep -Fxq -- "$helper_wrapper_fixture/archive:/archive:rw" "$helper_wrapper_fixture/delete.args"
+[[ $(grep -Fxc -- '--volume' "$helper_wrapper_fixture/delete.args") == 1 ]] || {
+    printf 'Bash archive delete helper received a mount other than the archive root.\n' >&2
+    exit 1
+}
+
+if command -v pwsh >/dev/null 2>&1; then
+    STORAGE_SCRIPT_TEST_ROOT="$test_root" STORAGE_SCRIPT_PATH="$powershell_script" \
+        pwsh -NoLogo -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            $parseErrors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
+                $env:STORAGE_SCRIPT_PATH, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors.Count) { throw ($parseErrors -join "`n") }
+            . $env:STORAGE_SCRIPT_PATH -Command help *> $null
+            $savedArchive = $ArchiveDirectory
+            $savedBackup = $BackupDirectory
+            $savedWal = $WalArchiveDirectory
+            $ArchiveDirectory = [IO.Path]::GetPathRoot($env:STORAGE_SCRIPT_TEST_ROOT)
+            $BackupDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "broad-test/backups"
+            $WalArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "broad-test/wal"
+            try {
+                Assert-StorageRootShapes
+                throw "PowerShell accepted a volume root as managed storage"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell accepted a volume root as managed storage") { throw }
+            }
+            $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "storage-roots/archive"
+            $BackupDirectory = Join-Path $ArchiveDirectory "backups"
+            $WalArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "storage-roots/wal"
+            try {
+                Assert-StorageRootShapes
+                throw "PowerShell accepted overlapping managed storage roots"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell accepted overlapping managed storage roots") { throw }
+            }
+            $ArchiveDirectory = $savedArchive
+            $BackupDirectory = $savedBackup
+            $WalArchiveDirectory = $savedWal
+            $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "archive"
+            $valid = Resolve-ConfinedArchivePath "datasets/ok/object.parquet"
+            $expected = [IO.Path]::GetFullPath((Join-Path $ArchiveDirectory "datasets/ok/object.parquet"))
+            if ($valid -cne $expected) { throw "PowerShell valid-path resolution mismatch" }
+            try {
+                [void](Resolve-ConfinedArchivePath "../etc/passwd")
+                throw "PowerShell accepted archive traversal"
+            } catch { if ($_.Exception.Message -eq "PowerShell accepted archive traversal") { throw } }
+            try {
+                [void](Resolve-ConfinedArchivePath "datasets/ok/escape.parquet")
+                throw "PowerShell accepted a symlink archive object"
+            } catch { if ($_.Exception.Message -eq "PowerShell accepted a symlink archive object") { throw } }
+            $missing = Resolve-ConfinedArchivePath "datasets/ok/already-deleted.parquet" -AllowMissing
+            $expectedMissing = [IO.Path]::GetFullPath((Join-Path $ArchiveDirectory "datasets/ok/already-deleted.parquet"))
+            if ($missing -cne $expectedMissing) { throw "PowerShell purge-resume path mismatch" }
+
+            $inventoryRoot = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "image-inventory-retag"
+            [void](Read-ImageInventory $inventoryRoot)
+            function Resolve-ReleaseImages {
+                return [pscustomobject]@{
+                    application = "oscar:$RequiredReleaseVersion"
+                    postgres = "oscar-postgis:$RequiredReleaseVersion"
+                    gateway = "nginxinc/nginx-unprivileged:1.28.1-alpine"
+                }
+            }
+            function Get-ImageInspectValue([string]$Image, [string]$Template) {
+                return "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+            try {
+                Confirm-ImageInventory $inventoryRoot -CompareCurrent
+                throw "PowerShell restore accepted a same-name image whose immutable ID changed"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell restore accepted a same-name image whose immutable ID changed") { throw }
+            }
+
+            $portableInventoryRoot = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "image-inventory-portable"
+            function Get-ImageInspectValue([string]$Image, [string]$Template) {
+                if ($Template -ceq "{{.Id}}") {
+                    switch -CaseSensitive ($Image) {
+                        "oscar:$RequiredReleaseVersion" { return "sha256:" + ("a" * 64) }
+                        "oscar-postgis:$RequiredReleaseVersion" { return "sha256:" + ("c" * 64) }
+                        "nginxinc/nginx-unprivileged:1.28.1-alpine" { return "sha256:" + ("d" * 64) }
+                    }
+                }
+                if ($Template -ceq "{{json .RepoDigests}}") { return "null" }
+                if ($Template -like "*org.opencontainers.image.version*") { return $RequiredReleaseVersion }
+                if ($Template -like "*com.botts.oscar.storage-profile*") { return $RequiredReleaseVersion }
+                throw "Unexpected image inspection: $Image $Template"
+            }
+            Confirm-ImageInventory $portableInventoryRoot -CompareCurrent
+
+            $credentialLive = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "credential-install-powershell"
+            $credentialRestore = Join-Path $credentialLive "restore"
+            foreach ($directory in @(
+                (Join-Path $credentialLive "secrets"), (Join-Path $credentialLive "tls"),
+                (Join-Path $credentialRestore "secrets"), (Join-Path $credentialRestore "tls"))) {
+                [IO.Directory]::CreateDirectory($directory) | Out-Null
+            }
+            $targetDeployment = "12345678-1234-4234-8234-123456789abc"
+            $sourceDeployment = "87654321-4321-4321-8321-cba987654321"
+            $targetArchive = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "target-storage/archive"
+            $targetWal = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "target-storage/wal"
+            $targetBackups = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "target-storage/backups"
+            $targetBindings = @(
+                "OSCAR_VERSION=$RequiredReleaseVersion",
+                "OSCAR_DEPLOYMENT_ID=$targetDeployment",
+                "OSCAR_POSTGIS_PLATFORM=windows/amd64",
+                "OSCAR_HTTPS_PORT=9443",
+                "OSCAR_HOSTNAME=restore-target.example",
+                "OSCAR_SECRETS_DIR=./secrets",
+                "OSCAR_TLS_DIR=./tls",
+                "OSCAR_ARCHIVE_DIR=$targetArchive",
+                "OSCAR_WAL_ARCHIVE_DIR=$targetWal",
+                "OSCAR_BACKUP_DIR=$targetBackups",
+                "OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt",
+                "OSCAR_BACKUP_RETENTION_COUNT=7"
+            )
+            $sourceBindings = @(
+                "OSCAR_VERSION=$RequiredReleaseVersion",
+                "OSCAR_DEPLOYMENT_ID=$sourceDeployment",
+                "OSCAR_POSTGIS_PLATFORM=linux/amd64",
+                "OSCAR_HTTPS_PORT=443",
+                "OSCAR_HOSTNAME=backup-source.example",
+                "OSCAR_SECRETS_DIR=C:\source\release-secrets",
+                "OSCAR_TLS_DIR=C:\source\release-tls",
+                "OSCAR_ARCHIVE_DIR=/source/storage/archive",
+                "OSCAR_WAL_ARCHIVE_DIR=/source/storage/wal",
+                "OSCAR_BACKUP_DIR=/source/storage/backups",
+                "OSCAR_BACKUP_KEY_FILE=C:\source\keys\backup-key.txt",
+                "OSCAR_BACKUP_RETENTION_COUNT=99"
+            )
+            [IO.File]::WriteAllLines((Join-Path $credentialLive ".env"), $targetBindings, $Utf8NoBom)
+            [IO.File]::WriteAllText((Join-Path $credentialLive "secrets/stale.key"), "stale")
+            [IO.File]::WriteAllText((Join-Path $credentialLive "tls/stale.crt"), "stale")
+            [IO.File]::WriteAllLines((Join-Path $credentialRestore ".env"), $sourceBindings, $Utf8NoBom)
+            [IO.File]::WriteAllText((Join-Path $credentialRestore "secrets/current.key"), "new")
+            [IO.File]::WriteAllText((Join-Path $credentialRestore "tls/current.crt"), "new")
+            Prepare-RestoredDeploymentCredentials $credentialRestore $credentialLive
+            Install-PreparedDeploymentCredentials $credentialRestore $credentialLive
+            $installedBindings = @([IO.File]::ReadAllLines((Join-Path $credentialLive ".env")))
+            foreach ($expected in @($targetBindings | Where-Object { $_ -notmatch "^OSCAR_BACKUP_RETENTION_COUNT=" })) {
+                if (@($installedBindings | Where-Object { $_ -ceq $expected }).Count -ne 1) {
+                    throw "PowerShell cross-host restore did not preserve target binding: $expected"
+                }
+            }
+            if (@($installedBindings | Where-Object { $_ -ceq "OSCAR_BACKUP_RETENTION_COUNT=99" }).Count -ne 1 -or
+                -not (Test-Path -LiteralPath (Join-Path $credentialLive "secrets/current.key") -PathType Leaf) -or
+                (Test-Path -LiteralPath (Join-Path $credentialLive "secrets/stale.key")) -or
+                -not (Test-Path -LiteralPath (Join-Path $credentialLive "tls/current.crt") -PathType Leaf) -or
+                (Test-Path -LiteralPath (Join-Path $credentialLive "tls/stale.crt"))) {
+                throw "PowerShell restore did not merge portable configuration or replace credential and TLS trees exactly"
+            }
+            $storageScriptRoot = $ScriptRoot
+            $ScriptRoot = $credentialLive
+            function Test-DockerVolume([string]$Volume) { return $true }
+            function Get-VolumeDeploymentLabel([string]$Volume) { return $targetDeployment }
+            Assert-DeploymentVolumeOwnership
+            $ScriptRoot = $storageScriptRoot
+
+            $unsafeLive = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "credential-unsafe-target-powershell"
+            $unsafeRestore = Join-Path $unsafeLive "restore"
+            foreach ($directory in @(
+                (Join-Path $unsafeLive "secrets"), (Join-Path $unsafeLive "tls"),
+                (Join-Path $unsafeRestore "secrets"), (Join-Path $unsafeRestore "tls"))) {
+                [IO.Directory]::CreateDirectory($directory) | Out-Null
+            }
+            [IO.File]::WriteAllLines(
+                (Join-Path $unsafeLive ".env"),
+                @($installedBindings | Where-Object { $_ -notmatch "^OSCAR_BACKUP_DIR=" }),
+                $Utf8NoBom)
+            [IO.File]::WriteAllLines((Join-Path $unsafeRestore ".env"), $installedBindings, $Utf8NoBom)
+            [IO.File]::WriteAllText((Join-Path $unsafeLive "secrets/live-sentinel.key"), "must survive")
+            [IO.File]::WriteAllText((Join-Path $unsafeRestore "secrets/source.key"), "replacement")
+            [IO.File]::WriteAllText((Join-Path $unsafeRestore "tls/source.crt"), "replacement")
+            try {
+                Prepare-RestoredDeploymentCredentials $unsafeRestore $unsafeLive
+                Install-PreparedDeploymentCredentials $unsafeRestore $unsafeLive
+                throw "PowerShell restore accepted a target missing a host-local binding"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell restore accepted a target missing a host-local binding") { throw }
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $unsafeLive "secrets/live-sentinel.key") -PathType Leaf)) {
+                throw "PowerShell restore changed live credentials before rejecting an unsafe target environment"
+            }
+
+            $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "reconcile-ok"
+            function Invoke-PsqlLines([string]$Sql) {
+                return @("datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet")
+            }
+            Test-ArchiveFilesystemRegistration
+            try {
+                Test-ArchiveFilesystemRegistration -RejectPartials
+                throw "PowerShell quiesced archive audit accepted partial suffix variants"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell quiesced archive audit accepted partial suffix variants") { throw }
+            }
+            $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "reconcile-partial-link"
+            try {
+                Test-ArchiveFilesystemRegistration -RejectPartials
+                throw "PowerShell quiesced archive audit accepted a symlinked partial suffix variant"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell quiesced archive audit accepted a symlinked partial suffix variant") { throw }
+            }
+            $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "reconcile-ok"
+            $orphan = Join-Path $ArchiveDirectory "datasets/observations/generation-orphan.parquet"
+            [IO.Directory]::CreateDirectory((Split-Path -Parent $orphan)) | Out-Null
+            [IO.File]::WriteAllText($orphan, "orphan")
+            try {
+                Test-ArchiveFilesystemRegistration
+                throw "PowerShell archive reconciliation accepted an orphan"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell archive reconciliation accepted an orphan") { throw }
+            } finally { Remove-Item -LiteralPath $orphan -Force }
+
+            # Exercise the separately authenticated post-verification journal
+            # audit sidecar. It is not part of the immutable core manifest.
+            $acceptanceId = "20261017T120000Z-1234abcd"
+            $BackupDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "acceptance/backups"
+            $BackupKeyFile = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "acceptance/backup-key.txt"
+            function Assert-Administrator {}
+            function Assert-Configured {}
+            function Assert-BackupKey {}
+            function Get-OscarImage { return "oscar:test" }
+            function Get-PostgresImage { return "postgres:test" }
+            function Assert-LocalImage([string]$Image) {}
+            function Confirm-ChecksumHmac([string]$Root, [string]$Image) {}
+            function Get-JournalConfirmationHmac([string]$ReceiptPath, [string]$Image) { return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }
+            function Invoke-External([string]$File, [string[]]$Arguments) {}
+            function Invoke-Compose([string[]]$Arguments) {}
+            function Protect-AdministratorFile([string]$Path) {}
+            function Assert-AdministratorFile([string]$Path, [string]$Description) {}
+            function Protect-PrivateDirectory([string]$Path) {}
+            function Protect-DockerStorageDirectory([string]$Path, [string]$DockerAccess) {}
+            function Protect-DockerReadableAdministratorFile([string]$Path) {}
+            function Confirm-ReleaseConfigArchive([string]$Root, [string]$Image) {}
+            function Confirm-BackupArchiveMembers([string]$Root, [string]$Image) {}
+            function Confirm-ImageInventory([string]$Root, [switch]$CompareCurrent) {}
+            function Get-ComposeOutput([string[]]$Arguments) { return @() }
+            $generationInventoryRoot = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "generation-inventory-powershell"
+            [IO.Directory]::CreateDirectory($generationInventoryRoot) | Out-Null
+            $generationInventory = Join-Path $generationInventoryRoot "archive-generation-ids.txt"
+            [IO.File]::Copy(
+                (Join-Path (Join-Path $BackupDirectory $acceptanceId) "archive-generation-ids.txt"),
+                $generationInventory,
+                $true)
+            $generationIds = @(Get-ArchiveGenerationInventory $generationInventoryRoot)
+            $expectedGenerationSql = ([char]39) + "{11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222}" + ([char]39) + "::uuid[]"
+            if ($generationIds.Count -ne 2 -or
+                (Get-ArchiveGenerationIdsSql $generationInventoryRoot) -cne $expectedGenerationSql) {
+                throw "PowerShell did not preserve the canonical authenticated generation set"
+            }
+            $invalidInventories = @(
+                "11111111-1111-4111-8111-111111111111`n11111111-1111-4111-8111-111111111111`n",
+                "22222222-2222-4222-8222-222222222222`n11111111-1111-4111-8111-111111111111`n",
+                "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA`n",
+                "11111111-1111-4111-8111-111111111111"
+            )
+            foreach ($invalidInventory in $invalidInventories) {
+                [IO.File]::WriteAllText($generationInventory, $invalidInventory, $Utf8NoBom)
+                try {
+                    [void](Get-ArchiveGenerationInventory $generationInventoryRoot)
+                    throw "PowerShell accepted a noncanonical archive-generation inventory"
+                } catch {
+                    if ($_.Exception.Message -eq "PowerShell accepted a noncanonical archive-generation inventory") { throw }
+                }
+            }
+            [IO.File]::Copy(
+                (Join-Path (Join-Path $BackupDirectory $acceptanceId) "archive-generation-ids.txt"),
+                $generationInventory,
+                $true)
+
+            $catalogSqlCapture = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "catalog-upsert-powershell.sql"
+            $script:MockEpochReceipt = "12345678-1234-4123-8123-123456789abc|VERIFIED"
+            function Assert-DeploymentVolumeOwnership {}
+            function Invoke-PsqlScript([string]$Sql) {
+                [IO.File]::WriteAllText($catalogSqlCapture, $Sql, $Utf8NoBom)
+                return $script:MockEpochReceipt
+            }
+            Set-VerifiedBackupEpochReceipt (Join-Path $BackupDirectory $acceptanceId) $acceptanceId "12345678-1234-4123-8123-123456789abc" "0/12345678"
+            $catalogSql = [IO.File]::ReadAllText($catalogSqlCapture)
+            if (-not $catalogSql.Contains($expectedGenerationSql) -or
+                $catalogSql.Contains("FROM oscar_archive_generation") -or
+                -not $catalogSql.Contains("archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids")) {
+                throw "PowerShell VERIFIED epoch upsert is not bound to the authenticated backup-time generation set"
+            }
+            $script:MockEpochReceipt = ""
+            try {
+                Set-VerifiedBackupEpochReceipt (Join-Path $BackupDirectory $acceptanceId) $acceptanceId "12345678-1234-4123-8123-123456789abc" "0/12345678"
+                throw "PowerShell accepted a foreign same-UUID epoch collision"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell accepted a foreign same-UUID epoch collision") { throw }
+            }
+            $verified = Join-Path (Join-Path $BackupDirectory $acceptanceId) "VERIFIED"
+            Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue
+            $journalReceipt = Join-Path (Join-Path $BackupDirectory $acceptanceId) "JOURNAL_CONFIRMED"
+            $validJournalReceipt = [IO.File]::ReadAllText($journalReceipt)
+            [IO.File]::WriteAllText($journalReceipt, "corrupt receipt`n", $Utf8NoBom)
+            Confirm-Backup $acceptanceId -WarningAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $verified -PathType Leaf)) {
+                throw "PowerShell audit-sidecar corruption incorrectly blocked authenticated core recovery acceptance"
+            }
+            Remove-Item -LiteralPath $verified -Force
+            [IO.File]::WriteAllText($journalReceipt, $validJournalReceipt, $Utf8NoBom)
+            Confirm-Backup $acceptanceId
+            if (-not (Test-Path -LiteralPath $verified -PathType Leaf) -or
+                ((Get-Item -LiteralPath $verified).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "PowerShell authenticated journal receipt did not produce VERIFIED"
+            }
+            Remove-Item -LiteralPath $verified -Force
+            function Write-VerifiedMarker([string]$Root) { throw "read-only wrote VERIFIED" }
+            function Set-VerifiedBackupEpochReceipt([string]$Root,[string]$Id,[string]$EpochId,[string]$PostgresLsn) { throw "read-only wrote catalog" }
+            Confirm-Backup $acceptanceId -ReadOnly
+            if (Test-Path -LiteralPath $verified) { throw "PowerShell read-only verification mutated acceptance state" }
+
+            $foreignGuard = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "FOREIGN-GUARD-RAN-PS"
+            $unsafeForeignVerified = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "UNSAFE-FOREIGN-VERIFIED-PS"
+            $unsafeForeignCatalog = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "UNSAFE-FOREIGN-CATALOG-PS"
+            function Get-ComposeOutput([string[]]$Arguments) { return @("postgres") }
+            function Assert-DeploymentVolumeOwnership {
+                [IO.File]::WriteAllText($foreignGuard, "guard")
+                throw "foreign deployment"
+            }
+            function Write-VerifiedMarker([string]$Root) { [IO.File]::WriteAllText($unsafeForeignVerified, "unsafe") }
+            function Set-VerifiedBackupEpochReceipt([string]$Root,[string]$Id,[string]$EpochId,[string]$PostgresLsn) {
+                [IO.File]::WriteAllText($unsafeForeignCatalog, "unsafe")
+            }
+            try {
+                Confirm-Backup $acceptanceId
+                throw "PowerShell backup verification accepted a running foreign deployment"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell backup verification accepted a running foreign deployment") { throw }
+            }
+            if (-not (Test-Path -LiteralPath $foreignGuard -PathType Leaf) -or
+                (Test-Path -LiteralPath $unsafeForeignVerified) -or
+                (Test-Path -LiteralPath $unsafeForeignCatalog)) {
+                throw "PowerShell foreign-volume guard ran after acceptance/catalog mutation"
+            }
+
+            # Validator failure must precede the UID-10001 extraction launch.
+            $journalExtraction = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "UNSAFE-JOURNAL-EXTRACTION"
+            function Get-ComposeOutput([string[]]$Arguments) { return @("postgres") }
+            function Invoke-Compose([string[]]$Arguments) {}
+            function Invoke-External([string]$File, [string[]]$Arguments) {
+                if (($Arguments -join " ") -match "/validate-storage-archive\.sh oscar-state") {
+                    throw "deliberate scoped validator failure"
+                }
+                [IO.File]::WriteAllText($journalExtraction, "extraction launched")
+            }
+            $journalStateHash = (Get-FileHash -LiteralPath (Join-Path (Join-Path $BackupDirectory $acceptanceId) "oscar-state.tar.gz") -Algorithm SHA256).Hash.ToLowerInvariant()
+            try {
+                Confirm-DailyJournalBackup $acceptanceId (Join-Path $BackupDirectory $acceptanceId) "oscar:test" $journalStateHash
+                throw "PowerShell journal bridge ignored scoped validator failure"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell journal bridge ignored scoped validator failure") { throw }
+            }
+            if (Test-Path -LiteralPath $journalExtraction) { throw "PowerShell journal bridge extracted before archive validation" }
+
+            $journalIsolationCapture = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "journal-confirmation-java.args"
+            function Get-ComposeOutput([string[]]$Arguments) { return @("postgres") }
+            function Invoke-Compose([string[]]$Arguments) {
+                if ($Arguments.Count -gt 0 -and $Arguments[0] -ceq "run") {
+                    throw "PowerShell journal confirmation used the Compose service container"
+                }
+            }
+            function Invoke-External([string]$File, [string[]]$Arguments) {
+                $joined = $Arguments -join " "
+                if ($joined -match "--entrypoint java") {
+                    [IO.File]::WriteAllText($journalIsolationCapture, $joined)
+                }
+            }
+            Confirm-DailyJournalBackup $acceptanceId (Join-Path $BackupDirectory $acceptanceId) "oscar:test" $journalStateHash
+            if (-not (Test-Path -LiteralPath $journalIsolationCapture -PathType Leaf)) {
+                throw "PowerShell journal confirmation did not launch its isolated Java container"
+            }
+            $journalIsolationArguments = [IO.File]::ReadAllText($journalIsolationCapture)
+            foreach ($required in @(
+                "--network none --read-only --cap-drop ALL --security-opt no-new-privileges",
+                "--tmpfs /tmp:rw,noexec,nosuid,nodev --user 10001:10001 --entrypoint java",
+                "--volume oscar_oscar_state:/var/lib/oscar")) {
+                if (-not $journalIsolationArguments.Contains($required)) {
+                    throw "PowerShell journal confirmation lacks isolated container argument: $required"
+                }
+            }
+
+            # Inject a verifier failure and prove creation cannot reach live
+            # journal confirmation or its audit sidecar before core VERIFIED.
+            $unsafeJournalConfirmation = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "UNSAFE-LIVE-JOURNAL-CONFIRMATION-PS"
+            function Confirm-Backup([string]$Id, [switch]$ReadOnly) { throw "injected immutable-core verification failure" }
+            function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, [string]$OscarStateSha256) {
+                [IO.File]::WriteAllText($unsafeJournalConfirmation, "unsafe")
+            }
+            function Write-JournalConfirmationReceipt([string]$Root, [string]$Id, [string]$OscarStateSha256, [string]$Image) {
+                [IO.File]::WriteAllText("$unsafeJournalConfirmation.receipt", "unsafe")
+            }
+            try {
+                Complete-NewBackupAcceptance $acceptanceId "unused" "oscar:test" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                throw "PowerShell backup acceptance ignored an injected core-verification failure"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell backup acceptance ignored an injected core-verification failure") { throw }
+            }
+            if ((Test-Path -LiteralPath $unsafeJournalConfirmation) -or (Test-Path -LiteralPath "$unsafeJournalConfirmation.receipt")) {
+                throw "PowerShell backup confirmed live journal retention before core VERIFIED acceptance"
+            }
+
+            $preflightId = "20261017T130000Z-deadbeef"
+            $preflightBackupDirectory = Join-Path $credentialLive "preflight-backups"
+            [IO.Directory]::CreateDirectory((Join-Path $preflightBackupDirectory $preflightId)) | Out-Null
+            $preflightPayload = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "invalid-restored-credentials-powershell"
+            [IO.Directory]::CreateDirectory((Join-Path $preflightPayload "secrets")) | Out-Null
+            [IO.File]::WriteAllLines((Join-Path $preflightPayload ".env"), $installedBindings, $Utf8NoBom)
+            [IO.File]::WriteAllText((Join-Path $preflightPayload "secrets/source.key"), "incomplete")
+            $preflightComposeMarker = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "preflight-compose-powershell"
+            $ScriptRoot = $credentialLive
+            $BackupDirectory = $preflightBackupDirectory
+            $BackupKeyFile = Join-Path $credentialLive "secrets/backup-key.txt"
+            function Assert-Administrator {}
+            function Assert-Configured {}
+            function Assert-BackupKey {}
+            function Assert-DeploymentVolumeOwnership {}
+            function Assert-RestoreCompatibility([string]$Root) {}
+            function Confirm-Backup([string]$Id, [switch]$ConfirmJournal) {}
+            function Invoke-Compose([string[]]$Arguments) {
+                [IO.File]::WriteAllText($preflightComposeMarker, ($Arguments -join " "))
+            }
+            function Invoke-External([string]$File, [string[]]$Arguments) {
+                $mount = @($Arguments | Where-Object { $_ -like "*:/restore" } | Select-Object -First 1)
+                if ($mount.Count -ne 1) { throw "Restore mock did not receive a staging mount" }
+                $restorePath = $mount[0].Substring(0, $mount[0].Length - ":/restore".Length)
+                Copy-Item -LiteralPath (Join-Path $preflightPayload ".env"), (Join-Path $preflightPayload "secrets") -Destination $restorePath -Recurse
+            }
+            try {
+                Restore-Backup $preflightId $preflightId
+                throw "PowerShell restore accepted an incomplete staged credential set"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell restore accepted an incomplete staged credential set") { throw }
+            }
+            if ((Test-Path -LiteralPath $preflightComposeMarker) -or
+                (Test-Path -LiteralPath (Join-Path $credentialLive "pre-restore-$preflightId"))) {
+                throw "PowerShell restore reached a destructive operation before credential preflight completed"
+            }
+        '
+
+    STORAGE_SCRIPT_TEST_ROOT="$test_root" STORAGE_SCRIPT_PATH="$powershell_script" \
+        pwsh -NoLogo -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            . $env:STORAGE_SCRIPT_PATH -Command help *> $null
+            $deployment = "12345678-1234-4234-8234-123456789abc"
+            function Assert-Administrator {}
+            function Protect-AdministratorFile([string]$Path) {}
+            function Assert-AdministratorFile([string]$Path, [string]$Description) {
+                if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Description is missing" }
+                if (((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "$Description is a reparse point"
+                }
+            }
+            function Protect-PrivateDirectory([string]$Path) {}
+            function Protect-DockerStorageDirectory([string]$Path, [string]$DockerAccess) {}
+            function Protect-DockerReadableAdministratorFile([string]$Path) {}
+
+            $identityBase = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "root-identity-powershell"
+            $ScriptRoot = Join-Path $identityBase "release"
+            $ArchiveDirectory = Join-Path $identityBase "roots/archive"
+            $BackupDirectory = Join-Path $identityBase "roots/backups"
+            $WalArchiveDirectory = Join-Path $identityBase "roots/wal"
+            [IO.Directory]::CreateDirectory($ScriptRoot) | Out-Null
+            foreach ($directory in @($ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory)) {
+                [IO.Directory]::CreateDirectory($directory) | Out-Null
+            }
+            [IO.File]::WriteAllLines((Join-Path $ScriptRoot ".env"), @(
+                "OSCAR_VERSION=3.9.2", "OSCAR_DEPLOYMENT_ID=$deployment",
+                "OSCAR_ARCHIVE_DIR=$ArchiveDirectory", "OSCAR_BACKUP_DIR=$BackupDirectory",
+                "OSCAR_WAL_ARCHIVE_DIR=$WalArchiveDirectory", "OSCAR_SECRETS_DIR=./secrets",
+                "OSCAR_TLS_DIR=./tls", "OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt"
+            ), $Utf8NoBom)
+            [IO.File]::WriteAllText((Join-Path $ArchiveDirectory "legacy-object"), "legacy")
+            try {
+                Initialize-StorageDirectories
+                throw "PowerShell implicitly adopted a nonempty unclaimed storage root"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell implicitly adopted a nonempty unclaimed storage root") { throw }
+            }
+            if (Test-Path -LiteralPath (Join-Path $ArchiveDirectory ".oscar-storage-root")) {
+                throw "PowerShell partially claimed roots before rejecting implicit adoption"
+            }
+            Initialize-StorageDirectories -AdoptExisting
+            $archiveMarker = Join-Path $ArchiveDirectory ".oscar-storage-root"
+            $backupMarker = Join-Path $BackupDirectory ".oscar-storage-root"
+            $archiveLines = @([IO.File]::ReadAllLines($archiveMarker))
+            if ($archiveLines.Count -ne 8 -or
+                @($archiveLines | Where-Object { $_ -ceq "format=oscar-storage-root-identity" }).Count -ne 1 -or
+                @($archiveLines | Where-Object { $_ -ceq "version=1" }).Count -ne 1 -or
+                @($archiveLines | Where-Object { $_ -ceq "deployment_id=$deployment" }).Count -ne 1 -or
+                @($archiveLines | Where-Object { $_ -ceq "root_kind=archive" }).Count -ne 1 -or
+                @($archiveLines | Where-Object { $_ -ceq "adoption=explicit-existing" }).Count -ne 1 -or
+                @([IO.File]::ReadAllLines($backupMarker) | Where-Object { $_ -ceq "adoption=new" }).Count -ne 1) {
+                throw "PowerShell storage-root identities do not have the exact version-1/adoption schema"
+            }
+            Assert-StorageRootIdentities
+            $validMarker = [IO.File]::ReadAllText($archiveMarker)
+            [IO.File]::WriteAllText($archiveMarker, $validMarker.Replace("root_kind=archive", "root_kind=backup"))
+            try {
+                Assert-StorageRootIdentity $ArchiveDirectory "archive"
+                throw "PowerShell accepted a swapped storage root"
+            } catch { if ($_.Exception.Message -eq "PowerShell accepted a swapped storage root") { throw } }
+            [IO.File]::WriteAllText($archiveMarker, $validMarker.Replace($deployment, "87654321-4321-4321-8321-cba987654321"))
+            try {
+                Assert-StorageRootIdentity $ArchiveDirectory "archive"
+                throw "PowerShell accepted a foreign storage root"
+            } catch { if ($_.Exception.Message -eq "PowerShell accepted a foreign storage root") { throw } }
+
+            $helperBase = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "archive-helper-wrapper-powershell"
+            $ArchiveDirectory = Join-Path $helperBase "archive"
+            $exportRoot = Join-Path $helperBase "export"
+            [IO.Directory]::CreateDirectory($ArchiveDirectory) | Out-Null
+            [IO.Directory]::CreateDirectory($exportRoot) | Out-Null
+            function Get-OscarImage { return "oscar:test" }
+            $script:HelperArguments = @()
+            function Get-ExternalOutput([string]$Program, [string[]]$Arguments) {
+                $script:HelperArguments = @($Arguments)
+                if ($Arguments -contains "delete") { return @("DELETED") }
+                return @()
+            }
+            $null = Invoke-ArchiveObjectHelper "copy" "datasets/ok/object.parquet" ("a" * 64) "ro" $exportRoot
+            foreach ($required in @(
+                "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "/usr/local/bin/oscar-archive-object",
+                "${ArchiveDirectory}:/archive:ro", "${exportRoot}:/export", "oscar:test", "copy")) {
+                if ($script:HelperArguments -notcontains $required) { throw "PowerShell archive helper omitted argument: $required" }
+            }
+            $deleteResult = Invoke-ArchiveObjectHelper "delete" "datasets/ok/object.parquet" ("a" * 64) "rw"
+            if ($deleteResult -cne "DELETED" -or $script:HelperArguments -notcontains "${ArchiveDirectory}:/archive:rw" -or
+                @($script:HelperArguments | Where-Object { $_ -ceq "--volume" }).Count -ne 1) {
+                throw "PowerShell archive delete helper mounts more than the writable archive root or lost its outcome"
+            }
+
+            $exportBase = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "archive-export-powershell"
+            $ArchiveDirectory = Join-Path $exportBase "archive"
+            [IO.Directory]::CreateDirectory($ArchiveDirectory) | Out-Null
+            $StoreKey = "obs"; $IdScope = "1"
+            $script:ComposeCalls = New-Object System.Collections.Generic.List[string]
+            function Get-ComposeOutput([string[]]$Arguments) {
+                if ($Arguments[0] -ceq "ps") { return @("oscar") }
+                return @()
+            }
+            function Invoke-Compose([string[]]$Arguments) { $script:ComposeCalls.Add(($Arguments -join " ")) }
+            function Invoke-PsqlLines([string]$Sql) { return @("datasets/ok/object.parquet`t$("a" * 64)") }
+            function Invoke-Psql([string]$Sql, [switch]$Table) {
+                if ($Sql -like "*json_agg*") { return "[]" }
+                return "{`"id`":`"generation`"}"
+            }
+            function Invoke-ArchiveObjectHelper(
+                [string]$Operation, [string]$Relative, [string]$ExpectedSha256,
+                [string]$ArchiveAccess, [string]$ExportRoot = "") {
+                if ($Operation -cne "copy" -or $ArchiveAccess -cne "ro" -or -not $ExportRoot) { throw "unsafe helper request" }
+                $destination = Join-Path $ExportRoot ($Relative.Replace("/", [IO.Path]::DirectorySeparatorChar))
+                [IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+                [IO.File]::WriteAllText($destination, "copied through helper")
+            }
+            $successTarget = Join-Path $exportBase "success/export"
+            Export-ArchiveGeneration "12345678-1234-4234-8234-123456789abc" $successTarget
+            if (-not (Test-Path -LiteralPath (Join-Path $successTarget "datasets/ok/object.parquet") -PathType Leaf) -or
+                $script:ComposeCalls -notcontains "stop oscar" -or
+                $script:ComposeCalls -notcontains "up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 oscar") {
+                throw "PowerShell archive export did not use helper quiescence/resume semantics"
+            }
+            $script:ComposeCalls.Clear()
+            function Invoke-ArchiveObjectHelper(
+                [string]$Operation, [string]$Relative, [string]$ExpectedSha256,
+                [string]$ArchiveAccess, [string]$ExportRoot = "") { throw "deliberate helper race failure" }
+            $failureTarget = Join-Path $exportBase "failure/export"
+            try {
+                Export-ArchiveGeneration "12345678-1234-4234-8234-123456789abc" $failureTarget
+                throw "PowerShell archive export ignored a helper failure"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell archive export ignored a helper failure") { throw }
+            }
+            if ($script:ComposeCalls -notcontains "stop oscar" -or
+                $script:ComposeCalls -notcontains "up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 oscar" -or
+                (Test-Path -LiteralPath $failureTarget) -or
+                @(Get-ChildItem -LiteralPath (Split-Path -Parent $failureTarget) -Filter ".export.partial-*" -ErrorAction SilentlyContinue).Count -ne 0) {
+                throw "PowerShell failed archive export did not resume OSCAR and remove its fresh partial"
+            }
+
+            $pruneBase = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "prune-preflight-powershell"
+            $BackupDirectory = Join-Path $pruneBase "backups"
+            $WalArchiveDirectory = Join-Path $pruneBase "wal"
+            [IO.Directory]::CreateDirectory($BackupDirectory) | Out-Null
+            [IO.Directory]::CreateDirectory($WalArchiveDirectory) | Out-Null
+            $pruneIds = @(
+                "20261017T130000Z-11111111", "20261017T140000Z-22222222", "20261017T150000Z-33333333")
+            foreach ($id in $pruneIds) {
+                $directory = Join-Path $BackupDirectory $id
+                [IO.Directory]::CreateDirectory($directory) | Out-Null
+                [IO.File]::WriteAllText((Join-Path $directory "VERIFIED"), "verified")
+            }
+            function Assert-Administrator {}
+            function Assert-Configured {}
+            function Assert-BackupKey {}
+            function Assert-LocalImage([string]$Image) {}
+            function Confirm-Backup([string]$Id, [switch]$ConfirmJournal, [switch]$ReadOnly) {
+                Add-Content -LiteralPath (Join-Path $pruneBase "verified-before-failure") -Value $Id
+                if ($Id -ceq "20261017T140000Z-22222222") { throw "deliberate corrupt backup" }
+            }
+            function Get-AuthenticatedBackupLabelBoundary([string]$Root) { return "000000010000000000000010" }
+            function Write-PruneIntent(
+                [int]$Retention, [string]$OldestRetained, [string]$WalBoundary,
+                [string[]]$DeleteBackups, [string[]]$DeleteWal) {
+                [IO.File]::WriteAllText((Join-Path $pruneBase "UNSAFE-INTENT"), "called")
+            }
+            function Complete-PruneIntent { [IO.File]::WriteAllText((Join-Path $pruneBase "UNSAFE-DELETE"), "called") }
+            try {
+                Remove-ExpiredBackups 2
+                throw "PowerShell backup prune ignored a corrupt verified candidate"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell backup prune ignored a corrupt verified candidate") { throw }
+            }
+            if ((Test-Path -LiteralPath (Join-Path $pruneBase "UNSAFE-INTENT")) -or
+                (Test-Path -LiteralPath (Join-Path $pruneBase "UNSAFE-DELETE")) -or
+                @(Get-ChildItem -LiteralPath $BackupDirectory -Directory).Count -ne 3) {
+                throw "PowerShell backup prune changed data before all-candidate verification succeeded"
+            }
+
+            function Confirm-Backup([string]$Id, [switch]$ConfirmJournal, [switch]$ReadOnly) {
+                Add-Content -LiteralPath (Join-Path $pruneBase "verified-success") -Value $Id
+            }
+            function Get-AuthenticatedBackupLabelBoundary([string]$Root) {
+                if ((Split-Path -Leaf $Root) -cne "20261017T140000Z-22222222") { throw "wrong retained boundary backup" }
+                return "000000010000000000000010"
+            }
+            $script:CapturedRetention = 0; $script:CapturedOldest = ""; $script:CapturedDeletes = @()
+            function Write-PruneIntent(
+                [int]$Retention, [string]$OldestRetained, [string]$WalBoundary,
+                [string[]]$DeleteBackups, [string[]]$DeleteWal) {
+                $script:CapturedRetention = $Retention
+                $script:CapturedOldest = $OldestRetained
+                $script:CapturedDeletes = @($DeleteBackups)
+            }
+            function Complete-PruneIntent {}
+            Remove-ExpiredBackups 2
+            if (@(Get-Content -LiteralPath (Join-Path $pruneBase "verified-success")).Count -ne 3 -or
+                $script:CapturedRetention -ne 2 -or
+                $script:CapturedOldest -cne "20261017T140000Z-22222222" -or
+                $script:CapturedDeletes.Count -ne 1 -or
+                $script:CapturedDeletes[0] -cne "20261017T130000Z-11111111") {
+                throw "PowerShell backup prune did not retain two newest fully verified recovery points"
+            }
+        '
+
+    legacy_binding_powershell="$test_root/legacy-binding-powershell"
+    legacy_custom_powershell="$test_root/legacy-binding-custom-powershell"
+    legacy_duplicate_powershell="$test_root/legacy-binding-duplicate-powershell"
+    current_missing_powershell="$test_root/current-binding-missing-powershell"
+    legacy_upgrade_path_powershell="$test_root/legacy-upgrade-path-powershell"
+    legacy_duplicate_root_powershell="$test_root/legacy-duplicate-root-powershell"
+    mkdir -p "$legacy_binding_powershell" "$legacy_custom_powershell" \
+        "$legacy_duplicate_powershell" "$current_missing_powershell" \
+        "$legacy_upgrade_path_powershell" "$legacy_duplicate_root_powershell"
+    write_391_env_fixture "$legacy_binding_powershell/.env"
+    write_391_env_fixture "$legacy_custom_powershell/.env"
+    write_391_env_fixture "$legacy_duplicate_powershell/.env"
+    write_391_env_fixture "$current_missing_powershell/.env"
+    write_391_env_fixture "$legacy_upgrade_path_powershell/.env"
+    write_391_env_fixture "$legacy_duplicate_root_powershell/.env"
+    printf 'OSCAR_BACKUP_KEY_FILE=C:\\source\\keys\\backup-key.txt\n' >>"$legacy_custom_powershell/.env"
+    printf 'OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\nOSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\n' >>"$legacy_duplicate_powershell/.env"
+    sed -i.bak 's/^OSCAR_VERSION=3\.9\.1$/OSCAR_VERSION=3.9.2/' "$current_missing_powershell/.env"
+    rm -f "$current_missing_powershell/.env.bak"
+    printf 'OSCAR_ARCHIVE_DIR=C:\\one\nOSCAR_ARCHIVE_DIR=C:\\two\n' >>"$legacy_duplicate_root_powershell/.env"
+    STORAGE_SETUP_PATH="$setup_powershell_script" \
+    LEGACY_BINDING_FIXTURE="$legacy_binding_powershell" \
+    LEGACY_CUSTOM_FIXTURE="$legacy_custom_powershell" \
+    LEGACY_DUPLICATE_FIXTURE="$legacy_duplicate_powershell" \
+    CURRENT_MISSING_FIXTURE="$current_missing_powershell" \
+        pwsh -NoLogo -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            . $env:STORAGE_SETUP_PATH -Command help *> $null
+            function Expect-BindingFailure([string]$Description) {
+                try {
+                    Assert-CanonicalCredentialBindings
+                    throw "UNEXPECTED-SUCCESS:$Description"
+                } catch {
+                    if ($_.Exception.Message -eq "UNEXPECTED-SUCCESS:$Description") { throw }
+                }
+            }
+
+            $ScriptRoot = $env:LEGACY_BINDING_FIXTURE
+            Initialize-LegacyBackupKeyBinding
+            Assert-CanonicalCredentialBindings
+            $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
+                Where-Object { $_ -ceq "OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt" })
+            if ($matches.Count -ne 1) { throw "PowerShell did not add exactly one canonical legacy backup-key binding" }
+
+            $ScriptRoot = $env:LEGACY_CUSTOM_FIXTURE
+            Initialize-LegacyBackupKeyBinding
+            Expect-BindingFailure "custom backup-key binding"
+            $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
+                Where-Object { $_ -ceq "OSCAR_BACKUP_KEY_FILE=C:\source\keys\backup-key.txt" })
+            if ($matches.Count -ne 1) { throw "PowerShell overwrote a custom backup-key binding" }
+
+            $ScriptRoot = $env:LEGACY_DUPLICATE_FIXTURE
+            Initialize-LegacyBackupKeyBinding
+            Expect-BindingFailure "duplicate backup-key bindings"
+            $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
+                Where-Object { $_ -match "^OSCAR_BACKUP_KEY_FILE=" })
+            if ($matches.Count -ne 2) { throw "PowerShell collapsed duplicate backup-key bindings" }
+
+            $ScriptRoot = $env:CURRENT_MISSING_FIXTURE
+            Initialize-LegacyBackupKeyBinding
+            Expect-BindingFailure "current release missing backup-key binding"
+            $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
+                Where-Object { $_ -match "^OSCAR_BACKUP_KEY_FILE=" })
+            if ($matches.Count -ne 0) { throw "PowerShell inserted a missing binding into a current-release environment" }
+        '
+
+    STORAGE_SETUP_PATH="$setup_powershell_script" \
+    LEGACY_UPGRADE_FIXTURE="$legacy_upgrade_path_powershell" \
+    LEGACY_DUPLICATE_ROOT_FIXTURE="$legacy_duplicate_root_powershell" \
+        pwsh -NoLogo -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            . $env:STORAGE_SETUP_PATH -Command help *> $null
+            $ScriptRoot = $env:LEGACY_UPGRADE_FIXTURE
+            Assert-UpgradeableEnvironmentBindings
+            Initialize-LegacyBackupKeyBinding
+            Assert-CanonicalCredentialBindings
+            function Invoke-ExternalProbe([scriptblock]$Action) { return $true }
+            function Get-VolumeDeploymentLabel([string]$Volume) { return "" }
+            function Get-DockerOutput([string[]]$Arguments) {
+                if ($Arguments[-1] -ceq "oscar_oscar_state") { return "2026-01-01T00:00:00Z" }
+                return "2026-01-02T00:00:00Z"
+            }
+            Assert-DeploymentVolumeOwnership $true
+            Initialize-StoragePaths
+            Assert-UniqueLiteralEnvironmentKeys
+            Set-EnvValue "OSCAR_VERSION" "3.9.2"
+            Assert-ManagedEnvironmentBindings
+            $lines = [IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env"))
+            foreach ($name in @("OSCAR_VERSION", "OSCAR_DEPLOYMENT_ID", "OSCAR_ARCHIVE_DIR", "OSCAR_BACKUP_DIR", "OSCAR_WAL_ARCHIVE_DIR")) {
+                if (@($lines | Where-Object { $_.StartsWith("$name=", [StringComparison]::Ordinal) }).Count -ne 1) {
+                    throw "PowerShell legacy upgrade did not normalize exactly one $name binding"
+                }
+            }
+
+            $ScriptRoot = $env:LEGACY_DUPLICATE_ROOT_FIXTURE
+            try {
+                Assert-UpgradeableEnvironmentBindings
+                throw "UNEXPECTED-SUCCESS:duplicate optional storage binding"
+            } catch {
+                if ($_.Exception.Message -eq "UNEXPECTED-SUCCESS:duplicate optional storage binding") { throw }
+            }
+            exit 0
+        '
+
+    skip_start_powershell="$test_root/skip-start-powershell"
+    mkdir -p "$skip_start_powershell"
+    printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$skip_start_powershell/.env"
+    printf 'format=oscar-init-state\nversion=1\ndeployment_id=%s\nstate=INITIALIZING\n' "$deployment_id" >"$skip_start_powershell/.oscar-init-state"
+    STORAGE_SETUP_PATH="$setup_powershell_script" STORAGE_SETUP_TEST_ROOT="$skip_start_powershell" \
+        pwsh -NoLogo -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            . $env:STORAGE_SETUP_PATH -Command help *> $null
+            $ScriptRoot = $env:STORAGE_SETUP_TEST_ROOT
+            $deployment = "12345678-1234-4234-8234-123456789abc"
+            $script:Volumes = @{}
+            function docker {
+                $dockerArgs = @($args)
+                if ($dockerArgs.Count -ge 3 -and $dockerArgs[0] -ceq "volume" -and $dockerArgs[1] -ceq "inspect") {
+                    $volume = if ($dockerArgs.Count -ge 5 -and $dockerArgs[2] -ceq "--format") { $dockerArgs[4] } else { $dockerArgs[2] }
+                    if (-not $script:Volumes.ContainsKey($volume)) { $global:LASTEXITCODE = 1; return }
+                    if ($dockerArgs.Count -ge 5 -and $dockerArgs[2] -ceq "--format") { $deployment }
+                    $global:LASTEXITCODE = 0
+                    return
+                }
+                if ($dockerArgs.Count -eq 5 -and $dockerArgs[0] -ceq "volume" -and $dockerArgs[1] -ceq "create" -and
+                    $dockerArgs[2] -ceq "--label" -and $dockerArgs[3] -ceq "com.botts.oscar.deployment-id=$deployment") {
+                    $script:Volumes[$dockerArgs[4]] = $true
+                    $dockerArgs[4]
+                    $global:LASTEXITCODE = 0
+                    return
+                }
+                $global:LASTEXITCODE = 1
+            }
+            Initialize-FreshDeploymentVolumes
+            Assert-DeploymentVolumeOwnership $false
+            Initialize-FreshDeploymentVolumes
+            if (-not $script:Volumes.ContainsKey("oscar_oscar_state") -or -not $script:Volumes.ContainsKey("oscar_postgres_data")) {
+                throw "PowerShell skip-start initialization did not create both labelled named volumes"
+            }
+            exit 0
+        ' >/dev/null
+
+    ps_volume_root="$test_root/volume-ownership-powershell"
+    mkdir -p "$ps_volume_root"
+    STORAGE_SETUP_TEST_ROOT="$ps_volume_root" STORAGE_SETUP_PATH="$setup_powershell_script" \
+        pwsh -NoLogo -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            . $env:STORAGE_SETUP_PATH -Command help *> $null
+            $ScriptRoot = $env:STORAGE_SETUP_TEST_ROOT
+            $deployment = "12345678-1234-4234-8234-123456789abc"
+            $script:MockDeployment = $deployment
+            function Get-ConfiguredEnvValue([string]$Name) { return $script:MockDeployment }
+            function Invoke-ExternalProbe([scriptblock]$Action) { return $true }
+            function Expect-Failure([scriptblock]$Action, [string]$Description) {
+                try { & $Action; throw "UNEXPECTED-SUCCESS:$Description" }
+                catch { if ($_.Exception.Message -eq "UNEXPECTED-SUCCESS:$Description") { throw } }
+            }
+
+            $script:MockStateLabel = $deployment; $script:MockPostgresLabel = $deployment
+            function Get-VolumeDeploymentLabel([string]$Volume) {
+                if ($Volume -ceq "oscar_oscar_state") { return $script:MockStateLabel }
+                return $script:MockPostgresLabel
+            }
+            Assert-DeploymentVolumeOwnership $false
+
+            $script:MockPostgresLabel = "87654321-4321-4321-8321-cba987654321"
+            Expect-Failure { Assert-DeploymentVolumeOwnership $false } "mixed volume labels"
+
+            function Invoke-ExternalProbe([scriptblock]$Action) { return $false }
+            Expect-Failure { Assert-DeploymentVolumeOwnership $false } "missing volume"
+
+            function Invoke-ExternalProbe([scriptblock]$Action) { return $true }
+            $script:MockStateLabel = ""; $script:MockPostgresLabel = ""
+            Expect-Failure { Assert-DeploymentVolumeOwnership $false } "unacknowledged legacy volumes"
+
+            $script:MockStateCreated = "2026-01-01T00:00:00Z"
+            $script:MockPostgresCreated = "2026-01-02T00:00:00Z"
+            function Get-DockerOutput([string[]]$Arguments) {
+                if ($Arguments[-1] -ceq "oscar_oscar_state") { return $script:MockStateCreated }
+                return $script:MockPostgresCreated
+            }
+            Assert-DeploymentVolumeOwnership $true
+            $receipt = Join-Path $ScriptRoot ".oscar-volume-adoption"
+            if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) { throw "PowerShell legacy adoption did not create its receipt" }
+            Assert-DeploymentVolumeOwnership $false
+            $script:MockPostgresCreated = "2026-01-03T00:00:00Z"
+            if (Test-VolumeAdoptionReceipt $deployment) { throw "PowerShell adoption receipt accepted a changed volume creation identity" }
+        '
+
+    ps_lock_root="$test_root/ps-lock"
+    mkdir -p "$ps_lock_root"
+    printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$ps_lock_root/.env"
+    ps_lock_ready="$ps_lock_root/ready"
+    OSCAR_STORAGE_TEST_MODE=1 OSCAR_STORAGE_LOCK_DIR="$ps_lock_root/stable-locks" STORAGE_SCRIPT_TEST_ROOT="$ps_lock_root" STORAGE_SCRIPT_PATH="$powershell_script" STORAGE_LOCK_READY="$ps_lock_ready" \
+        pwsh -NoLogo -NoProfile -Command '
+            . $env:STORAGE_SCRIPT_PATH -Command help *> $null
+            $Command = "backup"
+            $ScriptRoot = $env:STORAGE_SCRIPT_TEST_ROOT
+            function Assert-NoReparseComponents([string]$FullPath, [switch]$AllowMissingLeaf) {}
+            function Protect-PrivateDirectory([string]$Path) {}
+            function Protect-DockerStorageDirectory([string]$Path, [string]$DockerAccess) {}
+            function Protect-AdministratorFile([string]$Path) {}
+            function Assert-AdministratorFile([string]$Path, [string]$Description) {}
+            try {
+                Enter-StorageAdminLock
+                [IO.File]::WriteAllText($env:STORAGE_LOCK_READY, "ready")
+                Start-Sleep -Seconds 3
+            } finally { Exit-StorageAdminLock }
+        ' &
+    ps_lock_holder=$!
+    for _ in {1..50}; do [[ -e $ps_lock_ready ]] && break; sleep 0.1; done
+    [[ -e $ps_lock_ready ]] || { printf 'PowerShell lock holder did not start.\n' >&2; exit 1; }
+    if OSCAR_STORAGE_TEST_MODE=1 OSCAR_STORAGE_LOCK_DIR="$ps_lock_root/stable-locks" STORAGE_SCRIPT_TEST_ROOT="$ps_lock_root" STORAGE_SCRIPT_PATH="$powershell_script" \
+        pwsh -NoLogo -NoProfile -Command '
+            . $env:STORAGE_SCRIPT_PATH -Command help *> $null
+            $Command = "backup"
+            $ScriptRoot = $env:STORAGE_SCRIPT_TEST_ROOT
+            function Assert-NoReparseComponents([string]$FullPath, [switch]$AllowMissingLeaf) {}
+            function Protect-PrivateDirectory([string]$Path) {}
+            function Protect-DockerStorageDirectory([string]$Path, [string]$DockerAccess) {}
+            function Protect-AdministratorFile([string]$Path) {}
+            function Assert-AdministratorFile([string]$Path, [string]$Description) {}
+            try { Enter-StorageAdminLock; exit 0 } catch { exit 1 } finally { Exit-StorageAdminLock }
+        '; then
+        printf 'PowerShell storage lock allowed a concurrent command.\n' >&2
+        exit 1
+    fi
+    wait "$ps_lock_holder"
+fi
+
+assert_contains 'LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE' "$powershell_script"
+assert_contains "SET state='DELETING'" "$powershell_script"
+assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
+assert_contains 'SHA256SUMS\.hmac' "$powershell_script"
+assert_contains 'cannot be accepted as an authenticated \$RequiredReleaseVersion recovery point' "$powershell_script"
+assert_contains 'RequiredReleaseVersion = \$releaseVersionLine' "$powershell_script"
+assert_contains 'Confirm-BackupArchiveMembers' "$powershell_script"
+assert_contains '^[[:space:]]+Confirm-ArchiveObjects -RejectPartials$' "$powershell_script"
+assert_contains 'Confirm-ImageInventory \$Root -CompareCurrent' "$powershell_script"
+assert_contains 'Enter-StorageAdminLock' "$powershell_script"
+assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL'" "$powershell_script"
+assert_contains 'Invoke-ArchiveObjectHelper '\''copy'\'' \$fields\[0\] \$fields\[1\] '\''ro'\'' \$partial' "$powershell_script"
+assert_contains 'Invoke-ArchiveObjectHelper '\''delete'\'' \$fields\[1\] \$fields\[2\] '\''rw'\''' "$powershell_script"
+assert_contains "Invoke-Compose @\('stop', 'oscar'\)" "$powershell_script"
+assert_contains "'up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'oscar'" "$powershell_script"
+assert_contains 'DELETE FROM oscar_obs_overlay' "$powershell_script"
+assert_contains "subject_type='OBSERVATION'" "$powershell_script"
+assert_contains 'overlay_row\.generation_id=item\.generation_id' "$powershell_script"
+assert_contains 'DailyFileBackupConfirmationCli' "$powershell_script"
+assert_contains "state IN \('ACTIVE','DELETING'\)" "$powershell_script"
+assert_contains 'markerItem\.Attributes.*ReparsePoint' "$powershell_script"
+assert_contains 'Assert-StorageRootsReady' "$powershell_script"
+assert_contains 'Prepare-RestoredDeploymentCredentials' "$powershell_script"
+assert_contains 'Install-PreparedDeploymentCredentials' "$powershell_script"
+assert_contains 'INSERT INTO oscar_retention_hold\(id,store_key,id_scope' "$powershell_script"
+assert_contains 'INSERT INTO oscar_deletion_plan\(id,store_key,id_scope' "$powershell_script"
+assert_contains 'JOIN oscar_deletion_plan p ON p\.id=i\.plan_id' "$powershell_script"
+assert_contains 'g\.store_key=p\.store_key AND g\.id_scope=p\.id_scope' "$powershell_script"
+assert_contains 'ON CONFLICT \(subject_type,store_key,id_scope,subject_id\)' "$powershell_script"
+assert_contains 'archive purge -StoreKey \$StoreKey -IdScope \$IdScope' "$powershell_script"
+assert_not_contains 'h\.subject_id::numeric BETWEEN g\.min_id AND g\.max_id' "$powershell_script"
+assert_contains 'Assert-DeploymentVolumeOwnership \(\[bool\]\$AdoptLegacyVolumes\)' "$setup_powershell_script"
+assert_contains 'preserve \.oscar-volume-adoption' "$setup_powershell_script"
+assert_contains 'Assert-CanonicalCredentialBindings' "$setup_powershell_script"
+
+bash_restore_decrypt=$(grep -n "openssl enc -d .*tar -C /restore" "$shell_script" | tail -n 1 | cut -d: -f1)
+bash_restore_prepare=$(grep -n 'prepare_restored_credentials_exact "\$restore_temp"' "$shell_script" | tail -n 1 | cut -d: -f1)
+bash_restore_stop=$(grep -n 'compose stop gateway oscar postgres' "$shell_script" | tail -n 1 | cut -d: -f1)
+[[ -n $bash_restore_decrypt && -n $bash_restore_prepare && -n $bash_restore_stop &&
+   $bash_restore_decrypt -lt $bash_restore_prepare && $bash_restore_prepare -lt $bash_restore_stop ]] || {
+    printf 'Bash restore does not validate staged credentials before destructive Compose operations.\n' >&2
+    exit 1
+}
+
+ps_restore_decrypt=$(grep -n "openssl enc -d .*tar -C /restore" "$powershell_script" | tail -n 1 | cut -d: -f1)
+ps_restore_prepare=$(grep -n 'Prepare-RestoredDeploymentCredentials \$restoreTemp' "$powershell_script" | tail -n 1 | cut -d: -f1)
+ps_restore_stop=$(grep -n "Invoke-Compose @('stop', 'gateway', 'oscar', 'postgres')" "$powershell_script" | tail -n 1 | cut -d: -f1)
+[[ -n $ps_restore_decrypt && -n $ps_restore_prepare && -n $ps_restore_stop &&
+   $ps_restore_decrypt -lt $ps_restore_prepare && $ps_restore_prepare -lt $ps_restore_stop ]] || {
+    printf 'PowerShell restore does not validate staged credentials before destructive Compose operations.\n' >&2
+    exit 1
+}
+
+bash_backup_stop=$(grep -n '\$resume_oscar && compose stop oscar' "$shell_script" | head -n 1 | cut -d: -f1)
+bash_backup_archive_verify=$(grep -n '^[[:space:]]*archive_verify reject-partials$' "$shell_script" | head -n 1 | cut -d: -f1)
+bash_backup_snapshot=$(grep -n 'pg_basebackup --pgdata=' "$shell_script" | head -n 1 | cut -d: -f1)
+[[ -n $bash_backup_stop && -n $bash_backup_archive_verify && -n $bash_backup_snapshot &&
+   $bash_backup_stop -lt $bash_backup_archive_verify && $bash_backup_archive_verify -lt $bash_backup_snapshot ]] || {
+    printf 'Bash backup does not verify the quiesced archive before snapshot creation.\n' >&2
+    exit 1
+}
+
+ps_backup_stop=$(grep -n "Invoke-Compose @('stop', 'oscar')" "$powershell_script" | head -n 1 | cut -d: -f1)
+ps_backup_archive_verify=$(grep -n '^[[:space:]]*Confirm-ArchiveObjects -RejectPartials$' "$powershell_script" | head -n 1 | cut -d: -f1)
+ps_backup_snapshot=$(grep -n 'pg_basebackup --pgdata=' "$powershell_script" | head -n 1 | cut -d: -f1)
+[[ -n $ps_backup_stop && -n $ps_backup_archive_verify && -n $ps_backup_snapshot &&
+   $ps_backup_stop -lt $ps_backup_archive_verify && $ps_backup_archive_verify -lt $ps_backup_snapshot ]] || {
+    printf 'PowerShell backup does not verify the quiesced archive before snapshot creation.\n' >&2
+    exit 1
+}
+
+bash_accept_body=$(awk '/^accept_and_confirm_created_backup\(\)/,/^create_backup\(\)/' "$shell_script")
+bash_accept_verify=$(grep -n -m1 'verify_backup "\$backup_id"' <<<"$bash_accept_body" | cut -d: -f1)
+bash_accept_confirm=$(grep -n -m1 'confirm_daily_journal_backup' <<<"$bash_accept_body" | cut -d: -f1)
+bash_accept_receipt=$(grep -n -m1 'write_journal_confirmation_receipt' <<<"$bash_accept_body" | cut -d: -f1)
+bash_create_body=$(awk '/^create_backup\(\)/,/^verify_backup\(\)/' "$shell_script")
+bash_checksums=$(grep -n -m1 'find \. -type f ! -name SHA256SUMS' <<<"$bash_create_body" | cut -d: -f1)
+bash_publish=$(grep -n -m1 'publish_export_directory "\$work" "\$final"' <<<"$bash_create_body" | cut -d: -f1)
+bash_accept=$(grep -n -m1 'accept_and_confirm_created_backup' <<<"$bash_create_body" | cut -d: -f1)
+[[ -n $bash_accept_verify && -n $bash_accept_confirm && -n $bash_accept_receipt &&
+   -n $bash_checksums && -n $bash_publish && -n $bash_accept &&
+   $bash_checksums -lt $bash_publish && $bash_publish -lt $bash_accept &&
+   $bash_accept_verify -lt $bash_accept_confirm && $bash_accept_confirm -lt $bash_accept_receipt ]] || {
+    printf 'Bash backup does not verify the authenticated published core before live journal confirmation.\n' >&2
+    exit 1
+}
+ps_accept_body=$(awk '/^function Complete-NewBackupAcceptance/,/^function New-Backup/' "$powershell_script")
+ps_accept_verify=$(grep -n -m1 'Confirm-Backup \$Id' <<<"$ps_accept_body" | cut -d: -f1)
+ps_accept_confirm=$(grep -n -m1 'Confirm-DailyJournalBackup' <<<"$ps_accept_body" | cut -d: -f1)
+ps_accept_receipt=$(grep -n -m1 'Write-JournalConfirmationReceipt' <<<"$ps_accept_body" | cut -d: -f1)
+ps_create_body=$(awk '/^function New-Backup/,/^function Confirm-BackupManifestInventory/' "$powershell_script")
+ps_checksums=$(grep -n -m1 'Write-Checksums \$work' <<<"$ps_create_body" | cut -d: -f1)
+ps_publish=$(grep -n -m1 'Move-DurableNoReplace \$work \$final' <<<"$ps_create_body" | cut -d: -f1)
+ps_accept=$(grep -n -m1 'Complete-NewBackupAcceptance' <<<"$ps_create_body" | cut -d: -f1)
+[[ -n $ps_accept_verify && -n $ps_accept_confirm && -n $ps_accept_receipt &&
+   -n $ps_checksums && -n $ps_publish && -n $ps_accept &&
+   $ps_checksums -lt $ps_publish && $ps_publish -lt $ps_accept &&
+   $ps_accept_verify -lt $ps_accept_confirm && $ps_accept_confirm -lt $ps_accept_receipt ]] || {
+    printf 'PowerShell backup does not verify the authenticated published core before live journal confirmation.\n' >&2
+    exit 1
+}
+
+printf 'OSCAR storage script safety tests passed.\n'

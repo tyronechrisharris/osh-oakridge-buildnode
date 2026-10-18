@@ -187,7 +187,14 @@ For a 3.9.2-or-newer same-storage-profile upgrade, create and verify a coordinat
 sudo bash oscar.sh upgrade
 ```
 
-The command reads the target version from the new release, updates only `OSCAR_VERSION` in the preserved `.env`, validates Compose, prepares the versioned images, recreates changed services, waits for health checks, and retains the fixed `oscar_state` and `postgres_data` volumes. It never removes volumes. Confirm the result with `oscar.bat status` (Windows) or `sudo bash oscar.sh status` (Ubuntu).
+The command preserves existing settings and data while normalizing the required 3.9.2 managed
+bindings: deployment identity, absolute external storage roots, and the canonical backup-key
+binding. A legacy deployment may also receive a generated backup key plus explicit volume/root
+adoption metadata when the corresponding adoption options are supplied. After those guarded
+normalizations it updates `OSCAR_VERSION`, validates Compose, prepares the versioned images,
+recreates changed services, waits for health checks, and retains the fixed `oscar_state` and
+`postgres_data` volumes. It never removes volumes. Confirm the result with `oscar.bat status`
+(Windows) or `sudo bash oscar.sh status` (Ubuntu).
 
 Current releases label both named volumes with `OSCAR_DEPLOYMENT_ID` and refuse missing, mixed, or
 foreign ownership. For a pre-label deployment only, first verify from the old release and Docker
@@ -252,7 +259,10 @@ concurrent invocation fails rather than racing backup/archive state. The lock is
 `OSCAR_DEPLOYMENT_ID` in `/run/lock/oscar-storage` on Ubuntu or
 `%ProgramData%\OSCAR\StorageLocks` on Windows, so it
 continues to coordinate old and new extracted releases. Live commands validate every root identity
-and both named-volume ownership identities; only read-only offline `backup-verify` is exempt.
+and both named-volume ownership identities; only offline-capable `backup-verify` is exempt from
+those live dependencies. Verification is still an acceptance mutation: it publishes/replaces
+`VERIFIED` and normalizes backup permissions, and may update the live catalog only after proving
+volume ownership.
 Backup prune HMAC-authenticates and fully re-verifies every usable candidate before persisting a
 durable recovery intent or deleting anything, and authenticates the oldest retained
 `postgres/backup_label` again before pruning WAL. Review those settings against

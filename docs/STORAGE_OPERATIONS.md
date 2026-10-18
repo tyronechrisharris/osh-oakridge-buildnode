@@ -123,10 +123,12 @@ Each root also has an administrator-owned `.oscar-storage-root` identity with fo
 a foreign deployment UUID, a swapped root kind, unsafe ownership/ACL, or a symlink/reparse-point
 marker is a hard failure. Ubuntu archive and WAL roots are root-owned service-group directories mode
 `1770`, keeping service writes possible while the sticky bit protects the root-owned marker; the
-backup root is root-only mode `0700`. Windows uses a protected administrator ACL. Every live
-database/archive command and `backup-prune` validates all root and Docker-volume identities.
-`backup-verify` alone may run offline without them and receives only the selected backup's
-`postgres/` directory read-only.
+backup root is root-only mode `0700`. Windows uses a protected administrator ACL; `docker-users`
+has the read/execute access required by the confined Docker helper and must be treated as a
+Docker-engine-equivalent privileged group. Every live database/archive command and `backup-prune`
+validates all root and Docker-volume identities. `backup-verify` alone may run offline without
+them. It is an acceptance mutation that publishes/replaces `VERIFIED` and normalizes backup
+permissions; any optional live-catalog write is separately volume-ownership-gated.
 
 An upgrade may adopt a verified, nonempty legacy root exactly once with
 `--adopt-legacy-storage-roots` on Ubuntu or `-AdoptLegacyStorageRoots` on Windows. Setup records

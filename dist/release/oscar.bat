@@ -50,6 +50,17 @@ echo   logs -Service postgres -Follow
 echo   check
 echo   verify
 echo   upgrade
+echo   backup
+echo   backup-verify -BackupId BACKUP_ID
+echo   backup-prune -Keep 14
+echo   restore -BackupId BACKUP_ID -Confirm BACKUP_ID
+echo   archive status
+echo   archive verify
+echo   archive hold list
+echo   archive hold create -StoreKey KEY -IdScope INT -Generation UUID -Reason "legal hold"
+echo   archive hold release -HoldId UUID
+echo   archive dry-run -StoreKey KEY -IdScope INT -Before 2026-01-01T00:00:00Z
+echo   archive purge -StoreKey KEY -IdScope INT -Plan UUID -Token TOKEN
 echo   help
 echo.
 echo Enter exit to close this window.

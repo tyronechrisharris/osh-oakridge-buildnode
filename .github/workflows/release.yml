@@ -298,6 +298,7 @@ jobs:
             docker/oscar/archive-object-helper.sh \
             docker/oscar/atomic-publish.c \
             postgis/archive-wal.sh \
+            postgis/merge-wal-restore.sh \
             postgis/prepare-restore.sh \
             documentation/operator-manual/README.md \
             documentation/operator-manual/README_es.md \
@@ -436,6 +437,7 @@ jobs:
               docker/oscar/entrypoint.sh
               postgis/Dockerfile
               postgis/archive-wal.sh
+              postgis/merge-wal-restore.sh
               postgis/prepare-restore.sh
               postgis/init-app-role.sh
               postgis/init-extensions.sql

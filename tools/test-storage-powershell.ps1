@@ -133,8 +133,56 @@ try {
     try { Move-DurableNoReplace $source $destination } catch { $rejectedCollision = $true }
     Assert-True $rejectedCollision 'Win32 durable no-replace move overwrote an existing destination.'
 
+    $catalogRoot = Join-Path $temporaryRoot 'catalog-receipt'
+    New-Item -ItemType Directory -Path $catalogRoot | Out-Null
+    [IO.File]::WriteAllText((Join-Path $catalogRoot 'epoch.json'), "{}`n", (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $catalogRoot 'archive-generation-ids.txt'),
+        "11111111-1111-4111-8111-111111111111`n22222222-2222-4222-8222-222222222222`n",
+        (New-Object Text.UTF8Encoding($false)))
+    $catalogId = '12345678-1234-4234-8234-123456789abc'
+    $catalogBackup = '20261017T120000Z-1234abcd'
+    $script:CapturedCatalogSql = ''
+    function Assert-DeploymentVolumeOwnership {}
+    function Invoke-PsqlScript([string]$Sql) {
+        $script:CapturedCatalogSql = $Sql
+        return "$catalogId|VERIFIED"
+    }
+    Set-VerifiedBackupEpochReceipt $catalogRoot $catalogBackup $catalogId '0/12345678'
+    Assert-True ($script:CapturedCatalogSql.Contains("oscar_backup_epoch.state IN ('CREATED','VERIFIED')") -and
+        $script:CapturedCatalogSql.Contains('postgres_lsn IS NOT DISTINCT FROM EXCLUDED.postgres_lsn') -and
+        $script:CapturedCatalogSql.Contains('archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids') -and
+        $script:CapturedCatalogSql.Contains("'{11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222}'::uuid[]") -and
+        -not $script:CapturedCatalogSql.Contains('FROM oscar_archive_generation') -and
+        $script:CapturedCatalogSql.Contains('sha256 IS NOT DISTINCT FROM EXCLUDED.sha256')) 'PowerShell VERIFIED epoch upsert is not bound to the authenticated backup-time generation set.'
+    function Invoke-PsqlScript([string]$Sql) { return '' }
+    $rejectedForeignEpoch = $false
+    try { Set-VerifiedBackupEpochReceipt $catalogRoot $catalogBackup $catalogId '0/12345678' } catch { $rejectedForeignEpoch = $true }
+    Assert-True $rejectedForeignEpoch 'PowerShell accepted a foreign same-UUID backup epoch collision.'
+
     . $setupScript -Command help | Out-Null
     Assert-True (-not (Test-FullyQualifiedDeploymentPath '\\server\share\archive')) 'Setup accepted a UNC storage root.'
+
+    $wslCandidates = Join-Path $temporaryRoot 'wsl-candidates'
+    New-Item -ItemType Directory -Path $wslCandidates | Out-Null
+    $rejectedZero = $false
+    try { [void](Get-BundledWslInstaller $wslCandidates) } catch { $rejectedZero = $true }
+    Assert-True $rejectedZero 'Setup accepted zero WSL installer candidates.'
+    $wslOne = Join-Path $wslCandidates 'wsl.2.4.0.x64.msi'
+    [IO.File]::WriteAllText($wslOne, 'fixture', (New-Object Text.UTF8Encoding($false)))
+    Assert-True ((Get-BundledWslInstaller $wslCandidates).FullName -ceq $wslOne) 'Setup rejected the one regular allowlisted WSL MSI.'
+    $wslTwo = Join-Path $wslCandidates 'wsl.2.4.1.x64.msi'
+    [IO.File]::WriteAllText($wslTwo, 'fixture', (New-Object Text.UTF8Encoding($false)))
+    $rejectedMultiple = $false
+    try { [void](Get-BundledWslInstaller $wslCandidates) } catch { $rejectedMultiple = $true }
+    Assert-True $rejectedMultiple 'Setup selected one of multiple WSL installer candidates.'
+    Remove-Item -LiteralPath $wslOne, $wslTwo -Force
+    $junctionTarget = Join-Path $temporaryRoot 'wsl-junction-target'
+    New-Item -ItemType Directory -Path $junctionTarget | Out-Null
+    $junction = Join-Path $wslCandidates 'wsl-linked.msi'
+    New-Item -ItemType Junction -Path $junction -Target $junctionTarget | Out-Null
+    $rejectedLinked = $false
+    try { [void](Get-BundledWslInstaller $wslCandidates) } catch { $rejectedLinked = $true }
+    Assert-True $rejectedLinked 'Setup accepted a linked/reparse WSL installer candidate.'
 
     Write-Host 'OSCAR Windows PowerShell 5.1 storage safety tests passed.' -ForegroundColor Green
 } finally {

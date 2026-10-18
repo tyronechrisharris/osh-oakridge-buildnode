@@ -61,7 +61,7 @@ run_menu_command() {
     local command_name=${1:-}
     shift || true
     case "$command_name" in
-        init|verify|start|stop|restart|upgrade)
+        init|verify|start|stop|restart|upgrade|backup|backup-verify|backup-prune|restore|archive)
             if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
                 bash "$setup_script" "$command_name" "$@"
             else
@@ -97,6 +97,17 @@ Enter a command and any options. Examples:
   check
   verify
   upgrade
+  backup
+  backup-verify BACKUP_ID
+  backup-prune --keep 14
+  restore --backup BACKUP_ID --confirm BACKUP_ID
+  archive status
+  archive verify
+  archive hold list
+  archive hold create --store-key KEY --id-scope INT --generation UUID --reason "legal hold"
+  archive hold release --id UUID
+  archive dry-run --store-key KEY --id-scope INT --before YYYY-MM-DDTHH:MM:SSZ
+  archive purge --store-key KEY --id-scope INT --plan UUID --token TOKEN
   help
 
 Enter exit to close this window.

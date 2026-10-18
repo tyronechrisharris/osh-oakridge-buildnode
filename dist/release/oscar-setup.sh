@@ -248,6 +248,28 @@ require_unique_literal_environment_keys() {
     done
 }
 
+# A pre-3.9.2 deployment legitimately has no deployment identity or external
+# storage-root bindings yet.  Validate everything that is present without
+# making the documented one-time adoption path depend on the new schema.  The
+# fully normalized environment is subjected to the strict validator later.
+require_upgrade_environment_keys() {
+    local env_file="$script_dir/.env" name count value
+    [[ -f $env_file && ! -L $env_file ]] || fail 'Deployment .env must be a regular, non-symlink file.'
+    for name in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
+        count=$(awk -F= -v name="$name" '$1 == name { count++ } END { print count+0 }' "$env_file")
+        if [[ $name == OSCAR_VERSION ]]; then
+            ((count == 1)) || fail 'Upgrade source .env must contain exactly one literal OSCAR_VERSION binding.'
+        else
+            ((count <= 1)) || fail "Upgrade source .env contains duplicate $name bindings."
+        fi
+        if ((count == 1)); then
+            value=$(get_env_value "$name")
+            [[ -n $value && $value != *'$'* && $value != *'#'* && $value != *\"* && $value != *\'* &&
+               $value != *[[:space:]]* ]] || fail "Upgrade source .env contains a Compose-interpreted or nonliteral $name value."
+        fi
+    done
+}
+
 require_managed_environment_bindings() {
     local name value
     require_unique_literal_environment_keys
@@ -486,6 +508,27 @@ preflight_fresh_init() {
         fi
     done
     printf '%s' "$deployment_id"
+}
+
+ensure_fresh_init_volumes() {
+    local deployment_id receipt_id receipt_state volume label
+    validate_init_receipt
+    deployment_id=$(ensure_deployment_id)
+    receipt_id=$(read_init_receipt_value deployment_id)
+    receipt_state=$(read_init_receipt_value state)
+    [[ $receipt_id == "$deployment_id" ]] || fail 'The OSCAR initialization receipt does not match .env.'
+    [[ $receipt_state == INITIALIZING || $receipt_state == COMPLETE ]] ||
+        fail 'The OSCAR initialization receipt state is invalid.'
+    for volume in oscar_oscar_state oscar_postgres_data; do
+        if ! docker volume inspect "$volume" >/dev/null 2>&1; then
+            [[ $receipt_state == INITIALIZING ]] ||
+                fail "Initialized OSCAR volume is missing: $volume. Refusing to replace it silently."
+            docker volume create --label "com.botts.oscar.deployment-id=$deployment_id" "$volume" >/dev/null
+        fi
+        label=$(volume_deployment_label "$volume")
+        [[ $label == "$deployment_id" ]] ||
+            fail "Docker volume $volume does not belong to this OSCAR initialization."
+    done
 }
 
 random_password() { head -c 32 /dev/urandom | base64 | tr -d '\r\n'; }
@@ -826,6 +869,7 @@ case "$command_name" in
         require_canonical_credential_bindings
         configure_storage_paths
         preflight_fresh_init >/dev/null
+        ensure_fresh_init_volumes
         require_managed_environment_bindings
         [[ -e $script_dir/secrets/oscar-admin-password.txt ]] || write_secret "$script_dir/secrets/oscar-admin-password.txt" "$(read_admin_password)"
         [[ -e $script_dir/secrets/oscar-db-password.txt ]] || write_secret "$script_dir/secrets/oscar-db-password.txt" "$(random_password)"
@@ -889,14 +933,15 @@ case "$command_name" in
         assert_deployment_paths_safe
         assert_offline_bundle_integrity
         require_docker; base_configured || fail 'This release directory has not been initialized.'
-        require_unique_literal_environment_keys
-        assert_deployment_volume_ownership "$adopt_legacy_volumes"
+        require_upgrade_environment_keys
         heading 'Upgrade preflight'
         normalize_legacy_backup_key_binding
         require_canonical_credential_bindings
+        assert_deployment_volume_ownership "$adopt_legacy_volumes"
+        configure_storage_paths
+        require_unique_literal_environment_keys
         target_version=$(release_version)
         set_env_value OSCAR_VERSION "$target_version"
-        configure_storage_paths
         require_managed_environment_bindings
         [[ -e $script_dir/secrets/backup-key.txt ]] || write_secret "$script_dir/secrets/backup-key.txt" "$(random_password)$(random_password)"
         protect_deployment_files
