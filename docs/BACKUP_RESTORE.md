@@ -374,6 +374,12 @@ The restore workflow:
     stopped, and requires the recovery GUCs to return to defaults with no pending restart; and
 13. starts OSCAR/gateway and waits for complete Compose health.
 
+The WAL preflight performs complete name and type listings followed by one allowlisted sequential
+extraction into private staging. Its archive I/O is therefore bounded by a fixed number of complete
+passes over the snapshot rather than one or more gzip rescans per WAL member. Member type, canonical
+name, duplicate-target, extracted-path-set, live-root, and byte-identical collision checks all still
+finish before any WAL is published or any service is stopped.
+
 Decryption, environment merge, credential-tree validation, and the complete append-only WAL merge all
 finish before the safety copy is created, services are stopped, or replaceable data is changed. A malformed encrypted set,
 unsupported file type, link, or unsafe target environment therefore aborts without entering the
