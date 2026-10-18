@@ -131,7 +131,7 @@ validator_tmpfs_spec='/tmp:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=0,gid=
     exit 1
 }
 [[ $(grep -Fxc "\$ValidatorScratchTmpfs = '$validator_tmpfs_spec'" "$powershell_script") == 1 &&
-   $(grep -F -- "'--tmpfs', \$ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh'" "$powershell_script" | wc -l | tr -d ' ') == 3 ]] || {
+   $(grep -F -- "'--tmpfs', \$ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh'" "$powershell_script" | wc -l | tr -d ' ') == 3 ]] || {
     printf 'PowerShell tar-validator launches do not all use the exact bounded scratch tmpfs.\n' >&2
     exit 1
 }
@@ -1670,6 +1670,12 @@ awk '
     END { exit !(root_helpers >= 12 && missing == 0) }
 ' "$shell_script" || {
     printf 'Bash capless-root helper inherited an image-owned working directory.\n' >&2
+    exit 1
+}
+windows_root_helper_count=$(grep -hE -- "'--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
+windows_neutral_root_helper_count=$(grep -hE -- "'--workdir', '/', '--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
+[[ $windows_root_helper_count -ge 16 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
+    printf 'PowerShell capless-root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
 
@@ -3293,7 +3299,7 @@ fi
 
 assert_contains 'LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE' "$powershell_script"
 assert_contains "SET state='DELETING'" "$powershell_script"
-assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
+assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
 assert_contains 'SHA256SUMS\.hmac' "$powershell_script"
 assert_contains 'cannot be accepted as an authenticated \$RequiredReleaseVersion recovery point' "$powershell_script"
 assert_contains 'RequiredReleaseVersion = \$releaseVersionLine' "$powershell_script"

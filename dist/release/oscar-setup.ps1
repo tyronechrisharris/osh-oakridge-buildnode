@@ -760,7 +760,7 @@ function Initialize-Tls([string]$Name) {
             $parsedIp = $null
             $sanType = if ([Net.IPAddress]::TryParse($Name, [ref]$parsedIp)) { 'IP' } else { 'DNS' }
             $image = Get-OscarImage
-            Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/out", $image,
+            Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/out", $image,
                 'req', '-x509', '-newkey', 'rsa:3072', '-sha256', '-nodes', '-days', '365', '-subj', "/CN=$Name", '-addext', "subjectAltName=${sanType}:$Name", '-keyout', '/out/server.key', '-out', '/out/server.crt')
         }
     }
@@ -771,16 +771,16 @@ function Initialize-Tls([string]$Name) {
     # container-visible mode after generation or import. The protected Windows
     # parent-directory ACL still limits host access to the administrator and
     # Docker service.
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0:0', '--entrypoint', 'chmod', '--volume', "${tlsDirectory}:/tls", $image,
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'chmod', '--volume', "${tlsDirectory}:/tls", $image,
         '0444', '/tls/server.crt', '/tls/server.key')
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${tlsDirectory}:/tls:ro", $image, '-c',
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${tlsDirectory}:/tls:ro", $image, '-c',
         'openssl x509 -in /tls/server.crt -pubkey -noout >/tmp/cert.pub && openssl pkey -in /tls/server.key -pubout >/tmp/key.pub && cmp -s /tmp/cert.pub /tmp/key.pub')
     $parsedIp = $null
     $nameCheck = if ([Net.IPAddress]::TryParse($Name, [ref]$parsedIp)) { '-checkip' } else { '-checkhost' }
     # openssl x509 -checkhost/-checkip exits zero even when its text reports a
     # mismatch. Invoke OpenSSL directly so Windows PowerShell 5.1 never has to
     # preserve nested shell quotes, then require its one exact success line.
-    $nameOutput = Get-DockerOutput @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/tls:ro", $image,
+    $nameOutput = Get-DockerOutput @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/tls:ro", $image,
         'x509', '-in', '/tls/server.crt', '-noout', $nameCheck, $Name)
     $expectedNameOutput = if ($nameCheck -ceq '-checkip') { "IP $Name does match certificate" } else { "Hostname $Name does match certificate" }
     if ($nameOutput -cne $expectedNameOutput) { throw "TLS certificate does not match the configured hostname or IP address: $Name" }
@@ -890,6 +890,30 @@ function Get-ComposeOutput([string[]]$Arguments) {
     }
 }
 
+function Get-ComposeInputOutput([string]$InputText, [string[]]$Arguments) {
+    Assert-DeploymentPathsSafe
+    Assert-ManagedEnvironmentBindings
+    Push-Location $ScriptRoot
+    $saved = Clear-ComposeOverrideEnvironment
+    $previousErrorPreference = $ErrorActionPreference
+    $previousOutputEncoding = $OutputEncoding
+    try {
+        $ErrorActionPreference = 'Continue'
+        $OutputEncoding = $Utf8NoBom
+        $pinned = @(
+            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
+            '--file', (Join-Path $ScriptRoot 'compose.yaml')) + $Arguments
+        $output = @($InputText | & docker @pinned)
+        if ($LASTEXITCODE -ne 0) { throw "docker compose exited with code $LASTEXITCODE." }
+        return $output
+    } finally {
+        $OutputEncoding = $previousOutputEncoding
+        $ErrorActionPreference = $previousErrorPreference
+        Restore-ComposeOverrideEnvironment $saved
+        Pop-Location
+    }
+}
+
 function ConvertFrom-DockerInspectJson([string[]]$Lines, [ValidateSet('image', 'volume')][string]$Kind, [string]$Name) {
     $rawJson = $Lines -join "`n"
     $byteCount = $Utf8NoBom.GetByteCount($rawJson)
@@ -964,8 +988,14 @@ function Get-DockerVolumeCreatedAt([string]$Volume) {
 }
 
 function Invoke-BootstrapSql([string]$Sql) {
-    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); export PGPASSWORD; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
-    $output = Get-ComposeOutput @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper', '--tuples-only', '--no-align', '--command', $Sql)
+    if ([string]::IsNullOrWhiteSpace($Sql) -or $Utf8NoBom.GetByteCount($Sql) -gt 65536 -or $Sql.IndexOf([char]0) -ge 0) {
+        throw 'Bootstrap SQL must be nonempty, NUL-free, and at most 65536 UTF-8 bytes.'
+    }
+    # Stream SQL over stdin instead of forwarding it through a quoted shell
+    # positional argument. Windows PowerShell 5.1 otherwise strips nested
+    # variadic-shell quoting and splits one SQL statement into multiple psql arguments.
+    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); export PGPASSWORD; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --tuples-only --no-align'
+    $output = Get-ComposeInputOutput $Sql @('exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper)
     return (($output -join "`n").Trim())
 }
 

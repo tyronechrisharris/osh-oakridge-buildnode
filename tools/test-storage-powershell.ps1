@@ -135,6 +135,18 @@ try {
         Assert-True (-not $source.Contains('{{ index ')) `
             'A Windows launcher still passes a quoted Go-template index expression through PowerShell 5 native argument marshalling.'
     }
+    # Capability-free uid0 cannot traverse the OSCAR image's mode-0700
+    # /var/lib/oscar workdir. Require every root helper in both Windows
+    # launchers to select a neutral cwd explicitly, including future helpers.
+    $rootHelperLines = @(
+        @($setupSource, $storageSource) |
+            ForEach-Object { $_ -split "`r?`n" } |
+            Where-Object { $_.Contains("'--user', '0'") -or $_.Contains("'--user', '0:0'") })
+    Assert-True ($rootHelperLines.Count -ge 16) 'Windows capless-root helper inventory unexpectedly shrank.'
+    foreach ($rootHelperLine in $rootHelperLines) {
+        Assert-True ($rootHelperLine.Contains("'--workdir', '/'") ) `
+            'A Windows capless-root helper inherited an image-owned working directory.'
+    }
     $tlsStart = $setupSource.IndexOf('function Initialize-Tls', [StringComparison]::Ordinal)
     $tlsEnd = $setupSource.IndexOf('function Remove-LegacyEmbeddedBackupDirectory', $tlsStart, [StringComparison]::Ordinal)
     Assert-True ($tlsStart -ge 0 -and $tlsEnd -gt $tlsStart) 'Could not isolate Windows TLS initialization.'
@@ -149,6 +161,23 @@ try {
     }
     Assert-True ($tlsSource.Contains('if ($nameOutput -cne $expectedNameOutput)')) `
         'Windows TLS name validation does not fail closed on any noncanonical OpenSSL result.'
+    $composeInputStart = $setupSource.IndexOf('function Get-ComposeInputOutput', [StringComparison]::Ordinal)
+    $composeInputEnd = $setupSource.IndexOf('function ConvertFrom-DockerInspectJson', $composeInputStart, [StringComparison]::Ordinal)
+    Assert-True ($composeInputStart -ge 0 -and $composeInputEnd -gt $composeInputStart) 'Could not isolate Windows Compose stdin execution.'
+    $composeInputSource = $setupSource.Substring($composeInputStart, $composeInputEnd - $composeInputStart)
+    Assert-True ($composeInputSource.Contains('$OutputEncoding = $Utf8NoBom') -and
+        $composeInputSource.Contains('$InputText | & docker @pinned') -and
+        $composeInputSource.Contains('$OutputEncoding = $previousOutputEncoding')) `
+        'Windows Compose stdin execution does not stream UTF-8 input and restore its encoding.'
+    $bootstrapStart = $setupSource.IndexOf('function Invoke-BootstrapSql', [StringComparison]::Ordinal)
+    $bootstrapEnd = $setupSource.IndexOf('function Enable-StorageDatabaseFeatures', $bootstrapStart, [StringComparison]::Ordinal)
+    Assert-True ($bootstrapStart -ge 0 -and $bootstrapEnd -gt $bootstrapStart) 'Could not isolate Windows bootstrap SQL execution.'
+    $bootstrapSource = $setupSource.Substring($bootstrapStart, $bootstrapEnd - $bootstrapStart)
+    Assert-True ($bootstrapSource.Contains('Get-ComposeInputOutput $Sql') -and
+        $bootstrapSource.Contains('exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis --tuples-only --no-align') -and
+        $bootstrapSource.Contains('[string]::IsNullOrWhiteSpace($Sql)') -and
+        -not $bootstrapSource.Contains('$@') -and -not $bootstrapSource.Contains("'--command'")) `
+        'Windows bootstrap SQL is not a bounded stdin stream to direct psql.'
     $volumeJson = '[{"Name":"oscar_oscar_state","CreatedAt":"2026-10-18T13:45:03Z","Labels":{"com.botts.oscar.deployment-id":"12345678-1234-4234-8234-123456789abc"}}]'
     $volumeRecord = ConvertFrom-DockerInspectJson @($volumeJson) 'volume' 'oscar_oscar_state'
     Assert-True ((Get-DockerInspectLabel $volumeRecord $false 'com.botts.oscar.deployment-id') -ceq '12345678-1234-4234-8234-123456789abc') `
@@ -198,7 +227,7 @@ try {
         $javaArgs = [string]::Join('|', $calls[2].Arguments)
         Assert-True ($validatorArgs.Contains('--user|0') -and $validatorArgs.Contains('/validate-storage-archive.sh oscar-state')) `
             'Daily journal confirmation does not validate the authenticated archive as root before extraction.'
-        foreach ($required in @('--cap-drop|ALL|--cap-add|CHOWN', '--user|0|--entrypoint|sh')) {
+        foreach ($required in @('--cap-drop|ALL|--cap-add|CHOWN', '--workdir|/|--user|0|--entrypoint|sh')) {
             Assert-True ($extractorArgs.Contains($required)) "Daily journal extraction is missing its constrained root ownership bridge: $required"
         }
         $extractCommand = [string]$calls[1].Arguments[$calls[1].Arguments.Count - 1]

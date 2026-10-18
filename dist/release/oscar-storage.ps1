@@ -1450,7 +1450,7 @@ function Write-Checksums([string]$Root) {
 }
 
 function Get-ChecksumHmac([string]$Root, [string]$Image, [switch]$ReadOnly) {
-    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-eu', '-c', 'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A')
+    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-eu', '-c', 'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A')
     $tag = (($output -join '').Trim())
     if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not calculate a valid backup authentication tag.' }
     return $tag
@@ -1475,7 +1475,7 @@ function Confirm-ChecksumHmac([string]$Root, [string]$Image) {
 
 function Confirm-ReleaseConfigArchive([string]$Root, [string]$Image) {
     $validation = 'sh /validator/validate-storage-archive.sh release-config /backup/release-config.tar.gz'
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
 }
 
 function Confirm-BackupArchiveMembers([string]$Root, [string]$Image) {
@@ -1490,7 +1490,7 @@ sh /validator/validate-storage-archive.sh \
     release-config /backup/release-config.tar.gz \
     deployment-secrets "$secret_archive"
 '@
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
 }
 
 function Write-VerifiedMarker([string]$Root) {
@@ -1521,7 +1521,7 @@ function Get-JournalConfirmationHmac([string]$ReceiptPath, [string]$Image) {
     }
     $output = Get-ExternalOutput 'docker' @(
         'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
-        '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh',
+        '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh',
         '--volume', "${ReceiptPath}:/journal-confirmation:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro",
         $Image, '-eu', '-c', 'key=$(cat /backup-key.txt); head -n 4 /journal-confirmation | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A')
     $tag = (($output -join '').Trim())
@@ -1693,7 +1693,7 @@ SELECT * FROM upserted;
 }
 
 function Get-ReleaseConfigVersion([string]$Root, [string]$Image) {
-    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", $Image, '-eu', '-c', "tar -xOzf /backup/release-config.tar.gz .env.example | sed -n 's/^OSCAR_VERSION=//p' | head -n 1")
+    $output = Get-ExternalOutput 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", $Image, '-eu', '-c', "tar -xOzf /backup/release-config.tar.gz .env.example | sed -n 's/^OSCAR_VERSION=//p' | head -n 1")
     return (($output -join "`n").Trim())
 }
 
@@ -1730,9 +1730,9 @@ function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, 
     try {
         if ($resumeGateway) { Invoke-Compose @('stop', 'gateway') }
         if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-eu', '-c', 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz')
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-eu', '-c', 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz')
         $extract = 'umask 077; tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz; find /snapshot -type d -exec chmod 0700 {} +; find /snapshot -type f -exec chmod 0600 {} +; chown -R 10001:10001 /snapshot'
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-eu', '-c', $extract)
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-eu', '-c', $extract)
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshot}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)
     } finally {
         Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1826,7 +1826,7 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclu
 
     $encryptedSecrets = Join-Path $work 'deployment-secrets.tar.gz.enc'
     [IO.File]::WriteAllBytes($encryptedSecrets, [byte[]]@())
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${encryptedSecrets}:/deployment-secrets.tar.gz.enc", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'tar -C /deployment -czf - .env secrets tls | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/backup-key.txt -out /deployment-secrets.tar.gz.enc')
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${encryptedSecrets}:/deployment-secrets.tar.gz.enc", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'tar -C /deployment -czf - .env secrets tls | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/backup-key.txt -out /deployment-secrets.tar.gz.enc')
     $releaseConfigFiles = @(
         '.dockerignore', '.env.example', 'DEPLOYMENT.md', 'QUICKSTART.md', 'compose.yaml',
         'docker/gateway/default.conf', 'docker/oscar/archive-object-helper.sh', 'docker/oscar/atomic-publish.c', 'docker/oscar/Dockerfile', 'docker/oscar/entrypoint.sh',
@@ -1835,7 +1835,7 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclu
     )
     $releaseConfigArchive = Join-Path $work 'release-config.tar.gz'
     [IO.File]::WriteAllBytes($releaseConfigArchive, [byte[]]@())
-    Invoke-External 'docker' (@('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'tar', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${releaseConfigArchive}:/release-config.tar.gz", $image, '-C', '/deployment', '-czf', '/release-config.tar.gz') + $releaseConfigFiles)
+    Invoke-External 'docker' (@('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'tar', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${releaseConfigArchive}:/release-config.tar.gz", $image, '-C', '/deployment', '-czf', '/release-config.tar.gz') + $releaseConfigFiles)
 
     $epoch = [ordered]@{
         format = 'oscar-backup-epoch'; version = 1; backupEpochId = $epochId; backupId = $id
@@ -1935,7 +1935,7 @@ function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
     }
     [void](Get-ArchiveGenerationInventory $root)
     Confirm-BackupManifestInventory $root $manifestPaths
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'pg_verifybackup', '--volume', "$(Join-Path $root 'postgres'):/backup:ro", $postgresImage, '/backup')
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'pg_verifybackup', '--volume', "$(Join-Path $root 'postgres'):/backup:ro", $postgresImage, '/backup')
     Confirm-ReleaseConfigArchive $root $image
     Confirm-BackupArchiveMembers $root $image
     Confirm-ImageInventory $root
@@ -2002,7 +2002,7 @@ function Get-PruneIntentHmac([string]$FileName, [string]$Image) {
     if ($FileName -cne '.oscar-backup-prune-intent') { Fail 'Unsafe backup prune intent filename.' }
     $intentPath = Join-Path $BackupDirectory $FileName
     $output = Get-ExternalOutput 'docker' @(
-        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${intentPath}:/prune-intent:ro",
+        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${intentPath}:/prune-intent:ro",
         '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-eu', '-c',
         'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /prune-intent | openssl base64 -A')
     $tag = (($output -join '').Trim())
@@ -2479,7 +2479,7 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
     Protect-DockerStorageDirectory $walMergeStage 'ReadWrite'
     try {
         $image = "oscar:$RequiredReleaseVersion"
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${root}:/backup:ro", '--volume', "${restoreTemp}:/restore", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -')
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${root}:/backup:ro", '--volume', "${restoreTemp}:/restore", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-eu', '-c', 'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -')
         Prepare-RestoredDeploymentCredentials $restoreTemp $ScriptRoot
         # Complete the authenticated WAL collision/type preflight and
         # append-only merge before a safety copy, service stop, or replacement
