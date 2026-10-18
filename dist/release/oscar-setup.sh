@@ -649,7 +649,15 @@ prepare_deployment_images() {
         ((${#missing[@]} == 0)) && return
         heading 'Building deployment images'
         compose build oscar postgres
-        compose pull gateway
+
+        # Recheck the complete inventory after building the two local images.
+        # If the pinned gateway tag is already present, pulling it again is
+        # unnecessary and can make an otherwise offline-capable upgrade depend
+        # on a registry credential helper. Pull only when an image is still
+        # missing after the local builds have completed.
+        missing=()
+        while IFS= read -r image; do container_image_exists "$image" || missing+=("$image"); done < <(required_images)
+        ((${#missing[@]} == 0)) || compose pull gateway
     fi
 
     missing=()

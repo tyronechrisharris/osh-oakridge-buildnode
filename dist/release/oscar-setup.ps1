@@ -767,7 +767,14 @@ function Prepare-DeploymentImages {
         if ($missingImages.Count -eq 0) { return }
         Write-Heading 'Building deployment images'
         Invoke-Compose @('build', 'oscar', 'postgres')
-        Invoke-Compose @('pull', 'gateway')
+
+        # Recheck the complete inventory after building the two local images.
+        # If the pinned gateway tag is already present, pulling it again is
+        # unnecessary and can make an otherwise offline-capable upgrade depend
+        # on a registry credential helper. Pull only when an image is still
+        # missing after the local builds have completed.
+        $missingImages = @($requiredImages | Where-Object { -not (Test-ContainerImage $_) })
+        if ($missingImages.Count -gt 0) { Invoke-Compose @('pull', 'gateway') }
     }
 
     $missingImages = @($requiredImages | Where-Object { -not (Test-ContainerImage $_) })

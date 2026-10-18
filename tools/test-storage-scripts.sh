@@ -197,7 +197,8 @@ bash "$repo_root/tools/test-archive-object-helper.sh"
 assert_contains 'LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE' "$shell_script"
 assert_contains "SET state='DELETING'" "$shell_script"
 assert_contains 'docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$shell_script"
-assert_contains '--user 999:999 --entrypoint pg_verifybackup' "$shell_script"
+assert_contains '--cap-drop ALL --security-opt no-new-privileges' "$shell_script"
+assert_contains '--cap-add DAC_READ_SEARCH --workdir / --user 0:0 --entrypoint pg_verifybackup' "$shell_script"
 assert_contains 'SHA256SUMS\.hmac' "$shell_script"
 assert_contains 'cannot be accepted as an authenticated \$required_release_version recovery point' "$shell_script"
 assert_contains 'required_release_version=\$\(awk .*OSCAR_VERSION' "$shell_script"
@@ -330,6 +331,56 @@ ps_upgrade_case=$(extract_case_body "$setup_powershell_script" "        'upgrade
 [[ $(grep -Fxc "            Invoke-Compose @('up', '--detach', '--force-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')" <<<"$ps_upgrade_case") == 1 &&
    $ps_upgrade_case != *--renew-anon-volumes* && $ps_upgrade_case != *"Invoke-Compose @('down'"* ]] || {
     printf 'PowerShell upgrade must force-recreate all services without replacing persistent data.\n' >&2
+    exit 1
+}
+
+# A connected init/upgrade may need to rebuild the local OSCAR/PostGIS images
+# while the pinned gateway image is already cached. Recheck the inventory after
+# those builds: an unnecessary gateway pull would make that valid local state
+# depend on registry credentials/network access. Pull remains required when the
+# gateway really is absent.
+bash -c '
+    setup_script=$1
+    set -- help
+    source "$setup_script" >/dev/null
+    script_dir=$(mktemp -d)
+    trap '\''rm -rf -- "$script_dir"'\'' EXIT
+    built=false
+    gateway_present=true
+    actions=()
+    required_images() { printf "%s\n" oscar:test oscar-postgis:test gateway:test; }
+    container_image_exists() {
+        case $1 in
+            oscar:test|oscar-postgis:test) $built ;;
+            gateway:test) $gateway_present ;;
+            *) return 1 ;;
+        esac
+    }
+    heading() { :; }
+    compose() {
+        actions+=("$*")
+        case "$*" in
+            "build oscar postgres") built=true ;;
+            "pull gateway") gateway_present=true ;;
+            *) return 97 ;;
+        esac
+    }
+    prepare_deployment_images
+    [[ ${#actions[@]} == 1 && ${actions[0]} == "build oscar postgres" ]] || exit 41
+
+    built=false
+    gateway_present=false
+    actions=()
+    prepare_deployment_images
+    [[ ${#actions[@]} == 2 && ${actions[0]} == "build oscar postgres" && ${actions[1]} == "pull gateway" ]] || exit 42
+
+    built=true
+    gateway_present=true
+    actions=()
+    prepare_deployment_images
+    [[ ${#actions[@]} == 0 ]] || exit 43
+' _ "$setup_shell_script" || {
+    printf 'Bash connected image preparation did not avoid an unnecessary cached-gateway pull.\n' >&2
     exit 1
 }
 
@@ -1674,10 +1725,11 @@ grep -Fq -- "--volume $snapshot_path:/verified-snapshot:ro" "$journal_isolation_
     exit 1
 }
 
-# Every capability-free uid0 helper in setup and storage needs a neutral cwd.
-# In particular, the application image owns /var/lib/oscar as uid 10001 with
-# mode 0700, so a uid0 process after `--cap-drop ALL` cannot traverse or restore
-# the inherited cwd.
+# Every uid0 helper in setup and storage needs a neutral cwd. All are
+# capability-free except the read-only backup verifier's single
+# DAC_READ_SEARCH bridge. In particular, the application image owns
+# /var/lib/oscar as uid 10001 with mode 0700, so a uid0 process cannot safely
+# inherit that cwd.
 awk '
     FNR == 1 { previous="" }
     /--user 0(:0)?([[:space:]]|$)/ {
@@ -1685,15 +1737,15 @@ awk '
         if (index(previous "\n" $0, "--workdir /") == 0) missing++
     }
     { previous=$0 }
-    END { exit !(root_helpers == 14 && missing == 0) }
+    END { exit !(root_helpers == 15 && missing == 0) }
 ' "$shell_script" "$setup_shell_script" || {
-    printf 'Bash capless-root helper inherited an image-owned working directory.\n' >&2
+    printf 'Bash root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
 windows_root_helper_count=$(grep -hE -- "'--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
 windows_neutral_root_helper_count=$(grep -hE -- "'--workdir', '/', '--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
-[[ $windows_root_helper_count == 15 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
-    printf 'PowerShell capless-root helper inherited an image-owned working directory.\n' >&2
+[[ $windows_root_helper_count == 16 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
+    printf 'PowerShell root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
 
@@ -3321,8 +3373,8 @@ fi
 
 assert_contains 'LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE' "$powershell_script"
 assert_contains "SET state='DELETING'" "$powershell_script"
-assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '999:999', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
-assert_not_contains "'--user', '0', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
+assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_READ_SEARCH', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
+assert_not_contains "'--user', '999:999', '--entrypoint', 'pg_verifybackup'" "$powershell_script"
 assert_contains 'SHA256SUMS\.hmac' "$powershell_script"
 assert_contains 'cannot be accepted as an authenticated \$RequiredReleaseVersion recovery point' "$powershell_script"
 assert_contains 'RequiredReleaseVersion = \$releaseVersionLine' "$powershell_script"

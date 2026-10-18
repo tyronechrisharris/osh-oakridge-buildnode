@@ -254,9 +254,10 @@ Verification:
   checksum-only legacy directories are rejected and never receive a `VERIFIED` marker or count
   toward retention;
 - checks every `SHA256SUMS` entry;
-- starts a one-shot, dependency-free PostgreSQL utility container and runs `pg_verifybackup`
-  against the base backup as the same unprivileged UID/GID 999 that wrote it; this preserves
-  mode-0600 backup payloads without granting DAC capabilities or weakening storage permissions,
+- starts a one-shot, networkless, read-only PostgreSQL utility container and runs
+  `pg_verifybackup` with every capability dropped except `DAC_READ_SEARCH`; that narrowly scoped
+  read/traverse bridge supports both administrator-normalized Linux payloads and UID-999 Docker
+  Desktop payloads without granting write access or weakening mode-0600/0700 host permissions,
   and no live database container is required;
 - decrypts the secret/configuration archive into a disposable utility-container path;
 - validates every tar payload without extracting it into the deployment: member names cannot be

@@ -127,6 +127,60 @@ try {
 
     $storageSource = [IO.File]::ReadAllText($storageScript)
     $setupSource = [IO.File]::ReadAllText($setupScript)
+    $prepareImagesStart = $setupSource.IndexOf('function Prepare-DeploymentImages', [StringComparison]::Ordinal)
+    $prepareImagesEnd = $setupSource.IndexOf('function Initialize-Tls', $prepareImagesStart, [StringComparison]::Ordinal)
+    Assert-True ($prepareImagesStart -ge 0 -and $prepareImagesEnd -gt $prepareImagesStart) `
+        'Could not isolate Windows connected image preparation.'
+    $prepareImagesSource = $setupSource.Substring($prepareImagesStart, $prepareImagesEnd - $prepareImagesStart)
+    & {
+        $ScriptRoot = Join-Path $temporaryRoot 'connected-image-preparation'
+        New-Item -ItemType Directory -Path $ScriptRoot | Out-Null
+        $script:ImagesBuilt = $false
+        $script:GatewayPresent = $true
+        $script:ImagePreparationActions = New-Object System.Collections.Generic.List[string]
+        function Get-RequiredImages { return @('oscar:test', 'oscar-postgis:test', 'gateway:test') }
+        function Test-ContainerImage([string]$Image) {
+            switch ($Image) {
+                'oscar:test' { return $script:ImagesBuilt }
+                'oscar-postgis:test' { return $script:ImagesBuilt }
+                'gateway:test' { return $script:GatewayPresent }
+                default { return $false }
+            }
+        }
+        function Write-Heading([string]$Message) {}
+        function Invoke-External([string]$Program, [string[]]$Arguments) { throw 'Offline import was not expected.' }
+        function Invoke-Compose([string[]]$Arguments) {
+            $action = [string]::Join('|', $Arguments)
+            $script:ImagePreparationActions.Add($action)
+            switch ($action) {
+                'build|oscar|postgres' { $script:ImagesBuilt = $true }
+                'pull|gateway' { $script:GatewayPresent = $true }
+                default { throw "Unexpected Compose action: $action" }
+            }
+        }
+        Invoke-Expression $prepareImagesSource
+
+        Prepare-DeploymentImages
+        Assert-True ($script:ImagePreparationActions.Count -eq 1 -and
+            $script:ImagePreparationActions[0] -ceq 'build|oscar|postgres') `
+            'Windows connected image preparation pulled an already-cached gateway image.'
+
+        $script:ImagesBuilt = $false
+        $script:GatewayPresent = $false
+        $script:ImagePreparationActions.Clear()
+        Prepare-DeploymentImages
+        Assert-True ($script:ImagePreparationActions.Count -eq 2 -and
+            $script:ImagePreparationActions[0] -ceq 'build|oscar|postgres' -and
+            $script:ImagePreparationActions[1] -ceq 'pull|gateway') `
+            'Windows connected image preparation did not pull a genuinely missing gateway image.'
+
+        $script:ImagesBuilt = $true
+        $script:GatewayPresent = $true
+        $script:ImagePreparationActions.Clear()
+        Prepare-DeploymentImages
+        Assert-True ($script:ImagePreparationActions.Count -eq 0) `
+            'Windows connected image preparation mutated a complete local image inventory.'
+    }
     foreach ($astFixture in @(
         @{ Path = $setupScript; ExpectedShellRuns = 2 },
         @{ Path = $storageScript; ExpectedShellRuns = 18 })) {
@@ -167,26 +221,28 @@ try {
         Assert-True (-not $source.Contains('{{ index ')) `
             'A Windows launcher still passes a quoted Go-template index expression through PowerShell 5 native argument marshalling.'
     }
-    # Capability-free uid0 cannot traverse the OSCAR image's mode-0700
-    # /var/lib/oscar workdir. Require every root helper in both Windows
-    # launchers to select a neutral cwd explicitly, including future helpers.
+    # UID0 cannot safely inherit the OSCAR image's mode-0700 /var/lib/oscar
+    # workdir. Require every root helper in both Windows launchers to select a
+    # neutral cwd explicitly. All are capability-free except the read-only
+    # backup verifier's single DAC_READ_SEARCH bridge.
     $rootHelperLines = @(
         @($setupSource, $storageSource) |
             ForEach-Object { $_ -split "`r?`n" } |
             Where-Object { $_.Contains("'--user', '0'") -or $_.Contains("'--user', '0:0'") })
-    Assert-True ($rootHelperLines.Count -eq 15) 'Windows capless-root helper inventory changed unexpectedly.'
+    Assert-True ($rootHelperLines.Count -eq 16) 'Windows root-helper inventory changed unexpectedly.'
     foreach ($rootHelperLine in $rootHelperLines) {
         Assert-True ($rootHelperLine.Contains("'--workdir', '/'") ) `
-            'A Windows capless-root helper inherited an image-owned working directory.'
+            'A Windows root helper inherited an image-owned working directory.'
     }
     $postgresVerifierStart = $storageSource.IndexOf('function Confirm-PostgresBaseBackup', [StringComparison]::Ordinal)
     $postgresVerifierEnd = $storageSource.IndexOf('function Confirm-Backup(', $postgresVerifierStart, [StringComparison]::Ordinal)
     Assert-True ($postgresVerifierStart -ge 0 -and $postgresVerifierEnd -gt $postgresVerifierStart) `
         'Could not isolate the Windows PostgreSQL backup verifier.'
     $postgresVerifierSource = $storageSource.Substring($postgresVerifierStart, $postgresVerifierEnd - $postgresVerifierStart)
-    Assert-True ($postgresVerifierSource.Contains("'--workdir', '/', '--user', '999:999', '--entrypoint', 'pg_verifybackup'") -and
-        -not $postgresVerifierSource.Contains("'--user', '0', '--entrypoint', 'pg_verifybackup'")) `
-        'Windows pg_verifybackup must use the unprivileged PostgreSQL file owner, not capability-free root.'
+    Assert-True ($postgresVerifierSource.Contains("'--cap-drop', 'ALL', '--cap-add', 'DAC_READ_SEARCH'") -and
+        $postgresVerifierSource.Contains("'--workdir', '/', '--user', '0:0', '--entrypoint', 'pg_verifybackup'") -and
+        -not $postgresVerifierSource.Contains("'--user', '999:999', '--entrypoint', 'pg_verifybackup'")) `
+        'Windows pg_verifybackup must use only the read/search bridge for private cross-host backup ownership.'
     & {
         $script:CapturedPostgresVerifierProgram = $null
         $script:CapturedPostgresVerifierArguments = @()
@@ -197,9 +253,9 @@ try {
         Confirm-PostgresBaseBackup 'C:\backup root' 'oscar-postgis:test'
         $captured = [string]::Join('|', $script:CapturedPostgresVerifierArguments)
         Assert-True ($script:CapturedPostgresVerifierProgram -ceq 'docker' -and
-            $captured.Contains('run|--rm|--network|none|--read-only|--cap-drop|ALL|--security-opt|no-new-privileges|--workdir|/|--user|999:999|--entrypoint|pg_verifybackup') -and
+            $captured.Contains('run|--rm|--network|none|--read-only|--cap-drop|ALL|--cap-add|DAC_READ_SEARCH|--security-opt|no-new-privileges|--workdir|/|--user|0:0|--entrypoint|pg_verifybackup') -and
             $captured.Contains('C:\backup root\postgres:/backup:ro|oscar-postgis:test|/backup')) `
-            'Native PowerShell 5.1 did not preserve the safe pg_verifybackup identity or spaced read-only mount argv.'
+            'Native PowerShell 5.1 did not preserve the least-privilege pg_verifybackup bridge or spaced read-only mount argv.'
     }
     $tlsStart = $setupSource.IndexOf('function Initialize-Tls', [StringComparison]::Ordinal)
     $tlsEnd = $setupSource.IndexOf('function Remove-LegacyEmbeddedBackupDirectory', $tlsStart, [StringComparison]::Ordinal)

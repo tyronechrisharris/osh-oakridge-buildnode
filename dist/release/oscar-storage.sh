@@ -1353,11 +1353,13 @@ verify_backup() {
       image_entries == 1 && release_entries == 1 && wal_entries == 1)) ||
         fail 'Authenticated checksum manifest must contain each required recovery payload exactly once.'
     validate_archive_generation_inventory "$root" >/dev/null
-    # pg_basebackup creates private mode-0600 payloads as the PostgreSQL
-    # image's UID/GID 999. Capability-free uid 0 cannot bypass those mode
-    # bits, so verify read-only as the same unprivileged database identity.
+    # The published backup is deliberately normalized to administrator-owned
+    # mode-0600/0700 files. Docker Desktop can instead expose a freshly written
+    # base backup as UID/GID 999. Use a networkless, read-only root verifier
+    # with only DAC_READ_SEARCH so either private representation is readable
+    # without granting write access or weakening the backup on the host.
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --workdir / --user 999:999 --entrypoint pg_verifybackup \
+        --cap-add DAC_READ_SEARCH --workdir / --user 0:0 --entrypoint pg_verifybackup \
         --volume "$root/postgres:/backup:ro" "$pg_image" /backup
     validate_release_config_archive "$root" "$image"
     validate_backup_archive_members "$root" "$image"
