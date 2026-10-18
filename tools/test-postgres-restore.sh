@@ -42,7 +42,10 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 printf '%s\n' "$password" >"$scratch/oscar-db-password.txt"
-chmod 0600 "$scratch/oscar-db-password.txt"
+# The source PostgreSQL container reads this bind-mounted fixture as UID 999.
+# Its mktemp parent remains mode 0700, so allow that container UID to read the
+# fixed test-only credential without making the parent traversable on the host.
+chmod 0644 "$scratch/oscar-db-password.txt"
 
 docker build --quiet --platform linux/amd64 --build-arg OSCAR_VERSION=3.9.2 --tag "$image" \
     "$repo_root/dist/release/postgis" >/dev/null
