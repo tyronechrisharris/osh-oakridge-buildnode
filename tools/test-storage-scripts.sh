@@ -126,7 +126,7 @@ fi
 # environment cannot redirect validator writes outside that mount.
 validator_tmpfs_spec='/tmp:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=0,gid=0'
 [[ $(grep -Fxc "readonly validator_scratch_tmpfs=$validator_tmpfs_spec" "$shell_script") == 1 &&
-   $(grep -F -- '--tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh' "$shell_script" | wc -l | tr -d ' ') == 3 ]] || {
+   $(grep -F -- '--tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --workdir / --user 0 --entrypoint sh' "$shell_script" | wc -l | tr -d ' ') == 3 ]] || {
     printf 'Bash tar-validator launches do not all use the exact bounded scratch tmpfs.\n' >&2
     exit 1
 }
@@ -1641,7 +1641,7 @@ snapshot_path=$(awk '{print $NF}' "$journal_chown_capture")
 [[ -s $journal_isolation_capture && ! -e $journal_isolation_root/UNSAFE-COMPOSE-RUN ]] &&
 [[ -s $journal_extractor_capture && -s $journal_chown_capture ]] &&
 grep -Fq -- '--network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$journal_extractor_capture" &&
-grep -Fq -- '--user 0:0 --entrypoint sh' "$journal_extractor_capture" &&
+grep -Fq -- '--workdir / --user 0:0 --entrypoint sh' "$journal_extractor_capture" &&
 grep -Fq -- "--volume $journal_isolation_root/$acceptance_id/oscar-state.tar.gz:/oscar-state.tar.gz:ro" "$journal_extractor_capture" &&
 grep -Eq -- "--volume $journal_isolation_root/\\.journal-confirm-$acceptance_id\\.[^ ]+:/snapshot" "$journal_extractor_capture" &&
 ! grep -Fq -- "--volume $journal_isolation_root/$acceptance_id:/" "$journal_extractor_capture" &&
@@ -1655,6 +1655,21 @@ grep -Fq -- '--tmpfs /tmp:rw,noexec,nosuid,nodev --user 10001:10001 --entrypoint
 grep -Fq -- '--volume oscar_oscar_state:/var/lib/oscar' "$journal_isolation_capture" &&
 grep -Fq -- "--volume $snapshot_path:/verified-snapshot:ro" "$journal_isolation_capture" || {
     printf 'Bash journal confirmation is not confined to the state volume and offline hardened container.\n' >&2
+    exit 1
+}
+
+# Every capability-free uid0 helper needs a neutral cwd. In particular, the
+# application image owns /var/lib/oscar as uid 10001 with mode 0700, so a uid0
+# process after `--cap-drop ALL` cannot traverse or restore the inherited cwd.
+awk '
+    /--user 0(:0)?([[:space:]]|$)/ {
+        root_helpers++
+        if (index(previous "\n" $0, "--workdir /") == 0) missing++
+    }
+    { previous=$0 }
+    END { exit !(root_helpers >= 12 && missing == 0) }
+' "$shell_script" || {
+    printf 'Bash capless-root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
 

@@ -593,10 +593,13 @@ validate_image_inventory() {
     [[ $current_version == $(image_inventory_value "$root" postgres_version_label) && $current_profile == $(image_inventory_value "$root" postgres_storage_profile_label) ]] || fail 'Restore PostGIS OCI label mismatch.'
 }
 
+# Capability-free uid0 helpers must not inherit an image-owned workdir. The
+# OSCAR state workdir is deliberately mode 0700 for uid 10001; use / explicitly
+# so root without DAC override can run cwd-sensitive tools such as find(1).
 validate_release_config_archive() {
     local root=$1 image=$2
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh \
+        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --workdir / --user 0 --entrypoint sh \
         --volume "$root:/backup:ro" --volume "$script_dir:/validator:ro" "$image" -eu -c '
         sh /validator/validate-storage-archive.sh release-config /backup/release-config.tar.gz
     '
@@ -605,7 +608,7 @@ validate_release_config_archive() {
 validate_backup_archive_members() {
     local root=$1 image=$2
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh \
+        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --workdir / --user 0 --entrypoint sh \
         --volume "$root:/backup:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
         --volume "$script_dir:/validator:ro" "$image" -eu -c '
         secret_archive=$(mktemp /tmp/oscar-secrets.XXXXXX.tar.gz)
@@ -641,7 +644,7 @@ calculate_journal_confirmation_hmac() {
     local receipt=$1 image=$2 tag
     [[ -f $receipt && ! -L $receipt ]] || fail 'Journal-confirmation receipt payload is missing or unsafe.'
     tag=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh --volume "$receipt:/journal-confirmation:ro" \
+        --workdir / --user 0 --entrypoint sh --volume "$receipt:/journal-confirmation:ro" \
         --volume "$backup_key_file:/backup-key.txt:ro" "$image" -eu -c '
             key=$(cat /backup-key.txt)
             head -n 4 /journal-confirmation |
@@ -766,7 +769,7 @@ SQL
 release_config_version() {
     local root=$1 image=$2
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh --volume "$root:/backup:ro" "$image" -eu -c \
+        --workdir / --user 0 --entrypoint sh --volume "$root:/backup:ro" "$image" -eu -c \
         'tar -xOzf /backup/release-config.tar.gz .env.example' |
         awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }'
 }
@@ -778,7 +781,7 @@ backup_epoch_version() {
 write_checksum_hmac() {
     local root=$1 image=$2 tag
     tag=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh --volume "$root:/backup:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
+        --workdir / --user 0 --entrypoint sh --volume "$root:/backup:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
         "$image" -eu -c '
             key=$(cat /backup-key.txt)
             openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A
@@ -799,7 +802,7 @@ verify_checksum_hmac() {
     expected=$(tr -d '\r\n' <"$root/SHA256SUMS.hmac")
     [[ $expected =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail 'Backup authentication tag is malformed.'
     actual=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh \
+        --workdir / --user 0 --entrypoint sh \
         --volume "$root:/backup:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
         "$image" -eu -c '
             key=$(cat /backup-key.txt)
@@ -1069,7 +1072,7 @@ confirm_daily_journal_backup() (
     # immutable core has already passed full verification. This keeps the
     # retention bridge independently fail-closed against a swapped payload.
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh \
+        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --workdir / --user 0 --entrypoint sh \
         --volume "$root/oscar-state.tar.gz:/oscar-state.tar.gz:ro" \
         --volume "$script_dir/validate-storage-archive.sh:/validate-storage-archive.sh:ro" \
         "$image" -eu -c 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz'
@@ -1077,9 +1080,11 @@ confirm_daily_journal_backup() (
     # for the offline journal receipt bridge. The authenticated backup tree and
     # payload are deliberately administrator-only (0700/0600), so this narrowly
     # confined extractor must run as root to read the exact file bind. It has no
-    # capabilities, network, or writable path beyond the private snapshot.
+    # capabilities, network, or writable path beyond the private snapshot. Its
+    # explicit root workdir avoids inheriting the mode-0700 OSCAR state workdir,
+    # which capless root cannot traverse or restore after find(1) runs.
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0:0 --entrypoint sh \
+        --workdir / --user 0:0 --entrypoint sh \
         --volume "$root/oscar-state.tar.gz:/oscar-state.tar.gz:ro" --volume "$snapshot:/snapshot" "$image" -eu -c '
         umask 077
         tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz
@@ -1230,7 +1235,7 @@ create_backup() (
     : >"$work/deployment-secrets.tar.gz.enc"
     chmod 0600 "$work/deployment-secrets.tar.gz.enc"
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh --volume "$script_dir:/deployment:ro" \
+        --workdir / --user 0 --entrypoint sh --volume "$script_dir:/deployment:ro" \
         --volume "$work/deployment-secrets.tar.gz.enc:/deployment-secrets.tar.gz.enc" --volume "$backup_key_file:/backup-key.txt:ro" \
         "$image" -eu -c \
         'tar -C /deployment -czf - .env secrets tls | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/backup-key.txt -out /deployment-secrets.tar.gz.enc'
@@ -1349,7 +1354,7 @@ verify_backup() {
         fail 'Authenticated checksum manifest must contain each required recovery payload exactly once.'
     validate_archive_generation_inventory "$root" >/dev/null
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint pg_verifybackup \
+        --workdir / --user 0 --entrypoint pg_verifybackup \
         --volume "$root/postgres:/backup:ro" "$pg_image" /backup
     validate_release_config_archive "$root" "$image"
     validate_backup_archive_members "$root" "$image"
@@ -1439,7 +1444,7 @@ calculate_prune_intent_hmac() {
     local filename=$1 image=$2
     [[ $filename == .oscar-backup-prune-intent ]] || fail 'Unsafe backup prune intent filename.'
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh \
+        --workdir / --user 0 --entrypoint sh \
         --volume "$backup_dir/$filename:/prune-intent:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
         "$image" -eu -c '
             key=$(cat /backup-key.txt)
@@ -1930,7 +1935,7 @@ restore_backup() (
     }
     trap cleanup_restore_staging EXIT
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0:0 --entrypoint sh \
+        --workdir / --user 0:0 --entrypoint sh \
         --volume "$root:/backup:ro" --volume "$restore_temp:/restore" --volume "$backup_key_file:/backup-key.txt:ro" \
         "oscar:$required_release_version" -eu -c \
         'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -'
