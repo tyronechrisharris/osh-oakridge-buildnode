@@ -25,6 +25,7 @@ node --test tools/update-version.test.js
     :sensorhub-datastore-postgis:test \
     --tests org.sensorhub.impl.datastore.postgis.TestTieredArchiveConfiguration \
     --tests org.sensorhub.impl.datastore.postgis.TestParquetArchiveReader \
+    --tests org.sensorhub.impl.datastore.postgis.archive.TestDuckDbResourcePolicy \
     --tests org.sensorhub.impl.datastore.postgis.archive.TestArchiveLifecycleInvariants \
     --tests org.sensorhub.impl.datastore.postgis.database.TestOscarTieredModuleProvider \
     --tests org.sensorhub.impl.datastore.postgis.TestParameterizedQueryBuilder

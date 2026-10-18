@@ -131,6 +131,19 @@ archive generations, integrity receipts, overlays, tombstones, retention holds, 
 media references, and backup epochs. An archive object is not query-visible merely because a file
 exists; it must be `ACTIVE` or `SEALED` in this catalog.
 
+Each backup epoch stores only the canonical generation inventory's count, byte length, and
+SHA-256. The exact sorted UUID list remains an HMAC-authenticated file in that recovery point.
+Backup creation and verification stream the bounded list rather than constructing a PostgreSQL
+UUID array, avoiding unbounded launcher memory and permanent per-backup TOAST growth while retaining
+collision-safe identity and portable inspection.
+
+Catalog schema v5 adds durable retention-hold resolution provenance and makes holds part of the
+logical mutation boundary. A removal holds the shared store/per-observation locks, takes a shared
+hold-table lock in the same transaction, and materializes only exact observation holds plus held
+generations whose ID blocks are candidates for that bounded ID set. CLI hold creation/release uses
+a conflicting table-writer lock. This prevents both hot-row deletion and archived tombstoning from
+racing a successful hold without loading every generation hold in the store.
+
 ### Parquet cold tier
 
 An hourly background cycle finds the oldest eligible unarchived row before the 30-day cutoff. To
@@ -158,6 +171,25 @@ generation's schema snapshot is used to decode its observations.
 DuckDB is embedded in OSCAR for archive reads. There is no required FDW, archive server, or external
 query service. An exported generation can also be inspected with ordinary DuckDB or other Parquet
 tools; see [Archive format](ARCHIVE_FORMAT.md).
+
+Every embedded DuckDB connection—export, post-write verification, activation staging, hot/cold
+parity, hot-row deletion, cold result streaming, metadata scans, and counts—uses the same bounded
+resource policy. The 3.9.2 production defaults are 256 MiB of DuckDB memory, two worker threads,
+and 4 GiB of spill per operation, with at most two embedded sessions admitted process-wide. A
+fair first-in/first-out gate waits up to 30 seconds and then fails busy; all independently
+configured archive stores share the gate, and the smallest cap registered by an active or waiting
+store governs admission. This prevents overlapping queries and background jobs from multiplying
+the per-session native-memory and spill envelopes without bound. Each admitted operation receives
+a new unguessable child beneath
+`/var/lib/oscar/duckdb-tmp`; the connection is closed before that child is recursively removed.
+OSCAR rejects a scratch root that contains, equals, or is contained by the immutable archive root.
+On POSIX filesystems both the scratch parent and operation child must be mode `0700`; an existing
+broader parent is rejected instead of silently changing administrator-managed permissions. The
+Linux container used on both Ubuntu and Windows supplies these POSIX semantics. A non-container,
+non-POSIX embedding must enforce an equivalent owner-only ACL. The spill directory is excluded
+from coordinated backups. Because that exclusion is deliberately exact, the only permitted scratch
+path inside persistent `/var/lib/oscar` state is `/var/lib/oscar/duckdb-tmp`; a custom scratch path
+must be outside `/var/lib/oscar` and remain disjoint from the archive.
 
 ### Direct daily-file journal
 

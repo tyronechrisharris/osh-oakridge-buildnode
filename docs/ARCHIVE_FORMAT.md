@@ -136,6 +136,15 @@ PostgreSQL catalog transaction. A copied manifest must not be inserted into the 
 
 The catalog migration is versioned in `oscar_storage_schema_version`. Its operational tables are:
 
+The binary verifies the exact checksum of every recorded schema-version marker and refuses to open a
+catalog with a higher recorded version. When a v4 marker is present, the v4-to-v5 upgrade verifies
+that marker before applying any v5 DDL. This authenticates the declared migration lineage; it is not
+a checksum of the live v4 table definitions. The transactional migration and its constraints validate
+the live shape they consume, while a legacy catalog with no v4 marker follows the explicitly supported
+marker-bootstrap path.
+In-place storage-schema downgrade is unsupported: restore a coordinated backup into an isolated
+deployment running the matching release rather than starting older code on a newer catalog.
+
 | Table | Role |
 | --- | --- |
 | `oscar_archive_job` | Export attempts, revision, state, error, and two-hour stale-job recovery |
@@ -151,7 +160,7 @@ The catalog migration is versioned in `oscar_storage_schema_version`. Its operat
 | `oscar_deletion_plan` / `oscar_deletion_plan_item` | Frozen, expiring cold-deletion selection |
 | `oscar_deletion_ledger` | Per-object deletion audit trail |
 | `oscar_media_manifest` / `oscar_media_asset` | Reserved structured media catalog records |
-| `oscar_backup_epoch` | Link between a backup manifest, WAL location, and active/sealed generations |
+| `oscar_backup_epoch` | Link between a backup manifest/WAL location and the bounded count, byte length, and SHA-256 receipt for its authenticated active/sealed-generation inventory; exact UUIDs stay in the backup file rather than a per-backup PostgreSQL array |
 
 Generation states used by the observation reader/lifecycle are:
 
@@ -189,6 +198,31 @@ For each generation, OSCAR:
 5. records SHA-256 and bytes for Parquet, schema snapshot, and manifest in PostgreSQL;
 6. marks exact source rows and activates the catalog in one PostgreSQL transaction; and
 7. verifies the Parquet SHA-256 again before its first read in each OSCAR process.
+
+The supported `archive verify` command additionally proves catalog completeness: every
+query-visible (`ACTIVE` or `SEALED`) generation must have exactly one active Parquet object, one
+active generation manifest, and one active datastream-schema snapshot, each with a confined path
+and matching SHA-256. The required Parquet object's path and checksum must equal the generation's
+authoritative `object_path` and `sha256`, and the manifest object's path must equal
+`manifest_path`; verification hashes that exact file. It does not treat an absent object row—or a
+stale generation pointer—as an empty successful verification. Verification reads one canonical
+catalog snapshot before the file checks and requires the same snapshot afterward, so live archive
+activation or purge makes the command fail/retry rather than report a mixed-time success.
+The same snapshot verifies exactly one `oscar_archive_id_block` per query-visible generation, with
+`min_id`/`max_id` equal to the generation bounds, and requires at least one matching
+`oscar_archive_schema` row. This detects relational-catalog damage even when all three immutable
+files and their checksums remain intact.
+
+All embedded DuckDB work is resource bounded. Production defaults limit each connection to 256 MiB
+of memory, two threads, and 4 GiB of spill in a private per-operation directory under
+`/var/lib/oscar/duckdb-tmp`. A fair process-wide gate admits at most two sessions and fails a waiter
+busy after 30 seconds, bounding the aggregate resource multiplier across exports, verification,
+deletion, and cold queries. OSCAR rejects archive/scratch root overlap and, on POSIX, rejects an
+existing scratch parent unless it is mode `0700`; the Linux deployment container provides the same
+protection on Ubuntu and Windows hosts. Scratch directories are closed and removed per operation
+and are not part of the portable archive or coordinated backup. A hard process failure, or a surfaced
+close/delete failure, can leave an orphan. After stopping OSCAR, remove only confirmed abandoned
+children beneath the configured scratch parent.
 
 Object publication and PostgreSQL activation cannot be one filesystem/database transaction. A file
 that exists without an `ACTIVE`/`DELETING` catalog object is intentionally invisible and is reported

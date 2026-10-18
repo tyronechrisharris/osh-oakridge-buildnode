@@ -9,12 +9,14 @@ if [[ ${BASH_SOURCE[0]} != "$0" && ${OSCAR_STORAGE_TEST_MODE:-} == 1 ]]; then
     storage_test_mode=true
 fi
 case $script_path in */*) script_parent=${script_path%/*} ;; *) script_parent=. ;; esac
-script_dir=$(CDPATH= cd -- "$script_parent" && pwd)
+script_dir=$(CDPATH= cd -- "$script_parent" && pwd -P)
 script_path="$script_dir/${script_path##*/}"
 storage_command=${1:-help}
 if (($#)); then shift; fi
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+[[ -f $script_path && ! -L $script_path ]] ||
+    fail "OSCAR storage launcher must be a regular, non-symlink file: $script_path"
 require_supported_storage_host() {
     [[ $(uname -s) != Darwin ]] ||
         fail 'OSCAR 3.9.2 storage administration is not supported on macOS Docker Desktop; use Ubuntu 24.04 or Windows.'
@@ -462,7 +464,11 @@ psql_admin() {
 
 valid_backup_id() { [[ $1 =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ ]]; }
 valid_uuid() { [[ $1 =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; }
-valid_observation_id() { [[ $1 =~ ^[1-9][0-9]{0,18}$ ]]; }
+valid_observation_id() {
+    local LC_ALL=C maximum=9223372036854775807
+    [[ $1 =~ ^[1-9][0-9]{0,18}$ ]] || return 1
+    ((${#1} < 19)) || [[ $1 == "$maximum" || $1 < "$maximum" ]]
+}
 valid_before() { [[ $1 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; }
 valid_store_key() { [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]; }
 valid_id_scope() {
@@ -684,10 +690,14 @@ validate_journal_confirmation_receipt() {
 }
 
 validate_archive_generation_inventory() {
-    local root=$1 file="$1/archive-generation-ids.txt" bytes last_byte current count=0
+    local root=$1 file="$1/archive-generation-ids.txt" bytes last_byte current previous='' count=0 inventory_sha
+    local LC_ALL=C
     [[ -f $file && ! -L $file ]] ||
         fail 'Authenticated archive-generation inventory is missing or unsafe.'
-    bytes=$(wc -c <"$file" | tr -d '[:space:]')
+    if ! bytes=$(stat -c %s -- "$file" 2>/dev/null); then
+        bytes=$(stat -f %z "$file" 2>/dev/null) ||
+            fail 'Could not inspect the authenticated archive-generation inventory size.'
+    fi
     [[ $bytes =~ ^[0-9]+$ && $bytes -le $max_backup_archive_generation_inventory_bytes ]] ||
         fail 'Authenticated archive-generation inventory exceeds its size limit.'
     if ((bytes > 0)); then
@@ -701,45 +711,46 @@ validate_archive_generation_inventory() {
             fail 'Authenticated archive-generation inventory exceeds its entry limit.'
         [[ $current =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
             fail 'Authenticated archive-generation inventory contains a noncanonical UUID.'
+        [[ -z $previous || $current > $previous ]] ||
+            fail 'Authenticated archive-generation inventory is unsorted or contains duplicates.'
+        previous=$current
     done <"$file"
-    LC_ALL=C sort -c -u "$file" >/dev/null 2>&1 ||
-        fail 'Authenticated archive-generation inventory is unsorted or contains duplicates.'
-}
-
-archive_generation_ids_sql() {
-    local root=$1 file="$1/archive-generation-ids.txt"
-    validate_archive_generation_inventory "$root"
-    awk '
-        BEGIN { printf "\047{" }
-        { if (count++) printf ","; printf "%s", $0 }
-        END { printf "}\047::uuid[]" }
-    ' "$file"
+    ((bytes == count * 37)) ||
+        fail 'Authenticated archive-generation inventory has noncanonical record framing.'
+    inventory_sha=$(sha256_file "$file")
+    [[ $inventory_sha =~ ^[0-9a-f]{64}$ ]] ||
+        fail 'Could not hash the authenticated archive-generation inventory.'
+    printf '%s|%s|%s\n' "$count" "$inventory_sha" "$bytes"
 }
 
 write_archive_generation_inventory() {
     local root=$1 file="$1/archive-generation-ids.txt"
     psql_admin --quiet --tuples-only --no-align --command \
-        "SELECT id::text FROM oscar_archive_generation WHERE state IN ('ACTIVE','SEALED') ORDER BY id;" >"$file"
-    validate_archive_generation_inventory "$root"
+        "SELECT id::text FROM oscar_archive_generation WHERE state IN ('ACTIVE','SEALED') ORDER BY id LIMIT $((max_backup_archive_generation_ids + 1));" >"$file"
+    validate_archive_generation_inventory "$root" >/dev/null
 }
 
 upsert_verified_backup_epoch() {
-    local root=$1 backup_id=$2 epoch_id=$3 postgres_lsn=$4 epoch_sha generation_ids_sql receipt receipt_state
+    local root=$1 backup_id=$2 epoch_id=$3 postgres_lsn=$4 epoch_sha inventory_receipt
+    local generation_count generation_inventory_sha256 generation_inventory_bytes receipt receipt_state
     valid_backup_id "$backup_id" && valid_uuid "$epoch_id" && [[ $postgres_lsn =~ ^[0-9A-F]+/[0-9A-F]+$ ]] ||
         fail 'Authenticated backup epoch fields are invalid for the live verification receipt.'
     epoch_sha=$(sha256_file "$root/epoch.json")
-    generation_ids_sql=$(archive_generation_ids_sql "$root")
+    inventory_receipt=$(validate_archive_generation_inventory "$root")
+    IFS='|' read -r generation_count generation_inventory_sha256 generation_inventory_bytes <<<"$inventory_receipt"
     assert_deployment_volume_ownership
     receipt=$(cat <<SQL | psql_admin --quiet --tuples-only --no-align | tr -d '[:space:]'
 WITH upserted AS (
-INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_ids,manifest_path,sha256,verified_at)
-VALUES ('$epoch_id','VERIFIED','$postgres_lsn',$generation_ids_sql,'$backup_id/epoch.json','$epoch_sha',now())
+INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_count,archive_generation_inventory_sha256,archive_generation_inventory_bytes,manifest_path,sha256,verified_at)
+VALUES ('$epoch_id','VERIFIED','$postgres_lsn',$generation_count,'$generation_inventory_sha256',$generation_inventory_bytes,'$backup_id/epoch.json','$epoch_sha',now())
 ON CONFLICT (id) DO UPDATE SET
  state='VERIFIED',
  verified_at=CASE WHEN oscar_backup_epoch.state='VERIFIED' THEN oscar_backup_epoch.verified_at ELSE now() END
 WHERE oscar_backup_epoch.state IN ('CREATED','VERIFIED')
   AND oscar_backup_epoch.postgres_lsn IS NOT DISTINCT FROM EXCLUDED.postgres_lsn
-  AND oscar_backup_epoch.archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids
+  AND oscar_backup_epoch.archive_generation_count IS NOT DISTINCT FROM EXCLUDED.archive_generation_count
+  AND oscar_backup_epoch.archive_generation_inventory_sha256 IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_sha256
+  AND oscar_backup_epoch.archive_generation_inventory_bytes IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_bytes
   AND oscar_backup_epoch.manifest_path IS NOT DISTINCT FROM EXCLUDED.manifest_path
   AND oscar_backup_epoch.sha256 IS NOT DISTINCT FROM EXCLUDED.sha256
 RETURNING id::text||'|'||state
@@ -875,28 +886,32 @@ file_mtime_epoch() {
 audit_archive_filesystem() (
     local reject_partials=${1:-false}
     local root_real entry relative modified now failures=0 fresh_partials=0
-    local catalog_file scan_file find_file
+    local catalog_file scan_file find_file unregistered_file raw_catalog_file
     root_real=$(realpath "$archive_dir") || fail "Archive root is unavailable: $archive_dir"
     [[ -d $root_real && ! -L $archive_dir ]] || fail "Archive root is not a regular directory: $archive_dir"
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-archive-audit.XXXXXX")
     catalog_file=$scratch/catalog
     scan_file=$scratch/scan
     find_file=$scratch/find
+    unregistered_file=$scratch/unregistered
+    raw_catalog_file=$scratch/catalog-read
     : >"$catalog_file"
     : >"$scan_file"
     : >"$find_file"
     trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-archive-audit.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
 
     load_catalog_paths() {
-        local paths path
-        paths=$(psql_admin --quiet --tuples-only --no-align --command \
-            "SELECT relative_path FROM oscar_archive_object WHERE state IN ('ACTIVE','DELETING') ORDER BY relative_path;")
+        local path
+        : >"$raw_catalog_file"
+        psql_admin --quiet --tuples-only --no-align --command \
+            "SELECT relative_path FROM oscar_archive_object WHERE state IN ('ACTIVE','DELETING') ORDER BY relative_path;" \
+            >"$raw_catalog_file"
         while IFS= read -r path; do
             [[ -n $path ]] || continue
             valid_relative_path "$path" && valid_archive_object_path "$path" ||
                 fail "Catalog contains an object path outside the approved archive layout: $path"
             printf '%s\n' "$path" >>"$catalog_file"
-        done <<<"$paths"
+        done <"$raw_catalog_file"
     }
 
     load_catalog_paths
@@ -968,13 +983,14 @@ audit_archive_filesystem() (
     # A generation may commit between the first catalog read and the scan. Merge a
     # second read so a just-activated final object is not misreported as an orphan.
     load_catalog_paths
-    sort -u "$catalog_file" -o "$catalog_file"
+    LC_ALL=C sort -u "$catalog_file" -o "$catalog_file"
+    LC_ALL=C sort -u "$scan_file" -o "$scan_file"
+    LC_ALL=C comm -23 "$scan_file" "$catalog_file" >"$unregistered_file"
     while IFS= read -r relative; do
-        grep -Fqx -- "$relative" "$catalog_file" || {
-            printf 'Unregistered archive object: %s\n' "$relative" >&2
-            failures=$((failures + 1))
-        }
-    done <"$scan_file"
+        [[ -n $relative ]] || continue
+        printf 'Unregistered archive object: %s\n' "$relative" >&2
+        failures=$((failures + 1))
+    done <"$unregistered_file"
     ((failures == 0)) || fail "$failures archive filesystem reconciliation failure(s); no files were changed"
     ((fresh_partials == 0)) || printf '%s recent archive partial(s) reported but not treated as stale.\n' "$fresh_partials"
 )
@@ -1099,7 +1115,8 @@ accept_and_confirm_created_backup() {
 create_backup() (
     require_admin; require_configured; require_canonical_credential_bindings "$script_dir/.env"
     require_backup_key; assert_deployment_volume_ownership; prepare_storage_directories
-    local backup_id timestamp random work final lsn version template_version epoch_id image pg_image postgres_container generation_ids_sql
+    local backup_id timestamp random work final lsn version template_version epoch_id image pg_image postgres_container
+    local inventory_receipt generation_count generation_inventory_sha256 generation_inventory_bytes epoch_sha
     local -a release_config_files
     resume_gateway=false; resume_oscar=false; resume_postgres=false
     timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -1193,7 +1210,7 @@ create_backup() (
                  echo "Reserved OSCAR image-owned state path is not the expected symlink: $entry" >&2; exit 1
              fi
          done
-         tar --exclude="./archive" --exclude="./backups" --exclude="./lib" --exclude="./web" \
+         tar --exclude="./archive" --exclude="./backups" --exclude="./duckdb-tmp" --exclude="./lib" --exclude="./web" \
              --exclude="./rules" --exclude="./documentation" --exclude="./trusted_certificates" \
              --exclude="./config" --exclude="./logback.xml" -C /state -czf /output.tar.gz .'
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
@@ -1259,11 +1276,13 @@ create_backup() (
         compose up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 postgres
         resume_postgres=false
     fi
-    generation_ids_sql=$(archive_generation_ids_sql "$final")
+    inventory_receipt=$(validate_archive_generation_inventory "$final")
+    IFS='|' read -r generation_count generation_inventory_sha256 generation_inventory_bytes <<<"$inventory_receipt"
+    epoch_sha=$(sha256_file "$final/epoch.json")
     assert_deployment_volume_ownership
     if ! cat <<SQL | psql_admin >/dev/null; then
-INSERT INTO oscar_backup_epoch(id, state, postgres_lsn, archive_generation_ids, manifest_path, sha256)
-VALUES ('$epoch_id', 'CREATED', '$lsn', $generation_ids_sql, '$backup_id/epoch.json', '$(sha256_file "$final/epoch.json")');
+INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_count,archive_generation_inventory_sha256,archive_generation_inventory_bytes,manifest_path,sha256)
+VALUES ('$epoch_id','CREATED','$lsn',$generation_count,'$generation_inventory_sha256',$generation_inventory_bytes,'$backup_id/epoch.json','$epoch_sha');
 SQL
         printf 'WARNING: backup payload is complete, but its live catalog receipt could not be inserted. Verification will continue.\n' >&2
     fi
@@ -1323,7 +1342,7 @@ verify_backup() {
     ((oscar_state_entries == 1 && archive_entries == 1 && generation_entries == 1 && secret_entries == 1 && epoch_entries == 1 &&
       image_entries == 1 && release_entries == 1 && wal_entries == 1)) ||
         fail 'Authenticated checksum manifest must contain each required recovery payload exactly once.'
-    validate_archive_generation_inventory "$root"
+    validate_archive_generation_inventory "$root" >/dev/null
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --user 0 --entrypoint pg_verifybackup \
         --volume "$root/postgres:/backup:ro" "$pg_image" /backup
@@ -1982,10 +2001,11 @@ archive_hold() {
     local action=${1:-list}; (($#)) && shift
     case $action in
         list)
-            psql_admin --command "SELECT id, store_key, id_scope, subject_type, subject_id, reason, created_by, created_at, released_at, released_by FROM oscar_retention_hold ORDER BY (released_at IS NULL) DESC, store_key, id_scope, created_at DESC;"
+            psql_admin --command "SELECT id, store_key, id_scope, subject_type, subject_id, resolution_mode, reason, created_by, created_at, released_at, released_by FROM oscar_retention_hold ORDER BY (released_at IS NULL) DESC, store_key, id_scope, created_at DESC;"
             ;;
         create)
             local subject_type='' subject_id='' reason='' created_by=${SUDO_USER:-${USER:-administrator}} hold_id safe_reason numeric_subject=0 generation_subject=00000000-0000-4000-8000-000000000000
+            local hold_result resolution_mode
             local store_key='' id_scope=''
             while (($#)); do
                 case $1 in
@@ -2012,54 +2032,67 @@ archive_hold() {
             safe_reason=${reason//\'/\'\'}
             [[ $subject_type == OBSERVATION ]] && numeric_subject=$subject_id
             [[ $subject_type == ARCHIVE_GENERATION ]] && generation_subject=$subject_id
-            hold_id=$(psql_admin --quiet --tuples-only --no-align --command "BEGIN;
+            # ID blocks are coarse for sparse/interleaved generations.  An
+            # exact hot row is authoritative; ranges are a cold-only fallback.
+            hold_result=$(psql_admin --quiet --tuples-only --no-align --command "BEGIN;
                 LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE;
                 WITH eligible AS (
-                    SELECT 1 WHERE
-                        ('$subject_type'='ARCHIVE_GENERATION' AND EXISTS (
+                    SELECT CASE
+                        WHEN '$subject_type'='ARCHIVE_GENERATION' AND EXISTS (
                             SELECT 1 FROM oscar_archive_generation
                             WHERE id='$generation_subject' AND store_key='$store_key' AND id_scope=$id_scope
                               AND state IN ('ACTIVE','SEALED')
-                        )) OR
-                        ('$subject_type'='OBSERVATION' AND
-                            (EXISTS (
-                                SELECT 1 FROM "$store_key" observation_row
-                                WHERE observation_row.id='$numeric_subject'::numeric
-                                  AND (observation_row.archivegenerationid IS NULL OR EXISTS (
-                                      SELECT 1 FROM oscar_archive_generation owner
-                                      WHERE owner.id=observation_row.archivegenerationid
-                                        AND owner.store_key='$store_key' AND owner.id_scope=$id_scope
-                                        AND owner.state IN ('ACTIVE','SEALED')
-                                  ))
-                            ) OR EXISTS (
-                                SELECT 1 FROM oscar_archive_id_block b
-                                JOIN oscar_archive_generation g ON g.id=b.generation_id
-                                WHERE '$numeric_subject'::numeric BETWEEN b.min_id AND b.max_id
-                                  AND g.store_key='$store_key' AND g.id_scope=$id_scope
-                                  AND g.state IN ('ACTIVE','SEALED')
-                            )) AND
-                            NOT EXISTS (
-                                SELECT 1 FROM oscar_archive_id_block b
-                                JOIN oscar_archive_generation g ON g.id=b.generation_id
-                                WHERE '$numeric_subject'::numeric BETWEEN b.min_id AND b.max_id
-                                  AND g.store_key='$store_key' AND g.id_scope=$id_scope
-                                  AND g.state IN ('DELETING','PURGED')
-                            ) AND NOT EXISTS (
+                        ) THEN 'GENERATION_EXACT'
+                        WHEN '$subject_type'='OBSERVATION' AND NOT EXISTS (
                                 SELECT 1 FROM oscar_tombstone
                                 WHERE subject_type='OBSERVATION' AND store_key='$store_key' AND id_scope=$id_scope
                                   AND subject_id='$subject_id'
-                            ))
+                            ) THEN CASE
+                                WHEN EXISTS (
+                                    SELECT 1 FROM \"$store_key\" any_hot_row
+                                    WHERE any_hot_row.id='$numeric_subject'::bigint
+                                ) THEN CASE WHEN EXISTS (
+                                        SELECT 1 FROM \"$store_key\" exact_hot_row
+                                        WHERE exact_hot_row.id='$numeric_subject'::bigint
+                                          AND (exact_hot_row.archivegenerationid IS NULL OR EXISTS (
+                                              SELECT 1 FROM oscar_archive_generation exact_owner
+                                              WHERE exact_owner.id=exact_hot_row.archivegenerationid
+                                                AND exact_owner.store_key='$store_key' AND exact_owner.id_scope=$id_scope
+                                                AND exact_owner.state IN ('ACTIVE','SEALED')
+                                          ))
+                                    ) THEN 'HOT_EXACT' END
+                                WHEN EXISTS (
+                                        SELECT 1 FROM oscar_archive_id_block active_block
+                                        JOIN oscar_archive_generation active_generation ON active_generation.id=active_block.generation_id
+                                        WHERE '$numeric_subject'::bigint BETWEEN active_block.min_id AND active_block.max_id
+                                          AND active_generation.store_key='$store_key' AND active_generation.id_scope=$id_scope
+                                          AND active_generation.state IN ('ACTIVE','SEALED')
+                                    ) AND NOT EXISTS (
+                                        SELECT 1 FROM oscar_archive_id_block retired_block
+                                        JOIN oscar_archive_generation retired_generation ON retired_generation.id=retired_block.generation_id
+                                        WHERE '$numeric_subject'::bigint BETWEEN retired_block.min_id AND retired_block.max_id
+                                          AND retired_generation.store_key='$store_key' AND retired_generation.id_scope=$id_scope
+                                          AND retired_generation.state IN ('DELETING','PURGED')
+                                    ) THEN 'COLD_RANGE_CONSERVATIVE'
+                            END
+                    END AS resolution_mode
                 ), inserted AS (
-                    INSERT INTO oscar_retention_hold(id,store_key,id_scope,subject_type,subject_id,reason,created_by)
-                    SELECT gen_random_uuid(),'$store_key',$id_scope,'$subject_type','$subject_id','$safe_reason','$created_by' FROM eligible
-                    RETURNING id
+                    INSERT INTO oscar_retention_hold(id,store_key,id_scope,subject_type,subject_id,resolution_mode,reason,created_by)
+                    SELECT gen_random_uuid(),'$store_key',$id_scope,'$subject_type','$subject_id',resolution_mode,'$safe_reason','$created_by'
+                      FROM eligible WHERE resolution_mode IS NOT NULL
+                    RETURNING id,resolution_mode
                 )
-                SELECT coalesce((SELECT id::text FROM inserted),'REJECTED');
-                COMMIT;" | tr -d '[:space:]')
-            [[ $hold_id != REJECTED ]] ||
+                SELECT coalesce((SELECT id::text||chr(9)||resolution_mode FROM inserted),'REJECTED');
+                COMMIT;" | tr -d '\r')
+            [[ $hold_result != REJECTED ]] ||
                 fail 'The hold target is unknown, already purged/tombstoned, or currently being deleted.'
+            IFS=$'\t' read -r hold_id resolution_mode <<<"$hold_result"
             valid_uuid "$hold_id" || fail 'PostgreSQL did not return a valid hold ID.'
-            printf 'Retention hold created: %s (store=%s, id-scope=%s)\n' "$hold_id" "$store_key" "$id_scope"
+            [[ $resolution_mode == GENERATION_EXACT || $resolution_mode == HOT_EXACT ||
+               $resolution_mode == COLD_RANGE_CONSERVATIVE ]] ||
+                fail 'PostgreSQL did not return a valid hold resolution mode.'
+            printf 'Retention hold created: %s (store=%s, id-scope=%s, resolution=%s)\n' \
+                "$hold_id" "$store_key" "$id_scope" "$resolution_mode"
             ;;
         release)
             local hold_id='' released_by=${SUDO_USER:-${USER:-administrator}}
@@ -2083,27 +2116,138 @@ archive_hold() {
     esac
 }
 
-archive_verify() {
+archive_verify() (
     require_configured
-    local partial_mode=${1:-allow-recent-partials} failures=0 relative expected actual path rows
+    local partial_mode=${1:-allow-recent-partials} failures=0 row_type generation kind object_count object_state
+    local relative expected generation_object_path generation_sha generation_manifest_path
+    local actual path catalog_sql catalog_snapshot catalog_after scratch
     [[ $partial_mode == allow-recent-partials || $partial_mode == reject-partials ]] ||
         fail "Unknown archive verification partial mode: $partial_mode"
-    rows=$(psql_admin --tuples-only --no-align --field-separator=$'\t' --command \
-        "SELECT relative_path, sha256 FROM oscar_archive_object WHERE state='ACTIVE' ORDER BY relative_path;")
-    while IFS=$'\t' read -r relative expected; do
-        [[ -n $relative ]] || continue
+    catalog_sql="WITH required(kind) AS (VALUES ('OBSERVATIONS_PARQUET'),('GENERATION_MANIFEST'),('DATASTREAM_SCHEMAS')),
+         required_rows AS (
+             SELECT 'REQUIRED'::text row_type, g.id::text generation_id, required.kind,
+                    count(o.generation_id) object_count, coalesce(min(o.state),'') object_state,
+                    coalesce(min(o.relative_path),'') relative_path, coalesce(min(o.sha256),'') object_sha,
+                    coalesce(g.object_path,'') generation_object_path,
+                    coalesce(g.sha256,'') generation_sha,
+                    coalesce(g.manifest_path,'') generation_manifest_path
+               FROM oscar_archive_generation g CROSS JOIN required
+               LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.kind=required.kind
+              WHERE g.state IN ('ACTIVE','SEALED')
+              GROUP BY g.id, required.kind, g.object_path, g.sha256, g.manifest_path
+         ), additional_rows AS (
+             SELECT 'ADDITIONAL'::text, g.id::text, coalesce(o.kind,''), 1::bigint, o.state,
+                    coalesce(o.relative_path,''), coalesce(o.sha256,''), coalesce(g.object_path,''),
+                    coalesce(g.sha256,''), coalesce(g.manifest_path,'')
+              FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id
+              WHERE o.state='ACTIVE'
+                AND g.state IN ('ACTIVE','SEALED')
+                AND (o.kind IS NULL OR o.kind NOT IN ('OBSERVATIONS_PARQUET','GENERATION_MANIFEST','DATASTREAM_SCHEMAS'))
+         ), invalid_owner_rows AS (
+             SELECT 'INVALID_OWNER'::text, g.id::text, coalesce(o.kind,''), 1::bigint, o.state,
+                    coalesce(o.relative_path,''), coalesce(o.sha256,''), coalesce(g.object_path,''),
+                    coalesce(g.sha256,''), coalesce(g.manifest_path,'')
+               FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id
+              WHERE o.state='ACTIVE' AND g.state NOT IN ('ACTIVE','SEALED')
+         ), integrity_rows AS (
+             SELECT 'RELATIONAL'::text, g.id::text, 'ID_BLOCK_AND_SCHEMAS'::text,
+                    (SELECT count(*) FROM oscar_archive_id_block block
+                      WHERE block.generation_id=g.id)::bigint,
+                    CASE WHEN (SELECT count(*) FROM oscar_archive_id_block block
+                                WHERE block.generation_id=g.id)=1
+                              AND EXISTS (SELECT 1 FROM oscar_archive_id_block block
+                                           WHERE block.generation_id=g.id
+                                             AND block.min_id=g.min_id AND block.max_id=g.max_id)
+                         THEN 'MATCH' ELSE 'MISMATCH' END,
+                    (SELECT count(*)::text FROM oscar_archive_schema schema_row
+                      WHERE schema_row.generation_id=g.id),
+                    ''::text, coalesce(g.object_path,''), coalesce(g.sha256,''),
+                    coalesce(g.manifest_path,'')
+               FROM oscar_archive_generation g
+              WHERE g.state IN ('ACTIVE','SEALED')
+         )
+         SELECT * FROM required_rows UNION ALL SELECT * FROM additional_rows
+         UNION ALL SELECT * FROM invalid_owner_rows
+         UNION ALL SELECT * FROM integrity_rows
+         ORDER BY generation_id, row_type, kind, relative_path, object_sha;"
+    umask 077
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-archive-verify.XXXXXX")
+    trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-archive-verify.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
+    catalog_snapshot=$scratch/catalog-before
+    catalog_after=$scratch/catalog-after
+    # One PostgreSQL statement provides a canonical catalog snapshot. Repeating
+    # it after hashing/filesystem reconciliation detects background activation
+    # and any concurrent purge without routinely stopping OSCAR.
+    psql_admin --tuples-only --no-align --field-separator=$'\x1f' --command "$catalog_sql" \
+        >"$catalog_snapshot"
+    while IFS=$'\x1f' read -r row_type generation kind object_count object_state relative expected \
+        generation_object_path generation_sha generation_manifest_path; do
+        [[ -n $generation ]] || continue
+        case $row_type in
+            REQUIRED)
+                if ! valid_uuid "$generation" ||
+                   [[ $kind != OBSERVATIONS_PARQUET && $kind != GENERATION_MANIFEST && $kind != DATASTREAM_SCHEMAS ]] ||
+                   [[ $object_count != 1 || $object_state != ACTIVE || ! $expected =~ ^[0-9a-f]{64}$ ||
+                      -z $generation_object_path || ! $generation_sha =~ ^[0-9a-f]{64}$ ||
+                      -z $generation_manifest_path ]] ||
+                   [[ $kind == OBSERVATIONS_PARQUET &&
+                      ($relative != "$generation_object_path" || $expected != "$generation_sha") ]] ||
+                   [[ $kind == GENERATION_MANIFEST && $relative != "$generation_manifest_path" ]]; then
+                    printf 'Incomplete query-visible archive generation: generation=%s kind=%s count=%s state=%s\n' \
+                        "$generation" "$kind" "$object_count" "$object_state" >&2
+                    failures=$((failures+1))
+                    continue
+                fi
+                ;;
+            ADDITIONAL)
+                if ! valid_uuid "$generation" || [[ -z $kind || $object_count != 1 ||
+                   $object_state != ACTIVE || ! $expected =~ ^[0-9a-f]{64}$ ]]; then
+                    printf 'Unsafe additional archive catalog row: generation=%s kind=%s\n' \
+                        "$generation" "$kind" >&2
+                    failures=$((failures+1))
+                    continue
+                fi
+                ;;
+            INVALID_OWNER)
+                printf 'Active archive object belongs to a non-query-visible generation: generation=%s kind=%s\n' \
+                    "$generation" "$kind" >&2
+                failures=$((failures+1))
+                continue
+                ;;
+            RELATIONAL)
+                if ! valid_uuid "$generation" || [[ $kind != ID_BLOCK_AND_SCHEMAS ||
+                   $object_count != 1 || $object_state != MATCH ||
+                   ! $relative =~ ^[1-9][0-9]*$ ]]; then
+                    printf 'Invalid archive relational metadata: generation=%s blocks=%s bounds=%s schemas=%s\n' \
+                        "$generation" "$object_count" "$object_state" "$relative" >&2
+                    failures=$((failures+1))
+                fi
+                continue
+                ;;
+            *)
+                printf 'Unsafe archive catalog snapshot row type: %s\n' "$row_type" >&2
+                failures=$((failures+1))
+                continue
+                ;;
+        esac
         if ! path=$(archive_object_path "$relative" false); then failures=$((failures+1)); continue; fi
         actual=$(sha256_file "$path")
         if [[ $actual != "$expected" ]]; then printf 'Checksum mismatch: %s\n' "$relative" >&2; failures=$((failures+1)); fi
-    done <<<"$rows"
+    done <"$catalog_snapshot"
     if [[ $partial_mode == reject-partials ]]; then
         audit_archive_filesystem true
     else
         audit_archive_filesystem false
     fi
+    psql_admin --tuples-only --no-align --field-separator=$'\x1f' --command "$catalog_sql" \
+        >"$catalog_after"
+    if ! cmp -s "$catalog_snapshot" "$catalog_after"; then
+        printf 'Archive catalog changed during verification; no stable result was certified. Re-run archive verify.\n' >&2
+        failures=$((failures+1))
+    fi
     ((failures == 0)) || fail "$failures archive object verification failures"
-    printf 'All cataloged active archive objects passed checksum verification.\n'
-}
+    printf 'Every query-visible generation has exact ID-block bounds, schema rows, one required active object of each kind, and valid checksums.\n'
+)
 
 archive_dry_run() {
     require_admin; require_configured
@@ -2135,7 +2279,7 @@ archive_dry_run() {
                         (h.subject_type='OBSERVATION' AND h.subject_id ~ '^[0-9]+$' AND EXISTS (
                             SELECT 1 FROM oscar_archive_id_block held_block
                              WHERE held_block.generation_id=g.id
-                               AND h.subject_id::numeric BETWEEN held_block.min_id AND held_block.max_id)))) AS held
+                               AND h.subject_id::bigint BETWEEN held_block.min_id AND held_block.max_id)))) AS held
             FROM oscar_archive_generation g
             LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.state='ACTIVE'
             WHERE g.store_key='$store_key' AND g.id_scope=$id_scope
@@ -2250,7 +2394,7 @@ archive_purge() (
                 (h.subject_type='OBSERVATION' AND h.subject_id ~ '^[0-9]+$' AND EXISTS (
                     SELECT 1 FROM oscar_archive_id_block held_block
                      WHERE held_block.generation_id=g.id
-                       AND h.subject_id::numeric BETWEEN held_block.min_id AND held_block.max_id))));
+                       AND h.subject_id::bigint BETWEEN held_block.min_id AND held_block.max_id))));
         SELECT 1 / CASE WHEN EXISTS (
             SELECT 1 FROM oscar_deletion_plan_item i
             JOIN oscar_deletion_plan p ON p.id=i.plan_id

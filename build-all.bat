@@ -22,7 +22,7 @@ call npm run test:component || goto viewer_build_failed
 call npm run build || goto viewer_build_failed
 popd
 
-call gradlew.bat --no-parallel :sensorhub-datastore-postgis:test --tests org.sensorhub.impl.datastore.postgis.TestTieredArchiveConfiguration --tests org.sensorhub.impl.datastore.postgis.TestParquetArchiveReader --tests org.sensorhub.impl.datastore.postgis.archive.TestArchiveLifecycleInvariants --tests org.sensorhub.impl.datastore.postgis.database.TestOscarTieredModuleProvider --tests org.sensorhub.impl.datastore.postgis.TestParameterizedQueryBuilder || exit /b 1
+call gradlew.bat --no-parallel :sensorhub-datastore-postgis:test --tests org.sensorhub.impl.datastore.postgis.TestTieredArchiveConfiguration --tests org.sensorhub.impl.datastore.postgis.TestParquetArchiveReader --tests org.sensorhub.impl.datastore.postgis.archive.TestDuckDbResourcePolicy --tests org.sensorhub.impl.datastore.postgis.archive.TestArchiveLifecycleInvariants --tests org.sensorhub.impl.datastore.postgis.database.TestOscarTieredModuleProvider --tests org.sensorhub.impl.datastore.postgis.TestParameterizedQueryBuilder || exit /b 1
 
 call gradlew.bat --no-parallel :sensorhub-service-oscar:test :sensorhub-service-bucket:test :sensorhub-service-dailyfile-journal:test :sensorhub-system-lane:test || exit /b 1
 

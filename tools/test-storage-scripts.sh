@@ -53,6 +53,57 @@ sh -n "$archive_validator"
 sh -n "$archive_object_helper"
 sh -n "$oscar_entrypoint"
 
+# The release directory is part of every destructive containment decision.
+# Resolve directory aliases physically and reject a launcher-file alias before
+# reading deployment configuration.
+release_physical="$test_root/release-physical"
+release_alias="$test_root/release-alias"
+mkdir -p "$release_physical"
+cp "$shell_script" "$repo_root/dist/release/.env.example" "$release_physical/"
+ln -s "$release_physical" "$release_alias"
+resolved_release=$(bash -c '
+    storage_script=$1
+    set -- help
+    source "$storage_script" >/dev/null
+    printf "%s" "$script_dir"
+' _ "$release_alias/oscar-storage.sh")
+[[ $resolved_release == "$(CDPATH= cd -- "$release_physical" && pwd -P)" ]] || {
+    printf 'Bash storage launcher did not canonicalize its release directory.\n' >&2
+    exit 1
+}
+if bash -c '
+    storage_script=$1
+    set -- help
+    source "$storage_script" >/dev/null
+    validate_storage_path_shape TEST_ROOT "$script_dir/nested/archive"
+' _ "$release_alias/oscar-storage.sh" >/dev/null 2>&1; then
+    printf 'Bash storage containment accepted a root hidden inside a release-directory alias.\n' >&2
+    exit 1
+fi
+ln -s "$release_physical/oscar-storage.sh" "$test_root/oscar-storage-link.sh"
+if bash "$test_root/oscar-storage-link.sh" help >/dev/null 2>&1; then
+    printf 'Bash storage launcher accepted a symlinked launcher file.\n' >&2
+    exit 1
+fi
+
+assert_contains 'pwd -P' "$shell_script"
+assert_contains 'regular, non-symlink file' "$shell_script"
+assert_contains 'Assert-NoReparseComponents \$StorageScriptPath' "$powershell_script"
+assert_contains 'Resolve-PhysicalContainmentPath \$ScriptRoot' "$powershell_script"
+
+if command -v pwsh >/dev/null 2>&1; then
+    release_ps_physical="$test_root/release-ps-physical"
+    release_ps_alias="$test_root/release-ps-alias"
+    mkdir -p "$release_ps_physical"
+    cp "$powershell_script" "$repo_root/dist/release/.env.example" "$release_ps_physical/"
+    ln -s "$release_ps_physical" "$release_ps_alias"
+    pwsh -NoLogo -NoProfile -File "$release_ps_physical/oscar-storage.ps1" -Command help >/dev/null
+    if pwsh -NoLogo -NoProfile -File "$release_ps_alias/oscar-storage.ps1" -Command help >/dev/null 2>&1; then
+        printf 'PowerShell storage launcher accepted a reparse/symlink release alias.\n' >&2
+        exit 1
+    fi
+fi
+
 # Every tar-validator container is otherwise read-only and must receive the
 # same bounded, private scratch mount. Keep TMPDIR pinned so a future image
 # environment cannot redirect validator writes outside that mount.
@@ -135,6 +186,7 @@ assert_contains 'cannot be accepted as an authenticated \$required_release_versi
 assert_contains 'required_release_version=\$\(awk .*OSCAR_VERSION' "$shell_script"
 assert_contains 'validate_backup_archive_members' "$shell_script"
 assert_contains '^[[:space:]]+archive_verify reject-partials$' "$shell_script"
+assert_contains 'tar .*--exclude="\./duckdb-tmp"' "$shell_script"
 assert_contains 'validate_image_inventory "\$root" true' "$shell_script"
 assert_contains 'acquire_storage_admin_lock' "$shell_script"
 assert_contains 'Darwin\) lock_directory=/private/var/run/oscar-storage' "$shell_script"
@@ -153,12 +205,38 @@ assert_contains 'validate_storage_directories' "$shell_script"
 assert_contains 'prepare_restored_credentials_exact' "$shell_script"
 assert_contains 'install_prepared_credentials_exact' "$shell_script"
 assert_contains 'INSERT INTO oscar_retention_hold\(id,store_key,id_scope' "$shell_script"
+assert_contains 'resolution_mode' "$shell_script"
+assert_contains "THEN 'GENERATION_EXACT'" "$shell_script"
+assert_contains "THEN 'HOT_EXACT'" "$shell_script"
+assert_contains "THEN 'COLD_RANGE_CONSERVATIVE'" "$shell_script"
+assert_contains 'FROM \\"\$store_key\\" any_hot_row' "$shell_script"
+assert_contains 'FROM \\"\$store_key\\" exact_hot_row' "$shell_script"
+assert_contains 'oscar_archive_id_block retired_block' "$shell_script"
+assert_contains 'maximum=9223372036854775807' "$shell_script"
 assert_contains 'INSERT INTO oscar_deletion_plan\(id, store_key, id_scope' "$shell_script"
 assert_contains 'JOIN oscar_deletion_plan p ON p\.id=i\.plan_id' "$shell_script"
 assert_contains 'g\.store_key=p\.store_key AND g\.id_scope=p\.id_scope' "$shell_script"
 assert_contains 'ON CONFLICT \(subject_type,store_key,id_scope,subject_id\)' "$shell_script"
 assert_contains 'archive purge --store-key %s --id-scope %s' "$shell_script"
+assert_contains "VALUES \('OBSERVATIONS_PARQUET'\),\('GENERATION_MANIFEST'\),\('DATASTREAM_SCHEMAS'\)" "$shell_script"
+assert_contains "g\.state IN \('ACTIVE','SEALED'\)" "$shell_script"
+assert_contains '\$object_count != 1 \|\| \$object_state != ACTIVE' "$shell_script"
+assert_contains '\$relative != "\$generation_object_path" \|\| \$expected != "\$generation_sha"' "$shell_script"
+assert_contains '\$kind == GENERATION_MANIFEST && \$relative != "\$generation_manifest_path"' "$shell_script"
+assert_contains 'Archive catalog changed during verification' "$shell_script"
+assert_contains 'SELECT \* FROM required_rows UNION ALL SELECT \* FROM additional_rows' "$shell_script"
+assert_contains 'UNION ALL SELECT \* FROM invalid_owner_rows' "$shell_script"
+assert_contains "WHERE o\.state='ACTIVE' AND g\.state NOT IN \('ACTIVE','SEALED'\)" "$shell_script"
+assert_contains "--field-separator=\\\$'\\\\x1f'" "$shell_script"
+assert_contains 'ID_BLOCK_AND_SCHEMAS' "$shell_script"
+assert_contains 'block\.min_id=g\.min_id AND block\.max_id=g\.max_id' "$shell_script"
+assert_contains '! \$relative =~ \^\[1-9\]\[0-9\]\*\$' "$shell_script"
+assert_contains '\$fields\[4\] -cne .MATCH.' "$powershell_script"
+assert_contains 'block\.min_id=g\.min_id AND block\.max_id=g\.max_id' "$powershell_script"
+assert_contains '\$fields\[5\] -cnotmatch .\^\[1-9\]\[0-9\]\*\$.' "$powershell_script"
 assert_not_contains 'h\.subject_id::numeric BETWEEN g\.min_id AND g\.max_id' "$shell_script"
+assert_not_contains 'h\.subject_id::numeric BETWEEN held_block\.min_id AND held_block\.max_id' "$shell_script"
+assert_not_contains "numeric_subject'::numeric" "$shell_script"
 assert_contains 'assert_deployment_volume_ownership "\$adopt_legacy_volumes"' "$setup_shell_script"
 assert_contains 'require_upgrade_environment_keys' "$setup_shell_script"
 assert_contains 'ensure_fresh_init_volumes' "$setup_shell_script"
@@ -1348,18 +1426,25 @@ bash -c '
     exit 1
 }
 
-# The authenticated generation set is canonical, bounded, and independent of
-# later live-catalog drift. Reject aliases/order changes before constructing SQL.
+# The authenticated generation inventory is canonical, bounded, and independent
+# of later live-catalog drift. Its SQL receipt is only count/hash/bytes; UUIDs
+# remain in the checksummed file and are never materialized into a SQL literal.
 generation_inventory_fixture="$test_root/generation-inventory-bash"
 mkdir -p "$generation_inventory_fixture"
 cp "$acceptance_root/archive-generation-ids.txt" "$generation_inventory_fixture/archive-generation-ids.txt"
+generation_inventory_sha=$(sha256_path "$generation_inventory_fixture/archive-generation-ids.txt")
+bash -c '
+    storage_script=$1; root=$2; expected_sha=$3
+    set -- help; source "$storage_script" >/dev/null
+    [[ $(validate_archive_generation_inventory "$root") == "2|$expected_sha|74" ]]
+' _ "$shell_script" "$generation_inventory_fixture" "$generation_inventory_sha"
+: >"$generation_inventory_fixture/archive-generation-ids.txt"
 bash -c '
     storage_script=$1; root=$2
     set -- help; source "$storage_script" >/dev/null
-    expected="'"'"'{11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222}'"'"'::uuid[]"
-    [[ $(archive_generation_ids_sql "$root") == "$expected" ]]
+    [[ $(validate_archive_generation_inventory "$root") == "0|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|0" ]]
 ' _ "$shell_script" "$generation_inventory_fixture"
-for invalid_inventory in duplicate unsorted uppercase unterminated; do
+for invalid_inventory in duplicate unsorted uppercase unterminated crlf bom; do
     case $invalid_inventory in
         duplicate)
             printf '%s\n%s\n' 11111111-1111-4111-8111-111111111111 11111111-1111-4111-8111-111111111111 \
@@ -1371,6 +1456,10 @@ for invalid_inventory in duplicate unsorted uppercase unterminated; do
             printf '%s\n' AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
         unterminated)
             printf '%s' 11111111-1111-4111-8111-111111111111 >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
+        crlf)
+            printf '%s\r\n' 11111111-1111-4111-8111-111111111111 >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
+        bom)
+            printf '\357\273\277%s\n' 11111111-1111-4111-8111-111111111111 >"$generation_inventory_fixture/archive-generation-ids.txt" ;;
     esac
     if bash -c '
         storage_script=$1; root=$2
@@ -1381,6 +1470,27 @@ for invalid_inventory in duplicate unsorted uppercase unterminated; do
         exit 1
     fi
 done
+
+# A nontrivial inventory proves bounded streaming across many read buffers. An
+# oversized sparse file proves the advertised 37 MB ceiling is checked before
+# any record scan or hash operation.
+awk 'BEGIN { for (i=0; i<10000; i++) printf "00000000-0000-4000-8000-%012d\n", i }' \
+    >"$generation_inventory_fixture/archive-generation-ids.txt"
+large_inventory_sha=$(sha256_path "$generation_inventory_fixture/archive-generation-ids.txt")
+bash -c '
+    storage_script=$1; root=$2; expected_sha=$3
+    set -- help; source "$storage_script" >/dev/null
+    [[ $(validate_archive_generation_inventory "$root") == "10000|$expected_sha|370000" ]]
+' _ "$shell_script" "$generation_inventory_fixture" "$large_inventory_sha"
+dd if=/dev/null of="$generation_inventory_fixture/archive-generation-ids.txt" bs=1 seek=37000001 2>/dev/null
+if bash -c '
+    storage_script=$1; root=$2
+    set -- help; source "$storage_script" >/dev/null
+    validate_archive_generation_inventory "$root"
+' _ "$shell_script" "$generation_inventory_fixture" >/dev/null 2>&1; then
+    printf 'Bash accepted an archive-generation inventory above 37,000,000 bytes.\n' >&2
+    exit 1
+fi
 cp "$acceptance_root/archive-generation-ids.txt" "$generation_inventory_fixture/archive-generation-ids.txt"
 
 # No failure before immutable-core acceptance may reach the live daily-journal
@@ -1416,8 +1526,12 @@ bash -c '
 ' _ "$shell_script" "$acceptance_root" "$acceptance_id" "$test_root/acceptance/catalog-sql" >/dev/null 2>&1
 grep -Fq "oscar_backup_epoch.state IN ('CREATED','VERIFIED')" "$test_root/acceptance/catalog-sql" &&
 grep -Fq 'postgres_lsn IS NOT DISTINCT FROM EXCLUDED.postgres_lsn' "$test_root/acceptance/catalog-sql" &&
-grep -Fq 'archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids' "$test_root/acceptance/catalog-sql" &&
-grep -Fq "'{11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222}'::uuid[]" "$test_root/acceptance/catalog-sql" &&
+grep -Fq 'archive_generation_count IS NOT DISTINCT FROM EXCLUDED.archive_generation_count' "$test_root/acceptance/catalog-sql" &&
+grep -Fq 'archive_generation_inventory_sha256 IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_sha256' "$test_root/acceptance/catalog-sql" &&
+grep -Fq 'archive_generation_inventory_bytes IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_bytes' "$test_root/acceptance/catalog-sql" &&
+grep -Fq ",2,'$generation_inventory_sha',74," "$test_root/acceptance/catalog-sql" &&
+! grep -Fq 'archive_generation_ids' "$test_root/acceptance/catalog-sql" &&
+! grep -Fq '11111111-1111-4111-8111-111111111111' "$test_root/acceptance/catalog-sql" &&
 ! grep -Fq 'FROM oscar_archive_generation' "$test_root/acceptance/catalog-sql" &&
 grep -Fq 'sha256 IS NOT DISTINCT FROM EXCLUDED.sha256' "$test_root/acceptance/catalog-sql" || {
     printf 'Bash VERIFIED epoch upsert is not bound to the authenticated backup-time generation set.\n' >&2
@@ -1504,16 +1618,242 @@ grep -Fq -- '--volume oscar_oscar_state:/var/lib/oscar' "$journal_isolation_capt
 }
 wait "$lock_holder"
 
+# Archive verification must enumerate the Cartesian set of every query-visible
+# generation and every required object kind. Missing and duplicate catalog
+# objects must fail before an apparently healthy subset can be checksummed.
+archive_completeness_fixture="$test_root/archive-completeness-bash"
+mkdir -p "$archive_completeness_fixture"
+printf 'object\n' >"$archive_completeness_fixture/object"
+archive_fixture_sha=$(sha256_path "$archive_completeness_fixture/object")
+bash -c '
+    storage_script=$1; fixture=$2; fixture_sha=$3; mode=$4
+    set -- help; source "$storage_script" >/dev/null
+    require_configured() { :; }
+    psql_admin() {
+        local query=${!#}
+        [[ $query == *"CROSS JOIN required"* ]] || return 0
+        [[ $query == *"g.state IN"* ]] || return 44
+        local generation=12345678-1234-4234-8234-123456789abc
+        case $mode in
+            valid)
+                printf "REQUIRED\037%s\037OBSERVATIONS_PARQUET\0371\037ACTIVE\037datasets/a.parquet\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                printf "REQUIRED\037%s\037GENERATION_MANIFEST\0371\037ACTIVE\037datasets/a.manifest.json\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                printf "REQUIRED\037%s\037DATASTREAM_SCHEMAS\0371\037ACTIVE\037datasets/a.schemas.json.gz\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                printf "ADDITIONAL\037%s\037AUDIT_SIDECAR\0371\037ACTIVE\037datasets/a.audit\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                printf "RELATIONAL\037%s\037ID_BLOCK_AND_SCHEMAS\0371\037MATCH\0371\037\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha"
+                ;;
+            missing)
+                printf "REQUIRED\037%s\037OBSERVATIONS_PARQUET\0371\037ACTIVE\037datasets/a.parquet\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                printf "REQUIRED\037%s\037GENERATION_MANIFEST\0370\037MISSING\037missing\037bad\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha"
+                printf "REQUIRED\037%s\037DATASTREAM_SCHEMAS\0371\037ACTIVE\037datasets/a.schemas.json.gz\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                ;;
+            duplicate)
+                printf "REQUIRED\037%s\037OBSERVATIONS_PARQUET\0372\037ACTIVE\037datasets/a.parquet\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                printf "REQUIRED\037%s\037GENERATION_MANIFEST\0371\037ACTIVE\037datasets/a.manifest.json\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                printf "REQUIRED\037%s\037DATASTREAM_SCHEMAS\0371\037ACTIVE\037datasets/a.schemas.json.gz\037%s\037datasets/a.parquet\037%s\037datasets/a.manifest.json\n" "$generation" "$fixture_sha" "$fixture_sha"
+                ;;
+        esac
+    }
+    archive_object_path() { printf "%s/object" "$fixture"; }
+    sha256_file() { printf "%s" "$fixture_sha"; }
+    audit_archive_filesystem() { :; }
+    archive_verify
+' _ "$shell_script" "$archive_completeness_fixture" "$archive_fixture_sha" valid >/dev/null
+for invalid_mode in missing duplicate stale-path stale-hash relational inactive-owner; do
+    if bash -c '
+        storage_script=$1; fixture=$2; fixture_sha=$3; mode=$4
+        set -- help; source "$storage_script" >/dev/null
+        require_configured() { :; }
+        psql_admin() {
+            local query=${!#}
+            [[ $query == *"CROSS JOIN required"* ]] || return 0
+            local generation=12345678-1234-4234-8234-123456789abc
+            local parquet_count=1 parquet_path=datasets/a.parquet generation_path=datasets/a.parquet generation_sha=$fixture_sha
+            if [[ $mode == inactive-owner ]]; then
+                printf "INVALID_OWNER\037%s\037AUDIT_SIDECAR\0371\037ACTIVE\037datasets/a.audit\037%s\037\037\037\n" \
+                    "$generation" "$fixture_sha"
+                return
+            fi
+            [[ $mode == duplicate ]] && parquet_count=2
+            [[ $mode == stale-path ]] && generation_path=datasets/stale.parquet
+            [[ $mode == stale-hash ]] && generation_sha=$(printf "%064d" 0 | tr 0 b)
+            printf "REQUIRED\037%s\037OBSERVATIONS_PARQUET\037%s\037ACTIVE\037%s\037%s\037%s\037%s\037datasets/a.manifest.json\n" \
+                "$generation" "$parquet_count" "$parquet_path" "$fixture_sha" "$generation_path" "$generation_sha"
+            if [[ $mode == missing ]]; then
+                printf "REQUIRED\037%s\037GENERATION_MANIFEST\0370\037MISSING\037missing\037bad\037%s\037%s\037datasets/a.manifest.json\n" \
+                    "$generation" "$generation_path" "$generation_sha"
+            else
+                printf "REQUIRED\037%s\037GENERATION_MANIFEST\0371\037ACTIVE\037datasets/a.manifest.json\037%s\037%s\037%s\037datasets/a.manifest.json\n" \
+                    "$generation" "$fixture_sha" "$generation_path" "$generation_sha"
+            fi
+            printf "REQUIRED\037%s\037DATASTREAM_SCHEMAS\0371\037ACTIVE\037datasets/a.schemas.json.gz\037%s\037%s\037%s\037datasets/a.manifest.json\n" \
+                "$generation" "$fixture_sha" "$generation_path" "$generation_sha"
+            if [[ $mode == relational ]]; then
+                printf "RELATIONAL\037%s\037ID_BLOCK_AND_SCHEMAS\0372\037MISMATCH\0370\037\037%s\037%s\037datasets/a.manifest.json\n" \
+                    "$generation" "$generation_path" "$generation_sha"
+            fi
+        }
+        archive_object_path() { printf "%s/object" "$fixture"; }
+        sha256_file() { printf "%s" "$fixture_sha"; }
+        audit_archive_filesystem() { :; }
+        archive_verify
+    ' _ "$shell_script" "$archive_completeness_fixture" "$archive_fixture_sha" "$invalid_mode" >/dev/null 2>&1; then
+        printf 'Bash archive verification accepted a %s required-object catalog.\n' "$invalid_mode" >&2
+        exit 1
+    fi
+done
+
+# A stable first snapshot is not enough while the live archiver can activate a
+# generation. Adding or removing a canonical row set between the pre/post
+# snapshots must fail, covering both publication and purge races.
+for change_mode in activation purge; do
+    if bash -c '
+        storage_script=$1; fixture=$2; fixture_sha=$3; mode=$4
+        set -- help; source "$storage_script" >/dev/null
+        require_configured() { :; }
+        counter=$fixture/catalog-$mode.count
+        rm -f -- "$counter"
+        emit_generation() {
+            local generation=$1 prefix=$2
+            printf "REQUIRED\037%s\037OBSERVATIONS_PARQUET\0371\037ACTIVE\037datasets/%s.parquet\037%s\037datasets/%s.parquet\037%s\037datasets/%s.manifest.json\n" \
+                "$generation" "$prefix" "$fixture_sha" "$prefix" "$fixture_sha" "$prefix"
+            printf "REQUIRED\037%s\037GENERATION_MANIFEST\0371\037ACTIVE\037datasets/%s.manifest.json\037%s\037datasets/%s.parquet\037%s\037datasets/%s.manifest.json\n" \
+                "$generation" "$prefix" "$fixture_sha" "$prefix" "$fixture_sha" "$prefix"
+            printf "REQUIRED\037%s\037DATASTREAM_SCHEMAS\0371\037ACTIVE\037datasets/%s.schemas.json.gz\037%s\037datasets/%s.parquet\037%s\037datasets/%s.manifest.json\n" \
+                "$generation" "$prefix" "$fixture_sha" "$prefix" "$fixture_sha" "$prefix"
+            printf "RELATIONAL\037%s\037ID_BLOCK_AND_SCHEMAS\0371\037MATCH\0371\037\037datasets/%s.parquet\037%s\037datasets/%s.manifest.json\n" \
+                "$generation" "$prefix" "$fixture_sha" "$prefix"
+        }
+        psql_admin() {
+            local query=${!#} call=0
+            [[ $query == *"CROSS JOIN required"* ]] || return 0
+            [[ -f $counter ]] && call=$(<"$counter")
+            call=$((call+1)); printf "%s" "$call" >"$counter"
+            if [[ $mode == activation || $call == 1 ]]; then
+                emit_generation 12345678-1234-4234-8234-123456789abc a
+            fi
+            if [[ $mode == activation && $call -gt 1 ]]; then
+                emit_generation 87654321-4321-4234-8234-cba987654321 b
+            fi
+        }
+        archive_object_path() { printf "%s/object" "$fixture"; }
+        sha256_file() { printf "%s" "$fixture_sha"; }
+        audit_archive_filesystem() { :; }
+        archive_verify
+    ' _ "$shell_script" "$archive_completeness_fixture" "$archive_fixture_sha" "$change_mode" >/dev/null 2>&1; then
+        printf 'Bash archive verification accepted a concurrent catalog %s.\n' "$change_mode" >&2
+        exit 1
+    fi
+done
+
+# Observation IDs are persisted and indexed as signed BIGINT. Reject decimal
+# values outside that exact domain before interpolating a typed SQL literal.
+if ! bash -c '
+    storage_script=$1; set -- help; source "$storage_script" >/dev/null
+    valid_observation_id 1 && valid_observation_id 9223372036854775807 &&
+        ! valid_observation_id 0 && ! valid_observation_id 9223372036854775808 &&
+        ! valid_observation_id 9999999999999999999
+' _ "$shell_script"; then
+    printf 'Bash observation-ID validation does not enforce the positive signed-BIGINT domain.\n' >&2
+    exit 1
+fi
+
 # Both retention-hold selector forms must survive Bash's AND/OR precedence.
 bash -c '
     storage_script=$1; set -- help; source "$storage_script" >/dev/null
     require_admin() { :; }; require_configured() { :; }
-    psql_admin() { printf "%s\n" 87654321-4321-4234-8234-cba987654321; }
+    psql_admin() {
+        local query=${!#} mode=HOT_EXACT
+        [[ $query == *"'ARCHIVE_GENERATION'='ARCHIVE_GENERATION'"* ]] && mode=GENERATION_EXACT
+        printf "87654321-4321-4234-8234-cba987654321\t%s\n" "$mode"
+    }
     archive_hold create --store-key observations --id-scope 1 \
         --generation 12345678-1234-4234-8234-123456789abc --reason test --created-by tester
     archive_hold create --store-key observations --id-scope 1 \
         --observation 42 --reason test --created-by tester
 ' _ "$shell_script" >/dev/null
+
+# Observation IDs are global only within a store/scope and archive ID blocks
+# are coarse min/max indexes.  With eligible and ineligible streams
+# interleaved, a sparse retired generation can therefore span an unrelated
+# exact hot row.  Exact row state is authoritative; only a cold-only lookup
+# may use the conservative range fallback.
+hold_sql_capture="$test_root/observation-hold.sql"
+bash -c '
+    storage_script=$1; capture=$2
+    set -- help; source "$storage_script" >/dev/null
+    require_admin() { :; }; require_configured() { :; }
+    psql_admin() {
+        local query=${!#}
+        printf "%s\n" "$query" >"$capture"
+        printf "87654321-4321-4234-8234-cba987654321\tHOT_EXACT\n"
+    }
+    archive_hold create --store-key observations --id-scope 4 \
+        --observation 102 --reason interleaved-test --created-by tester
+' _ "$shell_script" "$hold_sql_capture" >/dev/null
+hold_sql=$(LC_ALL=C tr '\n\r\t' '   ' <"$hold_sql_capture" | tr -s '[:space:]' ' ')
+assert_ordered_hold_terms() {
+    local remainder=$1 term
+    shift
+    for term in "$@"; do
+        [[ $remainder == *"$term"* ]] || {
+            printf 'Observation-hold SQL is missing or misorders its exact/range precedence term: %s\n' "$term" >&2
+            exit 1
+        }
+        remainder=${remainder#*"$term"}
+    done
+}
+assert_ordered_hold_terms "$hold_sql" \
+    'SELECT 1 FROM oscar_tombstone' \
+    'THEN CASE' \
+    'SELECT 1 FROM "observations" any_hot_row' \
+    'THEN CASE WHEN EXISTS (' \
+    'SELECT 1 FROM "observations" exact_hot_row' \
+    'SELECT 1 FROM oscar_archive_generation exact_owner' \
+    "exact_owner.state IN ('ACTIVE','SEALED')" \
+    "THEN 'HOT_EXACT'" \
+    'WHEN EXISTS (' \
+    'SELECT 1 FROM oscar_archive_id_block active_block' \
+    'AND NOT EXISTS (' \
+    'SELECT 1 FROM oscar_archive_id_block retired_block' \
+    "THEN 'COLD_RANGE_CONSERVATIVE'" \
+    'END AS resolution_mode'
+[[ $hold_sql != *"::numeric"* &&
+   $(grep -o -- "::bigint" <<<"$hold_sql" | wc -l | tr -d ' ') == 4 ]] || {
+    printf 'Observation-hold SQL does not preserve bigint index operands.\n' >&2
+    exit 1
+}
+
+observation_hold_fixture_mode() {
+    local exact_present=$1 exact_eligible=$2 active_range=$3 retired_range=$4 tombstoned=$5
+    ((tombstoned == 0)) || { printf REJECTED; return; }
+    if ((exact_present == 1)); then
+        ((exact_eligible == 1)) && printf HOT_EXACT || printf REJECTED
+    else
+        ((active_range == 1 && retired_range == 0)) && printf COLD_RANGE_CONSERVATIVE || printf REJECTED
+    fi
+}
+assert_observation_hold_fixture() {
+    local name=$1 expected=$2 actual
+    shift 2
+    actual=$(observation_hold_fixture_mode "$@")
+    [[ $actual == "$expected" ]] || {
+        printf 'Observation-hold sparse/interleaved fixture failed: %s (expected=%s actual=%s)\n' \
+            "$name" "$expected" "$actual" >&2
+        exit 1
+    }
+}
+# A retired generation contains sparse IDs 100/104, so its [100,104] block
+# also spans unrelated exact rows 102/103 and an ambiguous cold-only ID 101.
+assert_observation_hold_fixture exact-hot-over-retired-range HOT_EXACT 1 1 1 1 0
+assert_observation_hold_fixture exact-active-owned-over-retired-range HOT_EXACT 1 1 1 1 0
+assert_observation_hold_fixture exact-sealed-owned-over-retired-range HOT_EXACT 1 1 1 1 0
+assert_observation_hold_fixture exact-retired-owned REJECTED 1 0 1 1 0
+assert_observation_hold_fixture cold-active-retired-ambiguous REJECTED 0 0 1 1 0
+assert_observation_hold_fixture cold-active-only COLD_RANGE_CONSERVATIVE 0 0 1 0 0
+assert_observation_hold_fixture cold-retired-only REJECTED 0 0 0 1 0
+assert_observation_hold_fixture exact-hot-tombstoned REJECTED 1 1 1 1 1
+assert_observation_hold_fixture unknown REJECTED 0 0 0 0 0
 
 # A purge object list is a here-string. Commands inside that loop must not
 # inherit it as stdin, or the first Docker/psql child can consume the remaining
@@ -1881,6 +2221,25 @@ if command -v pwsh >/dev/null 2>&1; then
                 $env:STORAGE_SCRIPT_PATH, [ref]$null, [ref]$parseErrors)
             if ($parseErrors.Count) { throw ($parseErrors -join "`n") }
             . $env:STORAGE_SCRIPT_PATH -Command help *> $null
+            $validObject = "datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet"
+            if (-not (Test-ArchiveObjectPath $validObject)) {
+                throw "PowerShell rejected an approved archive object path"
+            }
+            if (Test-ArchiveObjectPath "foreign/file") {
+                throw "PowerShell accepted an archive catalog path outside the approved layout"
+            }
+            & {
+                function Write-PsqlLinesToFile([string]$Sql, [string]$Path) {
+                    [IO.File]::WriteAllText($Path, "foreign/file`n", $Utf8NoBom)
+                }
+                $invalidCatalog = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "invalid-catalog-paths.txt"
+                try {
+                    Write-RegisteredArchivePaths $invalidCatalog
+                    throw "PowerShell accepted an absent catalog object outside the approved layout"
+                } catch {
+                    if ($_.Exception.Message -eq "PowerShell accepted an absent catalog object outside the approved layout") { throw }
+                }
+            }
             $savedArchive = $ArchiveDirectory
             $savedBackup = $BackupDirectory
             $savedWal = $WalArchiveDirectory
@@ -2050,11 +2409,50 @@ if command -v pwsh >/dev/null 2>&1; then
                 throw "PowerShell restore changed live credentials before rejecting an unsafe target environment"
             }
 
+            $sortFixture = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "archive-sort-powershell"
+            [IO.Directory]::CreateDirectory($sortFixture) | Out-Null
+            $rawCandidates = Join-Path $sortFixture "candidates.raw"
+            $sortedCandidates = Join-Path $sortFixture "candidates.sorted"
+            [IO.File]::WriteAllLines($rawCandidates, @("delta","alpha","gamma","alpha","beta"), $Utf8NoBom)
+            ConvertTo-ArchiveAuditSortedUniqueFile $rawCandidates $sortedCandidates 2
+            if (([IO.File]::ReadAllLines($sortedCandidates) -join ",") -cne "alpha,beta,delta,gamma") {
+                throw "PowerShell bounded archive sort did not order and deduplicate across chunks"
+            }
+            $catalogFirstRaw = Join-Path $sortFixture "catalog-first.raw"
+            $catalogSecondRaw = Join-Path $sortFixture "catalog-second.raw"
+            $catalogFirst = Join-Path $sortFixture "catalog-first.sorted"
+            $catalogSecond = Join-Path $sortFixture "catalog-second.sorted"
+            $catalogMerged = Join-Path $sortFixture "catalog-merged.sorted"
+            [IO.File]::WriteAllLines($catalogFirstRaw, @("gamma","alpha"), $Utf8NoBom)
+            [IO.File]::WriteAllLines($catalogSecondRaw, @("epsilon","beta","alpha"), $Utf8NoBom)
+            ConvertTo-ArchiveAuditSortedUniqueFile $catalogFirstRaw $catalogFirst 1
+            ConvertTo-ArchiveAuditSortedUniqueFile $catalogSecondRaw $catalogSecond 1
+            Merge-ArchiveAuditSortedFiles $catalogFirst $catalogSecond $catalogMerged
+            if (([IO.File]::ReadAllLines($catalogMerged) -join ",") -cne "alpha,beta,epsilon,gamma") {
+                throw "PowerShell bounded archive sort did not merge catalog snapshots"
+            }
+            $missing = Compare-ArchiveAuditSortedFiles $sortedCandidates $catalogMerged 2>$null
+            if ($missing -ne 1) { throw "PowerShell streaming archive comparison did not identify exactly one orphan" }
+
             $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "reconcile-ok"
-            function Invoke-PsqlLines([string]$Sql) {
-                return @("datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet")
+            $catalogPath = "datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-11111111-1111-4111-8111-111111111111.parquet"
+            $racePath = "datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-55555555-5555-4555-8555-555555555555.schemas.json.gz"
+            [IO.File]::WriteAllText((Join-Path $ArchiveDirectory ($racePath.Replace("/", [IO.Path]::DirectorySeparatorChar))), "activated during scan")
+            $script:ArchiveCatalogReads = 0
+            function Write-PsqlLinesToFile([string]$Sql, [string]$Path) {
+                if (-not $Sql.Contains("oscar_archive_object") -or -not $Sql.Contains("ACTIVE") -or
+                    -not $Sql.Contains("DELETING") -or -not $Sql.Contains("ORDER BY relative_path")) {
+                    throw "PowerShell archive reconciliation used a noncanonical catalog query"
+                }
+                $script:ArchiveCatalogReads++
+                $rows = @($catalogPath)
+                if ($script:ArchiveCatalogReads -ge 2) { $rows += $racePath }
+                [IO.File]::WriteAllLines($Path, $rows, $Utf8NoBom)
             }
             Test-ArchiveFilesystemRegistration
+            if ($script:ArchiveCatalogReads -ne 2) {
+                throw "PowerShell archive reconciliation did not merge exactly two file-backed catalog snapshots"
+            }
             try {
                 Test-ArchiveFilesystemRegistration -RejectPartials
                 throw "PowerShell quiesced archive audit accepted partial suffix variants"
@@ -2076,7 +2474,7 @@ if command -v pwsh >/dev/null 2>&1; then
                 if ($_.Exception.Message -eq "PowerShell archive reconciliation exempted a nested storage-root marker") { throw }
             }
             $ArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "reconcile-ok"
-            $orphan = Join-Path $ArchiveDirectory "datasets/observations/generation-orphan.parquet"
+            $orphan = Join-Path $ArchiveDirectory "datasets/observations/date=2026-10-17/profile=RAW_GATED/generation-66666666-6666-4666-8666-666666666666.manifest.json"
             [IO.Directory]::CreateDirectory((Split-Path -Parent $orphan)) | Out-Null
             [IO.File]::WriteAllText($orphan, "orphan")
             try {
@@ -2117,17 +2515,25 @@ if command -v pwsh >/dev/null 2>&1; then
                 (Join-Path (Join-Path $BackupDirectory $acceptanceId) "archive-generation-ids.txt"),
                 $generationInventory,
                 $true)
-            $generationIds = @(Get-ArchiveGenerationInventory $generationInventoryRoot)
-            $expectedGenerationSql = ([char]39) + "{11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222}" + ([char]39) + "::uuid[]"
-            if ($generationIds.Count -ne 2 -or
-                (Get-ArchiveGenerationIdsSql $generationInventoryRoot) -cne $expectedGenerationSql) {
-                throw "PowerShell did not preserve the canonical authenticated generation set"
+            $expectedGenerationSha = (Get-FileHash -LiteralPath $generationInventory -Algorithm SHA256).Hash.ToLowerInvariant()
+            $generationReceipt = Get-ArchiveGenerationInventory $generationInventoryRoot
+            if ($generationReceipt.Count -ne 2 -or $generationReceipt.Bytes -ne 74 -or
+                $generationReceipt.Sha256 -cne $expectedGenerationSha) {
+                throw "PowerShell did not produce the compact authenticated generation receipt"
+            }
+            [IO.File]::WriteAllBytes($generationInventory, [byte[]]@())
+            $emptyReceipt = Get-ArchiveGenerationInventory $generationInventoryRoot
+            if ($emptyReceipt.Count -ne 0 -or $emptyReceipt.Bytes -ne 0 -or
+                $emptyReceipt.Sha256 -cne "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+                throw "PowerShell rejected the canonical zero-generation inventory receipt"
             }
             $invalidInventories = @(
                 "11111111-1111-4111-8111-111111111111`n11111111-1111-4111-8111-111111111111`n",
                 "22222222-2222-4222-8222-222222222222`n11111111-1111-4111-8111-111111111111`n",
                 "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA`n",
-                "11111111-1111-4111-8111-111111111111"
+                "11111111-1111-4111-8111-111111111111",
+                "11111111-1111-4111-8111-111111111111`r`n",
+                ([Text.Encoding]::UTF8.GetString([byte[]](0xef,0xbb,0xbf)) + "11111111-1111-4111-8111-111111111111`n")
             )
             foreach ($invalidInventory in $invalidInventories) {
                 [IO.File]::WriteAllText($generationInventory, $invalidInventory, $Utf8NoBom)
@@ -2143,6 +2549,32 @@ if command -v pwsh >/dev/null 2>&1; then
                 $generationInventory,
                 $true)
 
+            $largeWriter = [IO.StreamWriter]::new($generationInventory, $false, $Utf8NoBom)
+            $largeWriter.NewLine = "`n"
+            try {
+                for ($index = 0; $index -lt 10000; $index++) {
+                    $largeWriter.WriteLine(("00000000-0000-4000-8000-{0:D12}" -f $index))
+                }
+            } finally { $largeWriter.Dispose() }
+            $largeSha = (Get-FileHash -LiteralPath $generationInventory -Algorithm SHA256).Hash.ToLowerInvariant()
+            $largeReceipt = Get-ArchiveGenerationInventory $generationInventoryRoot
+            if ($largeReceipt.Count -ne 10000 -or $largeReceipt.Bytes -ne 370000 -or
+                $largeReceipt.Sha256 -cne $largeSha) {
+                throw "PowerShell streaming archive-generation receipt failed its practical boundary fixture"
+            }
+            $oversized = [IO.File]::Open($generationInventory, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $oversized.SetLength(37000001) } finally { $oversized.Dispose() }
+            try {
+                [void](Get-ArchiveGenerationInventory $generationInventoryRoot)
+                throw "PowerShell accepted an archive-generation inventory above 37,000,000 bytes"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell accepted an archive-generation inventory above 37,000,000 bytes") { throw }
+            }
+            [IO.File]::Copy(
+                (Join-Path (Join-Path $BackupDirectory $acceptanceId) "archive-generation-ids.txt"),
+                $generationInventory,
+                $true)
+
             $catalogSqlCapture = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "catalog-upsert-powershell.sql"
             $script:MockEpochReceipt = "12345678-1234-4123-8123-123456789abc|VERIFIED"
             function Assert-DeploymentVolumeOwnership {}
@@ -2152,10 +2584,15 @@ if command -v pwsh >/dev/null 2>&1; then
             }
             Set-VerifiedBackupEpochReceipt (Join-Path $BackupDirectory $acceptanceId) $acceptanceId "12345678-1234-4123-8123-123456789abc" "0/12345678"
             $catalogSql = [IO.File]::ReadAllText($catalogSqlCapture)
-            if (-not $catalogSql.Contains($expectedGenerationSql) -or
+            $expectedReceiptFragment = ",2," + [char]39 + $expectedGenerationSha + [char]39 + ",74,"
+            if (-not $catalogSql.Contains($expectedReceiptFragment) -or
                 $catalogSql.Contains("FROM oscar_archive_generation") -or
-                -not $catalogSql.Contains("archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids")) {
-                throw "PowerShell VERIFIED epoch upsert is not bound to the authenticated backup-time generation set"
+                $catalogSql.Contains("archive_generation_ids") -or
+                $catalogSql.Contains("11111111-1111-4111-8111-111111111111") -or
+                -not $catalogSql.Contains("archive_generation_count IS NOT DISTINCT FROM EXCLUDED.archive_generation_count") -or
+                -not $catalogSql.Contains("archive_generation_inventory_sha256 IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_sha256") -or
+                -not $catalogSql.Contains("archive_generation_inventory_bytes IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_bytes")) {
+                throw "PowerShell VERIFIED epoch upsert is not bound to the compact authenticated backup-time generation receipt"
             }
             $script:MockEpochReceipt = ""
             try {
@@ -2758,6 +3195,7 @@ assert_contains 'cannot be accepted as an authenticated \$RequiredReleaseVersion
 assert_contains 'RequiredReleaseVersion = \$releaseVersionLine' "$powershell_script"
 assert_contains 'Confirm-BackupArchiveMembers' "$powershell_script"
 assert_contains '^[[:space:]]+Confirm-ArchiveObjects -RejectPartials$' "$powershell_script"
+assert_contains "tar --exclude='\./archive' --exclude='\./backups' --exclude='\./duckdb-tmp'" "$powershell_script"
 assert_contains 'Confirm-ImageInventory \$Root -CompareCurrent' "$powershell_script"
 assert_contains 'Enter-StorageAdminLock' "$powershell_script"
 assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL'" "$powershell_script"
@@ -2775,12 +3213,94 @@ assert_contains 'Assert-StorageRootsReady' "$powershell_script"
 assert_contains 'Prepare-RestoredDeploymentCredentials' "$powershell_script"
 assert_contains 'Install-PreparedDeploymentCredentials' "$powershell_script"
 assert_contains 'INSERT INTO oscar_retention_hold\(id,store_key,id_scope' "$powershell_script"
+assert_contains 'resolution_mode' "$powershell_script"
+assert_contains "THEN 'GENERATION_EXACT'" "$powershell_script"
+assert_contains "THEN 'HOT_EXACT'" "$powershell_script"
+assert_contains "THEN 'COLD_RANGE_CONSERVATIVE'" "$powershell_script"
+assert_contains 'FROM "\$StoreKey" any_hot_row' "$powershell_script"
+assert_contains 'FROM "\$StoreKey" exact_hot_row' "$powershell_script"
+assert_contains 'oscar_archive_id_block retired_block' "$powershell_script"
+assert_contains '\[long\]::TryParse\(\$Value, \[ref\]\$parsed\)' "$powershell_script"
 assert_contains 'INSERT INTO oscar_deletion_plan\(id,store_key,id_scope' "$powershell_script"
 assert_contains 'JOIN oscar_deletion_plan p ON p\.id=i\.plan_id' "$powershell_script"
 assert_contains 'g\.store_key=p\.store_key AND g\.id_scope=p\.id_scope' "$powershell_script"
 assert_contains 'ON CONFLICT \(subject_type,store_key,id_scope,subject_id\)' "$powershell_script"
 assert_contains 'archive purge -StoreKey \$StoreKey -IdScope \$IdScope' "$powershell_script"
+assert_contains "VALUES \('OBSERVATIONS_PARQUET'\),\('GENERATION_MANIFEST'\),\('DATASTREAM_SCHEMAS'\)" "$powershell_script"
+assert_contains "g\.state IN \('ACTIVE','SEALED'\)" "$powershell_script"
+assert_contains 'chr\(31\)' "$powershell_script"
+assert_not_contains "E'\\\\\\\\t'" "$powershell_script"
+assert_contains "\\\$fields\[3\] -cne '1' -or \\\$fields\[4\] -cne 'ACTIVE'" "$powershell_script"
+assert_contains "\\\$fields\[5\] -cne \\\$fields\[7\] -or \\\$fields\[6\] -cne \\\$fields\[8\]" "$powershell_script"
+assert_contains "\\\$fields\[2\] -ceq 'GENERATION_MANIFEST'.*\\\$fields\[5\] -cne \\\$fields\[9\]" "$powershell_script"
+assert_contains 'Archive catalog changed during verification' "$powershell_script"
+assert_contains 'SELECT \* FROM required_rows UNION ALL SELECT \* FROM additional_rows' "$powershell_script"
+assert_contains 'UNION ALL SELECT \* FROM invalid_owner_rows' "$powershell_script"
+assert_contains "WHERE o\.state='ACTIVE' AND g\.state NOT IN \('ACTIVE','SEALED'\)" "$powershell_script"
 assert_not_contains 'h\.subject_id::numeric BETWEEN g\.min_id AND g\.max_id' "$powershell_script"
+assert_not_contains 'h\.subject_id::numeric BETWEEN held_block\.min_id AND held_block\.max_id' "$powershell_script"
+assert_not_contains "numericSubject'::numeric" "$powershell_script"
+
+# Backup generation UUIDs remain only in the authenticated file. Both launchers
+# stream and frame that file, then persist only a compact count/hash/byte receipt.
+for compact_script in "$shell_script" "$powershell_script"; do
+    assert_not_contains '(^|[^A-Za-z0-9_])archive_generation_ids([^A-Za-z0-9_]|$)' "$compact_script"
+    assert_contains 'archive_generation_count IS NOT DISTINCT FROM EXCLUDED\.archive_generation_count' "$compact_script"
+    assert_contains 'archive_generation_inventory_sha256 IS NOT DISTINCT FROM EXCLUDED\.archive_generation_inventory_sha256' "$compact_script"
+    assert_contains 'archive_generation_inventory_bytes IS NOT DISTINCT FROM EXCLUDED\.archive_generation_inventory_bytes' "$compact_script"
+done
+assert_contains 'ORDER BY id LIMIT \$\(\(max_backup_archive_generation_ids \+ 1\)\)' "$shell_script"
+assert_contains 'ORDER BY id LIMIT \$\(\$MaxBackupArchiveGenerationIds \+ 1\)' "$powershell_script"
+assert_contains 'bytes == count \* 37' "$shell_script"
+assert_contains '\$bytesRead -ne \(\$count \* 37\)' "$powershell_script"
+assert_contains 'stat -c %s -- "\$file"' "$shell_script"
+bash_inventory_body=$(awk '/^validate_archive_generation_inventory\(\)/,/^write_archive_generation_inventory\(\)/' "$shell_script")
+if grep -Eq 'wc -c|sort -c|awk |uuid\[\]|archive_generation_ids_sql' <<<"$bash_inventory_body"; then
+    printf 'Bash archive-generation receipt still materializes or serializes the UUID inventory.\n' >&2
+    exit 1
+fi
+ps_inventory_body=$(awk '/^function Get-ArchiveGenerationInventory/,/^function Write-ArchiveGenerationInventory/' "$powershell_script")
+if grep -Eq 'ReadAllBytes|ReadAllLines| -split | -join |Invoke-PsqlLines|uuid\[\]' <<<"$ps_inventory_body"; then
+    printf 'PowerShell archive-generation receipt still materializes or serializes the UUID inventory.\n' >&2
+    exit 1
+fi
+ps_inventory_capture_body=$(awk '/^function Write-ArchiveGenerationInventory/,/^function Set-VerifiedBackupEpochReceipt/' "$powershell_script")
+if ! grep -Fq 'Write-PsqlLinesToFile' <<<"$ps_inventory_capture_body" ||
+   grep -Eq 'Invoke-PsqlLines|ReadAllBytes|ReadAllLines| -split | -join ' <<<"$ps_inventory_capture_body"; then
+    printf 'PowerShell archive-generation capture does not stream PostgreSQL output directly to its file.\n' >&2
+    exit 1
+fi
+bash_inventory_capture_body=$(awk '/^write_archive_generation_inventory\(\)/,/^upsert_verified_backup_epoch\(\)/' "$shell_script")
+if ! grep -Eq 'psql_admin .* >?"?\$file"|>\"?\$file\"?' <<<"$bash_inventory_capture_body" ||
+   grep -Eq '\$\([^)]*psql_admin|paste -sd|uuid\[\]' <<<"$bash_inventory_capture_body"; then
+    printf 'Bash archive-generation capture does not stream PostgreSQL output directly to its file.\n' >&2
+    exit 1
+fi
+assert_contains '\$writer\.NewLine = "`n"' "$powershell_script"
+
+# Windows reconciliation must never collect the complete catalog or candidate
+# set in RAM. It streams both PostgreSQL snapshots to disk, external-sorts in a
+# fixed-size buffer, pairwise-merges runs, and compares two sorted readers.
+assert_not_contains '^function Get-RegisteredArchivePaths' "$powershell_script"
+assert_contains '^\$ArchiveAuditSortChunkLines = 4096$' "$powershell_script"
+assert_contains '^function ConvertTo-ArchiveAuditSortedUniqueFile' "$powershell_script"
+assert_contains '^function Compare-ArchiveAuditSortedFiles' "$powershell_script"
+ps_reconcile_body=$(awk '/^function Test-ArchiveFilesystemRegistration/,/^function Protect-PrivateDirectory/' "$powershell_script")
+if grep -Eq 'Collections\.Generic\.HashSet|New-Object System\.Collections\.Generic\.List\[string\]|Invoke-PsqlLines' <<<"$ps_reconcile_body"; then
+    printf 'PowerShell archive reconciliation still materializes a full catalog/candidate collection.\n' >&2
+    exit 1
+fi
+for operation in \
+    'Write-RegisteredArchivePaths $catalogFirstRaw' \
+    'Write-RegisteredArchivePaths $catalogSecondRaw' \
+    'ConvertTo-ArchiveAuditSortedUniqueFile $candidateRaw $candidateSorted' \
+    'Compare-ArchiveAuditSortedFiles $candidateSorted $catalogMerged' \
+    '[IO.Directory]::EnumerateFileSystemEntries'; do
+    grep -Fq -- "$operation" <<<"$ps_reconcile_body" || {
+        printf 'PowerShell archive reconciliation is missing bounded operation: %s\n' "$operation" >&2
+        exit 1
+    }
+done
 assert_contains 'Assert-DeploymentVolumeOwnership \(\[bool\]\$AdoptLegacyVolumes\)' "$setup_powershell_script"
 assert_contains 'preserve \.oscar-volume-adoption' "$setup_powershell_script"
 assert_contains 'Assert-CanonicalCredentialBindings' "$setup_powershell_script"

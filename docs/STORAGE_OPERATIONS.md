@@ -52,6 +52,9 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Archive interval | 60 min | Background cycle frequency |
 | Archive catch-up bound | 24 generations / 15 min | Stops starting new generations at the first bound; in-progress publication completes safely |
 | Maximum generation | 2,000,000 rows / 2 GiB estimated uncompressed bytes | A UTC window is halved down to one second while either cap is exceeded; an irreducible prefix fails closed with hot rows retained |
+| DuckDB memory / threads | 256 MiB / 2 per connection | Bounds native memory and CPU for every export, verification, parity, delete, cold query, metadata scan, and count |
+| DuckDB session admission | 2 process-wide / 30 s wait | Fairly bounds the aggregate native-memory/CPU/spill multiplier; excess work fails busy and can be retried instead of opening an unbounded connection |
+| DuckDB spill | 4 GiB per operation in `/var/lib/oscar/duckdb-tmp` | Each connection gets a mode-0700 private child that is removed on close; scratch must be disjoint from the immutable archive and is excluded from backup |
 | Parquet compression | ZSTD level 6 | Cold-storage size/CPU tradeoff |
 | Archive rollback grace | 7 days | Minimum active overlap after parity before hot deletion |
 | `deleteHotAfterArchive` | `false` | Copy-only rollout; no archived hot rows are removed |
@@ -118,6 +121,13 @@ symbolic links, junctions, or reparse points. Both
 launchers enforce these rules before privileged storage work and again after initialization creates
 the directories. This protects purge and restore operations from a typo such as `/`, `C:\`, a parent
 mount, or a redirected path.
+
+The Ubuntu launcher resolves its own release directory to a physical path and rejects a symlinked
+launcher file before reading deployment configuration. The Windows launcher rejects every junction,
+symbolic link, or other reparse point in its launcher/release path and resolves each storage root
+through its nearest existing physical ancestor before containment comparisons. A release-directory
+alias therefore cannot hide an archive, backup, or WAL root located inside the release (or a release
+located inside one of those roots).
 
 Each root also has an administrator-owned `.oscar-storage-root` identity with format
 `oscar-storage-root-identity`, version `1`, the deployment UUID, root kind (`archive`, `backup`, or
@@ -245,11 +255,24 @@ portable/off-site copies.
 The archive and backup commands require a configured deployment. Mutating commands also require
 root/Administrator privileges.
 
+The coordinated backup excludes the reserved `/var/lib/oscar/duckdb-tmp` path exactly. Keep that
+default for scratch stored in OSCAR's persistent state. A custom DuckDB temporary parent is valid
+only outside `/var/lib/oscar`, must remain disjoint from the archive, and needs its own capacity and
+owner-only-permission monitoring.
+
 ## Archive health inspection
 
 `archive status` reports generation counts, rows, and Parquet bytes grouped by state/profile, then
-the number of active holds. `archive verify` hashes every cataloged object whose object state is
-`ACTIVE` and compares it with PostgreSQL. Both commands also reconcile the complete physical
+the number of active holds. `archive verify` first expands every `ACTIVE` or `SEALED` generation
+against the three required kinds and fails unless there is exactly one active
+`OBSERVATIONS_PARQUET`, `GENERATION_MANIFEST`, and `DATASTREAM_SCHEMAS` row with a path and SHA-256;
+the Parquet row must also repeat the generation's authoritative `object_path` and `sha256`, and the
+manifest row must repeat its `manifest_path`. It then resolves and hashes those exact required files.
+This prevents stale generation metadata or a missing catalog row from escaping verification
+merely because there was no object row to iterate. Required and supplemental objects come from one
+canonically ordered PostgreSQL snapshot. After hashing and filesystem reconciliation, the command
+recaptures the same snapshot and requires byte-for-byte equality; a concurrent activation or purge
+therefore fails with an explicit retry instead of certifying a mixed instant. Both commands also reconcile the complete physical
 archive root without changing it. The administrator-owned `.oscar-storage-root` is the only
 top-level exemption; all archive data must have the approved `datasets/...` shape. An unexpected
 top-level object, empty/unapproved directory, absent `datasets` tree accompanied by other content,
@@ -327,7 +350,7 @@ docker compose exec -T postgres sh -eu -c '
   export PGPASSWORD PGOPTIONS
   exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"
 ' psql-wrapper --command \
-  "SELECT id, subject_type, subject_id, reason, created_by, created_at
+  "SELECT id, subject_type, subject_id, resolution_mode, reason, created_by, created_at
      FROM oscar_retention_hold
     WHERE released_at IS NULL
     ORDER BY created_at;"
@@ -375,9 +398,24 @@ Windows equivalents:
 ```
 
 The CLI verifies that a generation exists, validates identifiers/reason/actor fields, and returns a
-hold UUID. Record that UUID with the controlling case. Generation holds block lifecycle eligibility;
-observation holds preserve that exact hot row and conservatively block a cold-generation purge when
-the ID falls within its generation range.
+hold UUID plus a durable `resolution_mode`. Record both with the controlling case. The list command
+shows the mode for active and released history:
+
+- `GENERATION_EXACT` means the supplied query-visible generation UUID was matched exactly.
+- `HOT_EXACT` means the supplied observation ID matched an exact PostgreSQL row owned by this
+  store/scope (either unowned hot data or a query-visible generation).
+- `COLD_RANGE_CONSERVATIVE` means no exact PostgreSQL row remained and the ID fell only within a
+  query-visible archive ID range. A Parquet generation can be sparse, so this protects every
+  candidate generation range but **does not prove that the typed observation ID exists**. For legal
+  certainty, verify the event/observation in OSCAR or place an explicit `GENERATION_EXACT` hold on
+  the confirmed generation.
+- `LEGACY_UNKNOWN` is migration-only. It marks a pre-3.9.2 observation hold whose original exact-
+  row versus range-based resolution was not recorded. It remains protective but is not evidence
+  that the exact observation existed. The CLI never creates a new hold with this mode.
+
+Catalog migration labels older generation holds `GENERATION_EXACT` and older observation holds
+`LEGACY_UNKNOWN`; it cannot reconstruct whether an old observation hold was created while its exact
+hot row still existed or from a conservative cold range.
 
 Release only after the legal/records owner authorizes it. Release records the actor/time and retains
 the row:
@@ -392,9 +430,41 @@ sudo bash oscar.sh archive hold release --id <hold-uuid> --released-by records-a
 
 The release CLI is the supported hold interface. Do not update hold rows directly.
 Hold creation is serialized with purge confirmation. Generation holds are accepted only while the
-generation is `ACTIVE` or `SEALED`; a hold targeting a `DELETING`/`PURGED` generation, or an exact
-observation already covered by such a generation/tombstone, is rejected rather than presenting a
-false assurance after deletion has started.
+generation is `ACTIVE` or `SEALED`. For an observation, an exact PostgreSQL row is authoritative:
+an unowned hot row or a row owned by an `ACTIVE`/`SEALED` generation remains holdable even when its
+numeric ID falls inside an unrelated `DELETING`/`PURGED` generation's coarse minimum/maximum range.
+An exact row owned by any other generation state is rejected. Only when no exact PostgreSQL row
+exists does the CLI fall back to archive ID ranges; because those ranges can contain gaps when
+eligible and ineligible streams interleave, a cold-only ID covered by both a queryable and a
+`DELETING`/`PURGED` range is rejected as ambiguous. An observation tombstone always rejects hold
+creation. These rules avoid both false rejection of extant data and false assurance after deletion
+has started. Observation hold IDs are positive signed 64-bit values (maximum
+`9223372036854775807`); the CLI rejects larger decimal values before SQL and uses `bigint`
+predicates so PostgreSQL can retain index plans on observation and ID-block columns.
+
+Active holds also protect logical datastore removal, not only lifecycle hot-row deletion and cold
+purge. Single-observation removal fails with an explicit active-hold error and leaves the row
+visible. Bulk filtered removal skips held observation IDs and rows owned by a held generation,
+continues removing eligible rows, and returns only the number actually removed; a later invocation
+can remove the skipped rows after authorized release. Each single/batch removal first acquires the
+normal store and ordered observation mutation locks, then takes a shared hold-table lock and reads
+the relevant observation holds and only candidate generation holds on the same PostgreSQL
+transaction. Hold creation/release takes the conflicting writer lock, so either the hold or the
+removal wins completely without a per-row connection borrow.
+
+For a tiered store, the generic datastore `clear`, `drop`, table-clone `backup`, and table-replacing
+`restore` APIs are intentionally unsupported: each would bypass holds or omit the cold catalog and
+objects. Use filtered hold-aware removal and the coordinated `oscar backup` / `oscar restore`
+commands instead. Datastream removal holds a namespace-wide retention-hold read barrier and
+preflights active observation and generation holds. If an exact, conservative, or unresolved hold
+can protect the datastream, it aborts before changing any observation—including unheld siblings.
+With a clean preflight, hold creation/release remains blocked through the bounded logical child
+removals and metadata delete. The child removals are bounded, restartable transactions rather than
+one unbounded all-or-nothing transaction: if a later child batch fails, datastream metadata remains,
+already committed logical removals stay removed, and retry safely finishes the remaining children
+before deleting metadata. Tiered datastream `clear`, `drop`, `backup`, and `restore` also fail closed
+so decoding metadata cannot be orphaned. Integrators should treat these exceptions as a
+storage-safety contract, not a transient database error.
 
 ## Delete old cold generations
 
@@ -647,7 +717,10 @@ docker compose exec -T postgres sh -eu -c '
 
 Expected behavior after rollout is lower PostgreSQL transaction/trigger/WAL overhead per telemetry
 row and bounded long-term hot-table growth. Expect temporary CPU and sequential I/O during a
-DuckDB export/parity pass, and CPU during FFmpeg JPEG extraction. Each generation is bounded; during
+DuckDB export/parity pass, and CPU during FFmpeg JPEG extraction. DuckDB is capped per connection
+at 256 MiB, two workers, and 4 GiB of spill by default, and a fair process-wide gate admits at most
+two sessions. Work that cannot acquire capacity within 30 seconds fails busy without activating a
+generation or deleting hot rows. Each generation is bounded; during
 backlog catch-up, one cycle may start up to 24 generations over its 15-minute start window. Health/status UI polling remains independently bounded. Treat a
 sustained regression—not a brief background spike—as the alert condition.
 
@@ -672,9 +745,12 @@ Track at least:
 | Complete-frame CRC or immutable CSV mismatch | Initialization/publication fails visibly | Preserve all evidence; investigate storage/hardware; recover from verified copy |
 | Observation batch commit fails | Snapshots stay queued for a later in-process retry | Fix PostgreSQL/network/disk immediately; restart only after assessing uncommitted-memory exposure |
 | Archive export fails | Hot rows remain; job records `FAILED` | Check database, archive space/permissions, DuckDB error, stale partials; allow controlled retry |
+| DuckDB memory/spill cap is exhausted | Current export/query/parity operation fails; no generation is activated and no unverified hot row is deleted | Reduce query/export concurrency or window size, restore scratch capacity, or raise a cap only after site-specific load testing; with OSCAR stopped, remove abandoned children beneath the configured DuckDB temporary parent |
+| DuckDB session capacity stays busy for 30 seconds | Waiting operation fails before allocating a connection or scratch child; active work continues | Let the caller retry, inspect unusually long archive queries/exports, and raise concurrency only after measuring aggregate native memory, CPU, and spill |
+| DuckDB scratch parent is broad or overlaps archive | Archive operation fails before opening DuckDB | Keep `/var/lib/oscar/duckdb-tmp` disjoint from the archive and mode `0700`; on a non-POSIX embedding apply an equivalent owner-only ACL |
 | Parity fails | Hot rows remain; generation is not sealable | Compare receipt details and source/object hashes; do not enable/bypass deletion |
 | Observation hold defers hot deletion | Held exact IDs remain hot; generation stays `ACTIVE` | No emergency action; review/release hold only through approved workflow |
-| Cataloged archive object missing or hash mismatch | Reader/verify/purge fails | Stop destructive work, preserve evidence, restore exact object from coordinated backup, verify again |
+| Cataloged archive object missing/hash mismatch, ID block mismatch, or missing generation schema rows | Reader/verify/purge fails | Stop destructive work, preserve evidence, restore the coordinated database and exact archive objects from the same backup epoch, then verify again |
 | Unregistered/`DELETED` archive file or stale `.partial` | Archive status/verify fails without changing the file | Correlate UUID/path with export jobs and logs; reconcile under an approved recovery procedure, never delete merely to clear the check |
 | Source video has fewer than five decodable frames | No retained manifest; MP4 preserved | Correct camera/recording health; keep source under legacy playback and investigate |
 | Media publication fails | Partial set stays invisible; source preserved; retry ledger records failure | Check FFmpeg, source integrity, filesystem/rename/space; allow idempotent retry |

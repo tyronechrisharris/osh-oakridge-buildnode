@@ -66,6 +66,13 @@ second. The exporter independently reads a sentinel row and enforces both limits
 mis-sized window cannot publish partial history. A still-oversized one-second prefix fails closed
 with all hot rows retained for operator action.
 
+The exporter and every other archive-side DuckDB operation use the configured memory, thread, and
+temporary-space caps. Larger sorts or joins spill only into an operation-private directory, which
+is removed after its connection closes. A fair process-wide gate admits no more than two sessions
+by default; a waiter fails busy after 30 seconds before opening DuckDB or allocating scratch.
+Exhausting admission, memory, or spill fails the operation without activating a generation or
+deleting hot rows.
+
 Publication order is:
 
 1. Write and verify `generation-<uuid>.parquet`.
@@ -97,6 +104,14 @@ Parquet is immutable. An update to an already archived observation is written to
 `oscar_obs_overlay`; a removal writes an `oscar_tombstone`. Reads apply the overlay or hide the
 tombstoned row. This avoids rewriting a large generation for a one-row change. These mutation
 tables must therefore be protected and backed up with PostgreSQL.
+
+Logical removal participates in the retention protocol. After the shared store and ordered
+observation mutation locks are held, the same PostgreSQL transaction takes a shared lock on the
+hold table and resolves exact observation holds plus generation holds for only the requested IDs'
+candidate archive ranges. A single held removal fails visibly. A filtered bulk removal skips held
+rows, removes other matching rows, and reports only successful removals. A hold created in the
+former select/delete race window therefore commits before the shared lock and is observed, or
+waits until the removal commits; it cannot be silently bypassed by a hot delete or tombstone.
 
 Observation ingestion uses the same logical identity as the OSH reference store: datastream,
 feature of interest, phenomenon time, and result time. Replaying the same value is idempotent; a
@@ -346,19 +361,30 @@ The archive catalog includes these control records:
 
 | Record | Purpose |
 | --- | --- |
-| `oscar_retention_hold` | Prevent generation or exact-observation lifecycle deletion while active |
+| `oscar_retention_hold` | Prevent physical and logical generation/observation deletion while active; persist exact vs conservative resolution provenance |
 | `oscar_obs_overlay` | Current value of a mutation to an immutable archived observation |
 | `oscar_tombstone` | Suppress a policy/user-deleted observation without rewriting Parquet |
 | `oscar_archive_verification` | Immutable history of parity, deletion, and deferred-hold receipts |
 | `oscar_deletion_plan` / `_item` | Frozen, expiring set reviewed for cold deletion |
 | `oscar_deletion_ledger` | Per-object deletion outcome retained after file removal |
-| `oscar_backup_epoch` | PostgreSQL link to a coordinated backup manifest and archive-generation set |
+| `oscar_backup_epoch` | PostgreSQL link to a coordinated backup manifest and the count/bytes/SHA-256 receipt for its authenticated archive-generation inventory; the exact UUID set remains in the backup |
 
 The release CLI can list, create, and release generation or exact-observation holds. Creation
 requires a generation UUID or numeric observation ID plus a reason; release records the actor and
 time without deleting the hold row. Use the commands in
 [Storage operations](STORAGE_OPERATIONS.md#manage-retention-holds) only as part of the site's
-approved legal/records workflow. Directly editing these tables can make retention results incorrect.
+approved legal/records workflow. An exact extant hot row takes precedence over unrelated coarse
+archive ID ranges; cold-only overlapping queryable and retired ranges remain fail-closed, and a
+tombstone always prevents a new hold. Directly editing these tables can make retention results
+incorrect.
+
+New holds persist `GENERATION_EXACT`, `HOT_EXACT`, or `COLD_RANGE_CONSERVATIVE`. The conservative
+mode means a cold-only ID was covered by a candidate generation's min/max block; because sparse
+Parquet IDs may leave gaps, it protects the range but is not evidence that the exact observation
+exists. A migrated pre-3.9.2 observation hold is labeled `LEGACY_UNKNOWN`: its historical exact-vs-
+range provenance cannot be reconstructed, so it remains protective but must not be cited as proof
+that an exact observation existed. Confirm the event or use an explicit generation hold when legal
+certainty is required.
 
 ## Policy changes
 

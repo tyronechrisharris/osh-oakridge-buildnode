@@ -103,7 +103,19 @@ sudo bash oscar.sh archive status
 sudo bash oscar.sh archive verify
 ```
 
-`backup` keeps OSCAR quiesced, verifies every active archive object against its catalog checksum,
+Retention-hold creation prints and persists a resolution label. `GENERATION_EXACT` and `HOT_EXACT`
+are exact catalog/row matches; `COLD_RANGE_CONSERVATIVE` protects candidate archive ranges but does
+not prove that a possibly sparse observation ID exists. Confirm the event or hold its exact
+generation when evidentiary certainty is required. A listed `LEGACY_UNKNOWN` mode is a protective
+migration-only label for a pre-3.9.2 observation hold; it does not prove exact observation
+existence. Active observation or generation holds also
+block Viewer/API datastore removals: a single remove fails visibly and a bulk remove skips held
+rows. See `documentation/STORAGE_OPERATIONS.md` before creating or releasing a hold.
+
+`backup` keeps OSCAR quiesced, proves that every query-visible generation has exactly one active
+Parquet, manifest, and schema object, verifies each against its catalog checksum,
+requires the Parquet object path/checksum and manifest path to match the generation's authoritative
+pointers, and rejects a catalog snapshot changed by concurrent activation or purge,
 reconciles the archive filesystem, then verifies and HMAC-authenticates the new backup, rejects
 unsafe tar members, atomically marks the recovery point `VERIFIED`, and then records protection for
 only the exact published daily-file segments present in that accepted snapshot. A confirmation

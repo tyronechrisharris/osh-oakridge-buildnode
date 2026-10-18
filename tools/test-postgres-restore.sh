@@ -21,6 +21,17 @@ password='oscar-restore-test-password'
 epoch_id='12345678-1234-4234-8234-123456789abc'
 backup_id='20261017T120000Z-1234abcd'
 epoch_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+generation_inventory_count=2
+generation_inventory_bytes=74
+if command -v sha256sum >/dev/null 2>&1; then
+    generation_inventory_sha=$(printf '%s\n%s\n' \
+        11111111-1111-4111-8111-111111111111 \
+        22222222-2222-4222-8222-222222222222 | sha256sum | awk '{print $1}')
+else
+    generation_inventory_sha=$(printf '%s\n%s\n' \
+        11111111-1111-4111-8111-111111111111 \
+        22222222-2222-4222-8222-222222222222 | shasum --algorithm 256 | awk '{print $1}')
+fi
 
 cleanup() {
     docker rm -f "$source_container" "$restored_container" >/dev/null 2>&1 || true
@@ -111,7 +122,12 @@ CREATE TABLE public.restore_probe(id integer PRIMARY KEY);
 INSERT INTO public.restore_probe VALUES (1);
 CREATE TABLE oscar.oscar_backup_epoch (
  id uuid PRIMARY KEY, state text NOT NULL, postgres_lsn pg_lsn,
- archive_generation_ids uuid[] NOT NULL DEFAULT '{}', manifest_path text,
+ archive_generation_count bigint NOT NULL CHECK (archive_generation_count BETWEEN 0 AND 1000000),
+ archive_generation_inventory_sha256 text NOT NULL CHECK (archive_generation_inventory_sha256 ~ '^[0-9a-f]{64}$'),
+ archive_generation_inventory_bytes bigint NOT NULL CHECK (
+   archive_generation_inventory_bytes BETWEEN 0 AND 37000000
+   AND archive_generation_inventory_bytes = archive_generation_count * 37),
+ manifest_path text,
  sha256 text, created_at timestamptz NOT NULL DEFAULT now(), verified_at timestamptz);
 SELECT pg_switch_wal();" >/dev/null
 source_timeline=$(psql_value "$source_container" 'SELECT timeline_id FROM pg_control_checkpoint();')
@@ -203,13 +219,15 @@ restored_timeline=$(psql_value "$restored_container" 'SELECT timeline_id FROM pg
 failed_before=$(psql_value "$restored_container" 'SELECT failed_count FROM pg_stat_archiver;')
 receipt=$(psql_value "$restored_container" "
 WITH upserted AS (
- INSERT INTO oscar.oscar_backup_epoch(id,state,postgres_lsn,archive_generation_ids,manifest_path,sha256,verified_at)
- VALUES ('$epoch_id','VERIFIED','$backup_lsn','{}','$backup_id/epoch.json','$epoch_sha',now())
+ INSERT INTO oscar.oscar_backup_epoch(id,state,postgres_lsn,archive_generation_count,archive_generation_inventory_sha256,archive_generation_inventory_bytes,manifest_path,sha256,verified_at)
+ VALUES ('$epoch_id','VERIFIED','$backup_lsn',$generation_inventory_count,'$generation_inventory_sha',$generation_inventory_bytes,'$backup_id/epoch.json','$epoch_sha',now())
  ON CONFLICT (id) DO UPDATE SET state='VERIFIED',
   verified_at=CASE WHEN oscar.oscar_backup_epoch.state='VERIFIED' THEN oscar.oscar_backup_epoch.verified_at ELSE now() END
  WHERE oscar.oscar_backup_epoch.state IN ('CREATED','VERIFIED')
    AND oscar.oscar_backup_epoch.postgres_lsn IS NOT DISTINCT FROM EXCLUDED.postgres_lsn
-   AND oscar.oscar_backup_epoch.archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids
+   AND oscar.oscar_backup_epoch.archive_generation_count IS NOT DISTINCT FROM EXCLUDED.archive_generation_count
+   AND oscar.oscar_backup_epoch.archive_generation_inventory_sha256 IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_sha256
+   AND oscar.oscar_backup_epoch.archive_generation_inventory_bytes IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_bytes
    AND oscar.oscar_backup_epoch.manifest_path IS NOT DISTINCT FROM EXCLUDED.manifest_path
    AND oscar.oscar_backup_epoch.sha256 IS NOT DISTINCT FROM EXCLUDED.sha256
  RETURNING id::text||'|'||state)
@@ -239,7 +257,7 @@ $archived || { printf 'Promoted history/new-timeline WAL did not reach the archi
 docker run --rm --interactive --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
     --user 999:999 --entrypoint sha256sum --volume "$wal_volume:/wal:ro" "$image" \
     --check --strict - <"$scratch/pre-restore-wal.sha256" >/dev/null
-[[ $(psql_value "$restored_container" "SELECT state||'|'||postgres_lsn::text||'|'||manifest_path||'|'||sha256 FROM oscar.oscar_backup_epoch WHERE id='$epoch_id';") == "VERIFIED|$backup_lsn|$backup_id/epoch.json|$epoch_sha" ]] || {
+[[ $(psql_value "$restored_container" "SELECT state||'|'||postgres_lsn::text||'|'||archive_generation_count::text||'|'||archive_generation_inventory_sha256||'|'||archive_generation_inventory_bytes::text||'|'||manifest_path||'|'||sha256 FROM oscar.oscar_backup_epoch WHERE id='$epoch_id';") == "VERIFIED|$backup_lsn|$generation_inventory_count|$generation_inventory_sha|$generation_inventory_bytes|$backup_id/epoch.json|$epoch_sha" ]] || {
     printf 'Restored epoch receipt identity changed.\n' >&2
     exit 1
 }

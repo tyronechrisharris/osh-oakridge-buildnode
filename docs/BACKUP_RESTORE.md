@@ -19,13 +19,13 @@ Each backup is stored under `${OSCAR_BACKUP_DIR}/<backup-id>`, where the ID has 
 | Object | Contents |
 | --- | --- |
 | `postgres/` | Plain-format `pg_basebackup` of the complete PostgreSQL cluster, with required WAL streamed into the backup |
-| `oscar-state.tar.gz` | Mutable `/var/lib/oscar` application state, including saved SensorHub configuration, journal, daily files, videos/JPEGs, reports, and adjudication artifacts; excludes the separately captured archive path, any legacy embedded backup mountpoint, and the verified image-owned links (`lib`, `web`, `rules`, `documentation`, `trusted_certificates`, `config`, and `logback.xml`) that the restored image recreates |
+| `oscar-state.tar.gz` | Mutable `/var/lib/oscar` application state, including saved SensorHub configuration, journal, daily files, videos/JPEGs, reports, and adjudication artifacts; excludes the separately captured archive path, reproducible transient DuckDB scratch at `/var/lib/oscar/duckdb-tmp`, any legacy embedded backup mountpoint, and the verified image-owned links (`lib`, `web`, `rules`, `documentation`, `trusted_certificates`, `config`, and `logback.xml`) that the restored image recreates |
 | `archive.tar.gz` | Complete configured `/var/lib/oscar/archive` data tree, excluding the host-local `.oscar-storage-root` identity |
 | `wal-archive.tar.gz` | Snapshot of `/var/lib/postgresql/wal-archive`, excluding the host-local `.oscar-storage-root` identity |
 | `deployment-secrets.tar.gz.enc` | `.env`, `secrets/`, and `tls/`, encrypted with AES-256-CBC and PBKDF2 using the external backup key |
 | `release-config.tar.gz` | Non-secret Compose, image-build, sample environment, and release documentation files |
 | `epoch.json` | Backup UUID, backup ID, UTC creation time, OSCAR version, PostgreSQL LSN, archive root, and creation state |
-| `archive-generation-ids.txt` | Canonically sorted, duplicate-free UUIDs for the exact active/sealed archive generations captured by this backup; at most 1,000,000 entries/37,000,000 bytes |
+| `archive-generation-ids.txt` | Canonically sorted, duplicate-free UUIDs for the exact active/sealed archive generations captured by this backup; validation is streaming and bounded at 1,000,000 entries/37,000,000 bytes |
 | `image-inventory.txt` | Exact Compose image names, immutable local image IDs, repository-digest provenance, and required OSCAR/PostGIS release labels used to create the recovery point |
 | `SHA256SUMS` | SHA-256 of every authenticated core payload file present before verification (excludes itself, its authentication tag, the later `VERIFIED` marker, and the post-verification `JOURNAL_CONFIRMED` sidecar) |
 | `SHA256SUMS.hmac` | HMAC-SHA-256 authentication of `SHA256SUMS`, using the external backup key; this authenticates the complete checksum inventory and every payload it names |
@@ -35,9 +35,12 @@ Each backup is stored under `${OSCAR_BACKUP_DIR}/<backup-id>`, where the ID has 
 When PostgreSQL is available, its live catalog first receives a best-effort `CREATED`
 `oscar_backup_epoch` receipt after the backup directory is finalized. Acceptance then requires an
 exact collision-safe `VERIFIED` receipt before the filesystem `VERIFIED` marker is allowed to
-remain. The receipt binds the manifest path, epoch checksum, LSN, and exact ordered set of archive
-generations authenticated in `archive-generation-ids.txt`; later catalog growth therefore cannot
-change an existing backup's identity. Offline verification omits the live catalog receipt, while a
+remain. The receipt binds the manifest path, epoch checksum, LSN, and the count, exact byte length,
+and SHA-256 of the ordered generation set authenticated in `archive-generation-ids.txt`; later
+catalog growth therefore cannot change an existing backup's identity. The exact UUIDs remain in the
+HMAC-authenticated backup file and are not duplicated in a PostgreSQL `uuid[]` for every backup.
+This keeps validation memory bounded and prevents backup receipts from adding multi-megabyte TOAST
+rows to every later database backup. Offline verification omits the live catalog receipt, while a
 running PostgreSQL service must first pass the deployment-volume ownership fence before either the
 acceptance marker or catalog can be changed. Disaster recovery remains possible when the original
 database is unavailable.
@@ -109,7 +112,11 @@ copy if recovery between coordinated backup endpoints is required.
 Verification requires exactly one authenticated checksum entry for every top-level recovery
 payload, including `epoch.json`, `archive-generation-ids.txt`, and `image-inventory.txt`. The
 generation inventory must use one canonical lowercase UUID per LF-terminated line, be strictly
-sorted without duplicates, and remain within its documented entry/byte bounds. The epoch must identify exactly OSCAR
+sorted without duplicates, have exactly 37 bytes per UUID record, and remain within its documented
+entry/byte bounds. Both launchers stream this file while calculating its receipt; they do not read
+the complete list into memory or construct an SQL UUID-array literal. A backup with no active or
+sealed generations uses a valid empty file (count and bytes zero, with the standard SHA-256 of empty
+content). The epoch must identify exactly OSCAR
 3.9.2, not merely any semantic version. Before destructive restore, OSCAR also compares the current
 application, PostgreSQL, and gateway image names, immutable IDs, and required release labels with
 the authenticated inventory. Exact names, content-addressed IDs, and required labels are hard
@@ -250,8 +257,9 @@ Verification:
   verification before extraction or acceptance and leaves no host-side temporary files;
 - requires the exact top-level payload inventory and exactly one copy of every mandatory
   release-config file;
-- validates the bounded canonical archive-generation UUID inventory and uses only that authenticated
-  backup-time set for collision-safe `CREATED`/`VERIFIED` catalog receipts;
+- streams and validates the bounded canonical archive-generation UUID inventory and uses its
+  authenticated count, byte length, and SHA-256 for collision-safe `CREATED`/`VERIFIED` catalog
+  receipts; the exact list stays in the recovery point instead of being copied into PostgreSQL;
 - validates the epoch UUID, format/version, immutable `CREATED` state, and exact backup-directory ID; and
 - when PostgreSQL is offline, durably writes and fsyncs a UTC `VERIFIED` marker without a database;
   when it is running, first proves fixed-volume deployment ownership and then requires the exact
@@ -274,8 +282,10 @@ Only a restore drill proves those dependencies.
 
 Validator scratch usage is determined by the number and path lengths of archive members, not by
 their compressed payload bytes. The 256 MiB tmpfs is a deliberate fail-closed resource ceiling;
-it is not an unlimited file-count guarantee. The one-million generation-ID parser ceiling is also
-a hostile-input bound, not a supported-capacity claim. Trend file counts in OSCAR state, cold
+it is not an unlimited file-count guarantee. The one-million generation-ID ceiling is also a
+hostile-input bound, not a supported-capacity claim. Inventory capture is SQL-limited to one entry
+beyond that ceiling, and both validators reject an oversized file before scanning it; accepted
+records are then parsed and hashed with bounded buffers. Trend file counts in OSCAR state, cold
 archive, and backup payloads, and qualify `backup-verify` plus an isolated restore with a
 representative high-watermark dataset before deploying a materially larger retention policy. A
 scratch-exhaustion failure leaves the backup unverified and must be resolved by reducing file
@@ -499,6 +509,12 @@ sudo bash oscar.sh backup-prune --keep 14
 `--keep`/`-Keep` must be between 1 and 10,000. To suspend automatic deletion while investigating or
 changing policy, set `OSCAR_BACKUP_AUTO_PRUNE=false`; continue monitoring capacity and run an
 explicit reviewed prune later.
+
+Pruning removes the selected recovery-point directories and eligible WAL, but deliberately keeps
+their small `oscar_backup_epoch` rows as audit history. Those rows contain only fixed-size identity,
+LSN, path, count, byte-length, and hash fields—not the UUID list—so they do not recreate the former
+per-backup database-growth problem. A receipt whose directory was pruned is not a usable backup;
+the exact generation inventory and payload existed only in that authenticated recovery point.
 
 Define a policy that retains enough **verified, off-host** coordinated backups to meet recovery
 objectives. The local count is not an off-site policy. If an off-site base backup is expected to

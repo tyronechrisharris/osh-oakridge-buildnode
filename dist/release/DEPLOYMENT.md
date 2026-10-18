@@ -161,6 +161,19 @@ executable native directory. Do not override either mount or add `-Djava.io.tmpd
 also rejects `_JAVA_OPTIONS`, which OpenJDK applies after command-line options; custom launchers
 must reproduce this two-mount contract.
 
+DuckDB query scratch is separate from both temporary mounts and the immutable archive. Every
+archive connection is limited by the persisted database-module settings (shipping defaults:
+256 MiB memory, two threads, and 4 GiB spill) and gets a private child below
+`/var/lib/oscar/duckdb-tmp` in `oscar_state`. Normal connection close removes the child; coordinated
+backups exclude this scratch parent. The scratch and archive roots must be disjoint. In the Linux
+container (on either Ubuntu or Windows hosts), OSCAR requires POSIX mode `0700` on the parent and
+each operation child and rejects an existing broader parent; a non-container/non-POSIX embedding
+must provide an equivalent owner-only ACL. If a hard process/container failure leaves a child
+behind, stop OSCAR before removing only abandoned children from that configured parent.
+The backup exclusion is intentionally limited to the reserved `/var/lib/oscar/duckdb-tmp` path.
+OSCAR therefore rejects any other scratch path inside `/var/lib/oscar`; a custom path must be
+outside that persistent state tree and disjoint from the archive.
+
 The backup key encrypts `.env`, deployment secrets, and TLS private material inside coordinated backups. The encrypted `secrets/` payload contains a recovery copy of the key file, but there is no usable plaintext key in the backup: store an external protected copy in an independent secret escrow or failure domain.
 
 The gateway gives content-hashed Viewer files under `/_next/static/` a private, one-year immutable browser cache policy, while `/sw.js` is always revalidated. This prevents repeated full-route navigations from downloading the same application bundles again without allowing a shared proxy to cache an authenticated response. HTML and API responses keep their normal revalidation behavior.
@@ -266,6 +279,15 @@ commands. The full procedures are in:
 - [`../../docs/ARCHIVE_FORMAT.md`](../../docs/ARCHIVE_FORMAT.md)
 - [`../../docs/BACKUP_RESTORE.md`](../../docs/BACKUP_RESTORE.md)
 - [`../../docs/STORAGE_OPERATIONS.md`](../../docs/STORAGE_OPERATIONS.md)
+
+The hold list and creation result include `resolution_mode`. A
+`COLD_RANGE_CONSERVATIVE` observation hold protects matching generation ranges but is not proof that
+the exact ID exists in sparse Parquet; verify the event or use an exact generation hold for legal
+certainty. `LEGACY_UNKNOWN` is a protective migration-only label for pre-3.9.2 observation holds
+whose exact-vs-range provenance cannot be reconstructed; the CLI never creates it. Active
+observation and generation holds are enforced inside the same transaction as
+hot/cold logical removal and tombstone creation. Single removal fails on a hold; filtered bulk
+removal skips protected rows and counts only rows actually removed.
 
 The same files are under `documentation/` in the packaged release. `backup` verifies the newly
 created backup automatically and authenticates its checksum inventory with the separately stored

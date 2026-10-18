@@ -71,8 +71,26 @@ for (const relative of ['oscar-storage.sh', 'oscar-storage.ps1']) {
     if (!source.includes('archive-generation-ids.txt')) {
         fail(`${relative} does not require the authenticated backup-time archive-generation inventory`);
     }
-    if (!source.includes('archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids')) {
-        fail(`${relative} does not collision-check the exact authenticated archive-generation set`);
+    for (const field of [
+        'archive_generation_count',
+        'archive_generation_inventory_sha256',
+        'archive_generation_inventory_bytes',
+    ]) {
+        if (!source.includes(`${field} IS NOT DISTINCT FROM EXCLUDED.${field}`)) {
+            fail(`${relative} does not collision-check compact archive receipt field ${field}`);
+        }
+    }
+    if (/(^|\W)archive_generation_ids(\W|$)/m.test(source) || source.includes('ArchiveGenerationIdsSql')) {
+        fail(`${relative} still embeds the archive-generation UUID set in SQL`);
+    }
+    if (relative === 'oscar-storage.sh' &&
+        (!source.includes('pwd -P') || !source.includes('regular, non-symlink file'))) {
+        fail('oscar-storage.sh does not physically resolve the release path and reject a symlinked launcher');
+    }
+    if (relative === 'oscar-storage.ps1' &&
+        (!source.includes('Assert-NoReparseComponents $StorageScriptPath') ||
+         !source.includes('Resolve-PhysicalContainmentPath $ScriptRoot'))) {
+        fail('oscar-storage.ps1 does not reject release reparse points and use physical containment paths');
     }
 }
 

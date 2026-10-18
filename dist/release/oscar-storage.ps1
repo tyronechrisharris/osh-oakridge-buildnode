@@ -27,7 +27,65 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $StorageScriptTestMode = ($MyInvocation.InvocationName -eq '.' -and $env:OSCAR_STORAGE_TEST_MODE -ceq '1')
-$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+function Fail([string]$Message) { throw $Message }
+
+function Assert-NoReparseComponents([string]$FullPath, [switch]$AllowMissingLeaf) {
+    $full = [IO.Path]::GetFullPath($FullPath)
+    $volume = [IO.Path]::GetPathRoot($full)
+    $current = $volume
+    $parts = $full.Substring($volume.Length) -split '[\\/]'
+    for ($index = 0; $index -lt $parts.Count; $index++) {
+        if (-not $parts[$index]) { continue }
+        $current = Join-Path $current $parts[$index]
+        $isLeaf = $index -eq ($parts.Count - 1)
+        if (-not (Test-Path -LiteralPath $current)) {
+            if ($AllowMissingLeaf -and $isLeaf) { return }
+            Fail "Path component is missing: $current"
+        }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Reparse points are not permitted in privileged storage paths: $current"
+        }
+    }
+}
+
+function Resolve-ExistingPhysicalPath([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path)
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        if (-not ('OscarStoragePathNative' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class OscarStoragePathNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint bufferLength);
+}
+'@
+        }
+        $buffer = New-Object Text.StringBuilder 32768
+        $length = [OscarStoragePathNative]::GetLongPathName($full, $buffer, [uint32]$buffer.Capacity)
+        if ($length -eq 0 -or $length -ge $buffer.Capacity) {
+            $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Fail "Could not canonicalize existing privileged path (Win32 $code): $Path"
+        }
+        return [IO.Path]::GetFullPath($buffer.ToString())
+    }
+    return [string](Resolve-Path -LiteralPath $full -ErrorAction Stop).ProviderPath
+}
+
+$StorageScriptPath = [IO.Path]::GetFullPath($MyInvocation.MyCommand.Path)
+Assert-NoReparseComponents $StorageScriptPath
+$StorageScriptPath = Resolve-ExistingPhysicalPath $StorageScriptPath
+$storageScriptItem = Get-Item -LiteralPath $StorageScriptPath -Force
+if ($storageScriptItem.PSIsContainer) { Fail "OSCAR storage launcher must be a regular file: $StorageScriptPath" }
+$ScriptRoot = Resolve-ExistingPhysicalPath (Split-Path -Parent $storageScriptItem.FullName)
+Assert-NoReparseComponents $ScriptRoot
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and
+    [IO.Path]::GetPathRoot($ScriptRoot) -notmatch '^[A-Za-z]:\\$') {
+    Fail "OSCAR storage launcher must reside on a local Windows volume: $ScriptRoot"
+}
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $releaseVersionLine = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot '.env.example')) | Where-Object { $_ -match '^OSCAR_VERSION=' } | Select-Object -First 1)
 if ($releaseVersionLine.Count -ne 1) { throw 'The packaged OSCAR release version is missing.' }
@@ -35,10 +93,9 @@ $RequiredReleaseVersion = $releaseVersionLine[0].Substring('OSCAR_VERSION='.Leng
 if ($RequiredReleaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?$') { throw 'The packaged OSCAR release version is invalid.' }
 $MaxBackupArchiveGenerationIds = 1000000
 $MaxBackupArchiveGenerationInventoryBytes = 37000000
+$ArchiveAuditSortChunkLines = 4096
 $ValidatorScratchTmpfs = '/tmp:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=0,gid=0'
 $script:StorageAdminLock = $null
-
-function Fail([string]$Message) { throw $Message }
 
 function Initialize-NativeStorageMethods {
     if ('OscarStorageNative' -as [type]) { return }
@@ -193,11 +250,35 @@ function Test-PathContains([string]$Parent, [string]$Child) {
         $childFull.StartsWith($parentFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Resolve-PhysicalContainmentPath([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $cursor = $full
+    $missing = New-Object 'System.Collections.Generic.List[string]'
+    while (-not (Test-Path -LiteralPath $cursor)) {
+        $leaf = Split-Path -Leaf $cursor
+        $parent = Split-Path -Parent $cursor
+        if (-not $leaf -or -not $parent -or $parent -ceq $cursor) {
+            Fail "Cannot resolve an existing ancestor for privileged storage path: $Path"
+        }
+        $missing.Insert(0, $leaf)
+        $cursor = $parent
+    }
+    Assert-NoReparseComponents $cursor
+    $item = Get-Item -LiteralPath $cursor -Force
+    if ($missing.Count -gt 0 -and -not $item.PSIsContainer) {
+        Fail "Privileged storage path ancestor is not a directory: $cursor"
+    }
+    $resolved = Resolve-ExistingPhysicalPath $item.FullName
+    foreach ($part in $missing) { $resolved = Join-Path $resolved $part }
+    return [IO.Path]::GetFullPath($resolved)
+}
+
 function Assert-StorageRootShapes {
+    $releasePath = Resolve-PhysicalContainmentPath $ScriptRoot
     $roots = @(
-        @('OSCAR_ARCHIVE_DIR', $ArchiveDirectory),
-        @('OSCAR_BACKUP_DIR', $BackupDirectory),
-        @('OSCAR_WAL_ARCHIVE_DIR', $WalArchiveDirectory)
+        @('OSCAR_ARCHIVE_DIR', (Resolve-PhysicalContainmentPath $ArchiveDirectory)),
+        @('OSCAR_BACKUP_DIR', (Resolve-PhysicalContainmentPath $BackupDirectory)),
+        @('OSCAR_WAL_ARCHIVE_DIR', (Resolve-PhysicalContainmentPath $WalArchiveDirectory))
     )
     foreach ($entry in $roots) {
         $label = $entry[0]
@@ -208,13 +289,14 @@ function Assert-StorageRootShapes {
         if ($components.Count -lt 2) {
             Fail "$label is too broad; configure a dedicated directory at least two components below its volume root: $path"
         }
-        if (Test-PathContains $path $ScriptRoot) {
+        if (Test-PathContains $path $releasePath) {
             Fail "$label must not equal or contain the OSCAR release directory: $path"
         }
-        if (Test-PathContains $ScriptRoot $path) {
+        if (Test-PathContains $releasePath $path) {
             Fail "$label must not be located inside the versioned OSCAR release directory: $path"
         }
         $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+        if ($profile) { $profile = Resolve-PhysicalContainmentPath $profile }
         if ($profile -and (Test-PathContains $path $profile)) {
             Fail "$label must not equal or contain the administrator profile directory: $path"
         }
@@ -721,6 +803,55 @@ function Invoke-PsqlLines([string]$Sql) {
     return @(Get-ComposeOutput $arguments | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -ne '' })
 }
 
+function Write-PsqlLinesToFile([string]$Sql, [string]$Path) {
+    $wrapper = 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password); PGOPTIONS=-csearch_path=oscar,public; export PGPASSWORD PGOPTIONS; exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"'
+    Push-Location $ScriptRoot
+    $saved = Clear-ComposeOverrideEnvironment
+    $writer = $null
+    try {
+        $pinned = @(
+            'compose', '--project-name', 'oscar', '--env-file', (Join-Path $ScriptRoot '.env'),
+            '--file', (Join-Path $ScriptRoot 'compose.yaml'),
+            'exec', '-T', 'postgres', 'sh', '-eu', '-c', $wrapper, 'psql-wrapper',
+            '--quiet', '--tuples-only', '--no-align', '--command', $Sql
+        )
+        $writer = [IO.StreamWriter]::new($Path, $false, $Utf8NoBom)
+        $writer.NewLine = "`n"
+        & docker @pinned | ForEach-Object { $writer.WriteLine(([string]$_).TrimEnd("`r")) }
+        $exitCode = $LASTEXITCODE
+        $writer.Flush()
+        if ($exitCode -ne 0) { Fail "docker compose PostgreSQL snapshot exited with code $exitCode." }
+    } finally {
+        if ($writer) { $writer.Dispose() }
+        Restore-ComposeOverrideEnvironment $saved
+        Pop-Location
+    }
+}
+
+function Test-FileContentEqual([string]$First, [string]$Second) {
+    $firstInfo = Get-Item -LiteralPath $First
+    $secondInfo = Get-Item -LiteralPath $Second
+    if ($firstInfo.Length -ne $secondInfo.Length) { return $false }
+    $left = [IO.File]::OpenRead($First)
+    $right = [IO.File]::OpenRead($Second)
+    try {
+        $leftBuffer = New-Object byte[] 65536
+        $rightBuffer = New-Object byte[] 65536
+        while ($true) {
+            $leftRead = $left.Read($leftBuffer, 0, $leftBuffer.Length)
+            $rightRead = $right.Read($rightBuffer, 0, $rightBuffer.Length)
+            if ($leftRead -ne $rightRead) { return $false }
+            if ($leftRead -eq 0) { return $true }
+            for ($index = 0; $index -lt $leftRead; $index++) {
+                if ($leftBuffer[$index] -ne $rightBuffer[$index]) { return $false }
+            }
+        }
+    } finally {
+        $left.Dispose()
+        $right.Dispose()
+    }
+}
+
 function Get-OscarImage { return "oscar:$(Get-EnvValue 'OSCAR_VERSION' 'local')" }
 
 function Invoke-ArchiveObjectHelper(
@@ -764,7 +895,11 @@ function Get-PostgresImage {
 }
 function Test-BackupId([string]$Value) { return $Value -match '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$' }
 function Test-Uuid([string]$Value) { return $Value -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$' }
-function Test-ObservationId([string]$Value) { return $Value -match '^[1-9][0-9]{0,18}$' }
+function Test-ObservationId([string]$Value) {
+    if ($Value -notmatch '^[1-9][0-9]{0,18}$') { return $false }
+    [long]$parsed = 0
+    return [long]::TryParse($Value, [ref]$parsed) -and $parsed -gt 0
+}
 function Test-UtcCutoff([string]$Value) { return $Value -match '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' }
 function Test-StoreKey([string]$Value) { return $Value -match '^[A-Za-z_][A-Za-z0-9_]{0,62}$' }
 function Test-IdScope([string]$Value) {
@@ -779,24 +914,9 @@ function Test-RelativeObjectPath([string]$Value) {
         $Value -notmatch '(^|/)\.\.(/|$)' -and $Value -notmatch '//'
 }
 
-function Assert-NoReparseComponents([string]$FullPath, [switch]$AllowMissingLeaf) {
-    $full = [IO.Path]::GetFullPath($FullPath)
-    $volume = [IO.Path]::GetPathRoot($full)
-    $current = $volume
-    $parts = $full.Substring($volume.Length) -split '[\\/]'
-    for ($index = 0; $index -lt $parts.Count; $index++) {
-        if (-not $parts[$index]) { continue }
-        $current = Join-Path $current $parts[$index]
-        $isLeaf = $index -eq ($parts.Count - 1)
-        if (-not (Test-Path -LiteralPath $current)) {
-            if ($AllowMissingLeaf -and $isLeaf) { return }
-            Fail "Path component is missing: $current"
-        }
-        $item = Get-Item -LiteralPath $current -Force
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Fail "Reparse points are not permitted in privileged storage paths: $current"
-        }
-    }
+function Test-ArchiveObjectPath([string]$Value) {
+    return (Test-RelativeObjectPath $Value) -and
+        $Value -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+/generation-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(?:parquet|schemas\.json\.gz|manifest\.json)$'
 }
 
 function Assert-SafeCreatableDirectoryPath([string]$FullPath) {
@@ -840,105 +960,298 @@ function Resolve-ConfinedArchivePath([string]$Relative, [switch]$AllowMissing) {
     return Resolve-ConfinedStorageFile $ArchiveDirectory $Relative -AllowMissing:$AllowMissing
 }
 
-function Get-RegisteredArchivePaths {
-    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($path in @(Invoke-PsqlLines "SELECT relative_path FROM oscar_archive_object WHERE state IN ('ACTIVE','DELETING') ORDER BY relative_path;")) {
-        if (-not (Test-RelativeObjectPath $path)) { Fail "Catalog contains unsafe object path: $path" }
-        [void]$paths.Add($path)
+function Write-ArchiveAuditSortedChunk(
+    [Collections.Generic.List[string]]$Lines,
+    [string]$Path
+) {
+    [void]$Lines.Sort([StringComparer]::Ordinal)
+    $writer = [IO.StreamWriter]::new($Path, $false, $Utf8NoBom)
+    try {
+        $previous = $null
+        $hasPrevious = $false
+        foreach ($line in $Lines) {
+            if (-not $hasPrevious -or -not [StringComparer]::Ordinal.Equals($previous, $line)) {
+                $writer.WriteLine($line)
+                $previous = $line
+                $hasPrevious = $true
+            }
+        }
+    } finally { $writer.Dispose() }
+}
+
+function Merge-ArchiveAuditSortedFiles(
+    [string]$LeftPath,
+    [string]$RightPath,
+    [string]$DestinationPath
+) {
+    $left = $null
+    $right = $null
+    $writer = $null
+    try {
+        $left = [IO.StreamReader]::new($LeftPath, $Utf8NoBom, $true, 65536)
+        $right = [IO.StreamReader]::new($RightPath, $Utf8NoBom, $true, 65536)
+        $writer = [IO.StreamWriter]::new($DestinationPath, $false, $Utf8NoBom, 65536)
+        $leftLine = $left.ReadLine()
+        $rightLine = $right.ReadLine()
+        $previous = $null
+        $hasPrevious = $false
+        while ($null -ne $leftLine -or $null -ne $rightLine) {
+            if ($null -eq $rightLine) {
+                $selected = $leftLine
+                $leftLine = $left.ReadLine()
+            } elseif ($null -eq $leftLine) {
+                $selected = $rightLine
+                $rightLine = $right.ReadLine()
+            } else {
+                $comparison = [StringComparer]::Ordinal.Compare($leftLine, $rightLine)
+                if ($comparison -lt 0) {
+                    $selected = $leftLine
+                    $leftLine = $left.ReadLine()
+                } elseif ($comparison -gt 0) {
+                    $selected = $rightLine
+                    $rightLine = $right.ReadLine()
+                } else {
+                    $selected = $leftLine
+                    $leftLine = $left.ReadLine()
+                    $rightLine = $right.ReadLine()
+                }
+            }
+            if (-not $hasPrevious -or -not [StringComparer]::Ordinal.Equals($previous, $selected)) {
+                $writer.WriteLine($selected)
+                $previous = $selected
+                $hasPrevious = $true
+            }
+        }
+    } finally {
+        if ($writer) { $writer.Dispose() }
+        if ($right) { $right.Dispose() }
+        if ($left) { $left.Dispose() }
     }
-    Write-Output -NoEnumerate $paths
+}
+
+function ConvertTo-ArchiveAuditSortedUniqueFile(
+    [string]$InputPath,
+    [string]$OutputPath,
+    [int]$ChunkLineLimit = $ArchiveAuditSortChunkLines
+) {
+    if ($ChunkLineLimit -lt 1 -or $ChunkLineLimit -gt 65536) {
+        Fail 'Archive audit sort chunk size must be between 1 and 65536 lines.'
+    }
+    $sortRoot = Join-Path (Split-Path -Parent $OutputPath) ('sort-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $sortRoot | Out-Null
+    $reader = $null
+    try {
+        $buffer = New-Object 'Collections.Generic.List[string]'
+        $chunkCount = 0
+        $reader = [IO.StreamReader]::new($InputPath, $Utf8NoBom, $true, 65536)
+        while (($line = $reader.ReadLine()) -ne $null) {
+            if ($line.Length -eq 0) { continue }
+            $buffer.Add($line)
+            if ($buffer.Count -ge $ChunkLineLimit) {
+                $chunk = Join-Path $sortRoot ('pass-0000-{0:D8}.txt' -f $chunkCount)
+                Write-ArchiveAuditSortedChunk $buffer $chunk
+                $buffer.Clear()
+                $chunkCount++
+            }
+        }
+        if ($buffer.Count -ne 0) {
+            $chunk = Join-Path $sortRoot ('pass-0000-{0:D8}.txt' -f $chunkCount)
+            Write-ArchiveAuditSortedChunk $buffer $chunk
+            $buffer.Clear()
+            $chunkCount++
+        }
+        $reader.Dispose()
+        $reader = $null
+
+        if ($chunkCount -eq 0) {
+            [IO.File]::WriteAllText($OutputPath, '', $Utf8NoBom)
+            return
+        }
+
+        $pass = 0
+        while ($chunkCount -gt 1) {
+            $nextCount = 0
+            for ($index = 0; $index -lt $chunkCount; $index += 2) {
+                $left = Join-Path $sortRoot ('pass-{0:D4}-{1:D8}.txt' -f $pass, $index)
+                $destination = Join-Path $sortRoot ('pass-{0:D4}-{1:D8}.txt' -f ($pass + 1), $nextCount)
+                if (($index + 1) -lt $chunkCount) {
+                    $right = Join-Path $sortRoot ('pass-{0:D4}-{1:D8}.txt' -f $pass, ($index + 1))
+                    Merge-ArchiveAuditSortedFiles $left $right $destination
+                    Remove-Item -LiteralPath $right -Force
+                } else {
+                    [IO.File]::Move($left, $destination)
+                }
+                if (Test-Path -LiteralPath $left) { Remove-Item -LiteralPath $left -Force }
+                $nextCount++
+            }
+            $pass++
+            $chunkCount = $nextCount
+        }
+
+        $finalChunk = Join-Path $sortRoot ('pass-{0:D4}-00000000.txt' -f $pass)
+        if (Test-Path -LiteralPath $OutputPath) { Remove-Item -LiteralPath $OutputPath -Force }
+        [IO.File]::Move($finalChunk, $OutputPath)
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if (Test-Path -LiteralPath $sortRoot) {
+            Remove-Item -LiteralPath $sortRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Write-RegisteredArchivePaths([string]$Path) {
+    $sql = "SELECT relative_path FROM oscar_archive_object WHERE state IN ('ACTIVE','DELETING') ORDER BY relative_path;"
+    Write-PsqlLinesToFile $sql $Path
+    foreach ($relative in [IO.File]::ReadLines($Path)) {
+        if (-not (Test-ArchiveObjectPath $relative)) {
+            Fail "Catalog contains an object path outside the approved archive layout: $relative"
+        }
+    }
+}
+
+function Compare-ArchiveAuditSortedFiles([string]$CandidatePath, [string]$CatalogPath) {
+    $candidates = $null
+    $catalog = $null
+    $failures = 0
+    try {
+        $candidates = [IO.StreamReader]::new($CandidatePath, $Utf8NoBom, $true, 65536)
+        $catalog = [IO.StreamReader]::new($CatalogPath, $Utf8NoBom, $true, 65536)
+        $candidate = $candidates.ReadLine()
+        $registered = $catalog.ReadLine()
+        while ($null -ne $candidate) {
+            while ($null -ne $registered -and
+                [StringComparer]::Ordinal.Compare($registered, $candidate) -lt 0) {
+                $registered = $catalog.ReadLine()
+            }
+            if ($null -eq $registered -or
+                [StringComparer]::Ordinal.Compare($registered, $candidate) -gt 0) {
+                Write-Error "Unregistered archive object: $candidate" -ErrorAction Continue
+                $failures++
+            }
+            $candidate = $candidates.ReadLine()
+        }
+    } finally {
+        if ($catalog) { $catalog.Dispose() }
+        if ($candidates) { $candidates.Dispose() }
+    }
+    return $failures
 }
 
 function Test-ArchiveFilesystemRegistration([switch]$RejectPartials) {
     if (-not (Test-Path -LiteralPath $ArchiveDirectory -PathType Container)) { Fail "Archive root is unavailable: $ArchiveDirectory" }
     Assert-NoReparseComponents $ArchiveDirectory
     $root = [IO.Path]::GetFullPath($ArchiveDirectory).TrimEnd('\', '/')
-    $catalog = Get-RegisteredArchivePaths
-    $candidates = New-Object System.Collections.Generic.List[string]
-    $pending = New-Object System.Collections.Generic.Stack[string]
-    $pending.Push($root)
-    $failures = 0
-    $freshPartials = 0
-    while ($pending.Count -gt 0) {
-        $directory = $pending.Pop()
-        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force)) {
-            $relative = $item.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                Write-Error "Unsafe reparse-point archive entry: $relative" -ErrorAction Continue
-                $failures++
-                continue
-            }
-            # The administrator-owned root identity is host metadata, not an
-            # archive object. The command dispatcher authenticates it before
-            # every live archive operation; only its exact root-level name is
-            # exempt from the intentionally narrower object-path grammar.
-            if ($relative -ceq '.oscar-storage-root') {
-                if ($item.PSIsContainer -or $item -isnot [IO.FileInfo]) {
-                    Write-Error "Archive root identity marker is not a regular file: $relative" -ErrorAction Continue
-                    $failures++
-                }
-                continue
-            }
-            if (-not (Test-RelativeObjectPath $relative)) {
-                Write-Error "Unsafe archive filesystem path: $relative" -ErrorAction Continue
-                $failures++
-                continue
-            }
-            $validDirectory = $relative -ceq 'datasets' -or $relative -ceq 'datasets/observations' -or
-                $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}$' -or
-                $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+$'
-            $validObject = $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+/generation-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(?:parquet|schemas\.json\.gz|manifest\.json)$'
-            $validPartial = $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+/generation-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(?:parquet|schemas\.json\.gz|manifest\.json)\.partial.*$'
-            if ($item.Name.IndexOf('.partial', [StringComparison]::Ordinal) -ge 0) {
-                if (-not $validPartial) {
-                    Write-Error "Archive partial is outside the approved generation-object layout: $relative" -ErrorAction Continue
-                    $failures++
-                    continue
-                }
-                if ($RejectPartials) {
-                    Write-Error "Archive partial exists while writers are quiesced: $relative" -ErrorAction Continue
-                    $failures++
-                } elseif (([DateTime]::UtcNow - $item.LastWriteTimeUtc).TotalSeconds -ge 7200) {
-                    Write-Error "Stale archive partial (at least two hours old): $relative" -ErrorAction Continue
-                    $failures++
-                } else {
-                    Write-Warning "Archive partial is still within the two-hour in-progress window: $relative"
-                    $freshPartials++
-                }
-                continue
-            }
-            if ($item.PSIsContainer) {
-                if (-not $validDirectory) {
-                    Write-Error "Archive directory is outside the approved datasets layout: $relative" -ErrorAction Continue
-                    $failures++
-                }
-                $pending.Push($item.FullName)
-            } elseif ($item -is [IO.FileInfo]) {
-                if (-not $validObject) {
-                    Write-Error "Archive file is outside the approved generation-object layout: $relative" -ErrorAction Continue
-                    $failures++
-                } else {
-                    $candidates.Add($relative)
-                }
-            } else {
-                Write-Error "Unsafe non-regular archive entry: $relative" -ErrorAction Continue
-                $failures++
-            }
-        }
-    }
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('oscar-archive-audit-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    $candidateWriter = $null
+    try {
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { Protect-PrivateDirectory $scratch }
+        $catalogFirstRaw = Join-Path $scratch 'catalog-first.raw'
+        $catalogSecondRaw = Join-Path $scratch 'catalog-second.raw'
+        $catalogFirst = Join-Path $scratch 'catalog-first.sorted'
+        $catalogSecond = Join-Path $scratch 'catalog-second.sorted'
+        $catalogMerged = Join-Path $scratch 'catalog-merged.sorted'
+        $candidateRaw = Join-Path $scratch 'candidates.raw'
+        $candidateSorted = Join-Path $scratch 'candidates.sorted'
+        Write-RegisteredArchivePaths $catalogFirstRaw
 
-    # Merge a second catalog read so a generation activated during the scan is
-    # not reported as an orphan merely because publication and catalog commit race.
-    $latestCatalog = Get-RegisteredArchivePaths
-    foreach ($path in $latestCatalog) { [void]$catalog.Add($path) }
-    foreach ($relative in $candidates) {
-        if (-not $catalog.Contains($relative)) {
-            Write-Error "Unregistered archive object: $relative" -ErrorAction Continue
-            $failures++
+        $candidateWriter = [IO.StreamWriter]::new($candidateRaw, $false, $Utf8NoBom, 65536)
+        $pending = New-Object System.Collections.Generic.Stack[string]
+        $pending.Push($root)
+        $failures = 0
+        $freshPartials = 0
+        while ($pending.Count -gt 0) {
+            $directory = $pending.Pop()
+            $entries = [IO.Directory]::EnumerateFileSystemEntries($directory).GetEnumerator()
+            try {
+                while ($entries.MoveNext()) {
+                    $item = Get-Item -LiteralPath ([string]$entries.Current) -Force
+                    $relative = $item.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+                    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        Write-Error "Unsafe reparse-point archive entry: $relative" -ErrorAction Continue
+                        $failures++
+                        continue
+                    }
+                    # The administrator-owned root identity is host metadata, not an
+                    # archive object. The command dispatcher authenticates it before
+                    # every live archive operation; only its exact root-level name is
+                    # exempt from the intentionally narrower object-path grammar.
+                    if ($relative -ceq '.oscar-storage-root') {
+                        if ($item.PSIsContainer -or $item -isnot [IO.FileInfo]) {
+                            Write-Error "Archive root identity marker is not a regular file: $relative" -ErrorAction Continue
+                            $failures++
+                        }
+                        continue
+                    }
+                    if (-not (Test-RelativeObjectPath $relative)) {
+                        Write-Error "Unsafe archive filesystem path: $relative" -ErrorAction Continue
+                        $failures++
+                        continue
+                    }
+                    $validDirectory = $relative -ceq 'datasets' -or $relative -ceq 'datasets/observations' -or
+                        $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}$' -or
+                        $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+$'
+                    $validObject = Test-ArchiveObjectPath $relative
+                    $validPartial = $relative -cmatch '^datasets/observations/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/profile=[A-Za-z0-9_-]+/generation-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(?:parquet|schemas\.json\.gz|manifest\.json)\.partial.*$'
+                    if ($item.Name.IndexOf('.partial', [StringComparison]::Ordinal) -ge 0) {
+                        if (-not $validPartial) {
+                            Write-Error "Archive partial is outside the approved generation-object layout: $relative" -ErrorAction Continue
+                            $failures++
+                            continue
+                        }
+                        if ($RejectPartials) {
+                            Write-Error "Archive partial exists while writers are quiesced: $relative" -ErrorAction Continue
+                            $failures++
+                        } elseif (([DateTime]::UtcNow - $item.LastWriteTimeUtc).TotalSeconds -ge 7200) {
+                            Write-Error "Stale archive partial (at least two hours old): $relative" -ErrorAction Continue
+                            $failures++
+                        } else {
+                            Write-Warning "Archive partial is still within the two-hour in-progress window: $relative"
+                            $freshPartials++
+                        }
+                        continue
+                    }
+                    if ($item.PSIsContainer) {
+                        if (-not $validDirectory) {
+                            Write-Error "Archive directory is outside the approved datasets layout: $relative" -ErrorAction Continue
+                            $failures++
+                        }
+                        $pending.Push($item.FullName)
+                    } elseif ($item -is [IO.FileInfo]) {
+                        if (-not $validObject) {
+                            Write-Error "Archive file is outside the approved generation-object layout: $relative" -ErrorAction Continue
+                            $failures++
+                        } else {
+                            $candidateWriter.WriteLine($relative)
+                        }
+                    } else {
+                        Write-Error "Unsafe non-regular archive entry: $relative" -ErrorAction Continue
+                        $failures++
+                    }
+                }
+            } finally {
+                if ($entries -is [IDisposable]) { $entries.Dispose() }
+            }
+        }
+        $candidateWriter.Dispose()
+        $candidateWriter = $null
+
+        # Merge a second catalog read so a generation activated during the scan is
+        # not reported as an orphan merely because publication and catalog commit race.
+        Write-RegisteredArchivePaths $catalogSecondRaw
+        ConvertTo-ArchiveAuditSortedUniqueFile $catalogFirstRaw $catalogFirst
+        ConvertTo-ArchiveAuditSortedUniqueFile $catalogSecondRaw $catalogSecond
+        Merge-ArchiveAuditSortedFiles $catalogFirst $catalogSecond $catalogMerged
+        ConvertTo-ArchiveAuditSortedUniqueFile $candidateRaw $candidateSorted
+        $failures += Compare-ArchiveAuditSortedFiles $candidateSorted $catalogMerged
+        if ($failures -ne 0) { Fail "$failures archive filesystem reconciliation failure(s); no files were changed" }
+        if ($freshPartials -ne 0) { Write-Host "$freshPartials recent archive partial(s) reported but not treated as stale." }
+    } finally {
+        if ($candidateWriter) { $candidateWriter.Dispose() }
+        if (Test-Path -LiteralPath $scratch) {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    if ($failures -ne 0) { Fail "$failures archive filesystem reconciliation failure(s); no files were changed" }
-    if ($freshPartials -ne 0) { Write-Host "$freshPartials recent archive partial(s) reported but not treated as stale." }
 }
 
 function Protect-PrivateDirectory([string]$Path) {
@@ -1188,43 +1501,75 @@ function Confirm-JournalConfirmationReceipt(
 
 function Get-ArchiveGenerationInventory([string]$Root) {
     $path = Resolve-ConfinedStorageFile $Root 'archive-generation-ids.txt'
-    $bytes = [IO.File]::ReadAllBytes($path)
-    if ($bytes.Length -gt $MaxBackupArchiveGenerationInventoryBytes) {
+    $file = Get-Item -LiteralPath $path -Force
+    if ($file.Length -gt $MaxBackupArchiveGenerationInventoryBytes) {
         Fail 'Authenticated archive-generation inventory exceeds its size limit.'
     }
-    if ($bytes.Length -gt 0 -and $bytes[$bytes.Length - 1] -ne 10) {
-        Fail 'Authenticated archive-generation inventory is not canonically newline terminated.'
-    }
-    $text = $Utf8NoBom.GetString($bytes)
-    $lines = @()
-    if ($text.Length -gt 0) { $lines = @($text.Substring(0, $text.Length - 1) -split "`n") }
-    if ($lines.Count -gt $MaxBackupArchiveGenerationIds) {
-        Fail 'Authenticated archive-generation inventory exceeds its entry limit.'
-    }
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    $buffer = New-Object byte[] 65536
+    $lineBuffer = New-Object byte[] 36
+    [long]$bytesRead = 0
+    [long]$count = 0
+    $lineLength = 0
     $previous = $null
-    foreach ($line in $lines) {
-        if ($line -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') {
-            Fail 'Authenticated archive-generation inventory contains a noncanonical UUID.'
+    try {
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $bytesRead += $read
+            if ($bytesRead -gt $MaxBackupArchiveGenerationInventoryBytes) {
+                Fail 'Authenticated archive-generation inventory exceeds its size limit.'
+            }
+            [void]$hasher.TransformBlock($buffer, 0, $read, $buffer, 0)
+            for ($index = 0; $index -lt $read; $index++) {
+                $value = $buffer[$index]
+                if ($value -eq 10) {
+                    if ($lineLength -ne 36) {
+                        Fail 'Authenticated archive-generation inventory has noncanonical record framing.'
+                    }
+                    $line = [Text.Encoding]::ASCII.GetString($lineBuffer)
+                    if ($line -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') {
+                        Fail 'Authenticated archive-generation inventory contains a noncanonical UUID.'
+                    }
+                    if ($null -ne $previous -and [string]::CompareOrdinal($previous, $line) -ge 0) {
+                        Fail 'Authenticated archive-generation inventory is unsorted or contains duplicates.'
+                    }
+                    $previous = $line
+                    $count++
+                    if ($count -gt $MaxBackupArchiveGenerationIds) {
+                        Fail 'Authenticated archive-generation inventory exceeds its entry limit.'
+                    }
+                    $lineLength = 0
+                    continue
+                }
+                if ($lineLength -ge 36) {
+                    Fail 'Authenticated archive-generation inventory has noncanonical record framing.'
+                }
+                $lineBuffer[$lineLength] = $value
+                $lineLength++
+            }
         }
-        if ($null -ne $previous -and [string]::CompareOrdinal($previous, $line) -ge 0) {
-            Fail 'Authenticated archive-generation inventory is unsorted or contains duplicates.'
+        [void]$hasher.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+        if ($lineLength -ne 0) {
+            Fail 'Authenticated archive-generation inventory is not canonically newline terminated.'
         }
-        $previous = $line
+        if ($bytesRead -ne $file.Length -or $bytesRead -ne ($count * 37)) {
+            Fail 'Authenticated archive-generation inventory has noncanonical record framing.'
+        }
+        $sha256 = ([BitConverter]::ToString($hasher.Hash)).Replace('-', '').ToLowerInvariant()
+        return [pscustomobject]@{
+            Count = $count
+            Sha256 = $sha256
+            Bytes = $bytesRead
+        }
+    } finally {
+        $stream.Dispose()
+        $hasher.Dispose()
     }
-    return $lines
-}
-
-function Get-ArchiveGenerationIdsSql([string]$Root) {
-    $ids = @(Get-ArchiveGenerationInventory $Root)
-    return "'{$($ids -join ',')}'::uuid[]"
 }
 
 function Write-ArchiveGenerationInventory([string]$Root) {
     $path = Join-Path $Root 'archive-generation-ids.txt'
-    $ids = @(Invoke-PsqlLines "SELECT id::text FROM oscar_archive_generation WHERE state IN ('ACTIVE','SEALED') ORDER BY id;")
-    $content = ''
-    if ($ids.Count -gt 0) { $content = ($ids -join "`n") + "`n" }
-    [IO.File]::WriteAllText($path, $content, $Utf8NoBom)
+    Write-PsqlLinesToFile "SELECT id::text FROM oscar_archive_generation WHERE state IN ('ACTIVE','SEALED') ORDER BY id LIMIT $($MaxBackupArchiveGenerationIds + 1);" $path
     [void](Get-ArchiveGenerationInventory $Root)
 }
 
@@ -1238,18 +1583,20 @@ function Set-VerifiedBackupEpochReceipt(
         Fail 'Authenticated backup epoch fields are invalid for the live verification receipt.'
     }
     $epochHash = (Get-FileHash -LiteralPath (Join-Path $Root 'epoch.json') -Algorithm SHA256).Hash.ToLowerInvariant()
-    $generationIdsSql = Get-ArchiveGenerationIdsSql $Root
+    $inventory = Get-ArchiveGenerationInventory $Root
     Assert-DeploymentVolumeOwnership
     $sql = @"
 WITH upserted AS (
-INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_ids,manifest_path,sha256,verified_at)
-VALUES ('$EpochId','VERIFIED','$PostgresLsn',$generationIdsSql,'$Id/epoch.json','$epochHash',now())
+INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_count,archive_generation_inventory_sha256,archive_generation_inventory_bytes,manifest_path,sha256,verified_at)
+VALUES ('$EpochId','VERIFIED','$PostgresLsn',$($inventory.Count),'$($inventory.Sha256)',$($inventory.Bytes),'$Id/epoch.json','$epochHash',now())
 ON CONFLICT (id) DO UPDATE SET
  state='VERIFIED',
  verified_at=CASE WHEN oscar_backup_epoch.state='VERIFIED' THEN oscar_backup_epoch.verified_at ELSE now() END
 WHERE oscar_backup_epoch.state IN ('CREATED','VERIFIED')
   AND oscar_backup_epoch.postgres_lsn IS NOT DISTINCT FROM EXCLUDED.postgres_lsn
-  AND oscar_backup_epoch.archive_generation_ids IS NOT DISTINCT FROM EXCLUDED.archive_generation_ids
+  AND oscar_backup_epoch.archive_generation_count IS NOT DISTINCT FROM EXCLUDED.archive_generation_count
+  AND oscar_backup_epoch.archive_generation_inventory_sha256 IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_sha256
+  AND oscar_backup_epoch.archive_generation_inventory_bytes IS NOT DISTINCT FROM EXCLUDED.archive_generation_inventory_bytes
   AND oscar_backup_epoch.manifest_path IS NOT DISTINCT FROM EXCLUDED.manifest_path
   AND oscar_backup_epoch.sha256 IS NOT DISTINCT FROM EXCLUDED.sha256
 RETURNING id::text||'|'||state
@@ -1388,7 +1735,7 @@ for entry in lib web rules documentation trusted_certificates config logback.xml
         echo "Reserved OSCAR image-owned state path is not the expected symlink: $entry" >&2; exit 1
     fi
 done
-tar --exclude='./archive' --exclude='./backups' --exclude='./lib' --exclude='./web' --exclude='./rules' --exclude='./documentation' --exclude='./trusted_certificates' --exclude='./config' --exclude='./logback.xml' -C /state -czf /output.tar.gz .
+tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclude='./lib' --exclude='./web' --exclude='./rules' --exclude='./documentation' --exclude='./trusted_certificates' --exclude='./config' --exclude='./logback.xml' -C /state -czf /output.tar.gz .
 '@
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state:ro', '--volume', "$(Join-Path $work 'oscar-state.tar.gz'):/output.tar.gz", $image, '-eu', '-c', $stateArchive)
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive:ro", '--volume', "$(Join-Path $work 'archive.tar.gz'):/output.tar.gz", $image, '-eu', '-c', "tar --exclude='./.oscar-storage-root' -C /archive -czf /output.tar.gz .")
@@ -1425,10 +1772,10 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./lib' --exclude='./w
         $resumePostgres = $false
     }
     $epochHash = (Get-FileHash -LiteralPath (Join-Path $final 'epoch.json') -Algorithm SHA256).Hash.ToLowerInvariant()
-    $generationIdsSql = Get-ArchiveGenerationIdsSql $final
+    $inventory = Get-ArchiveGenerationInventory $final
     try {
         Assert-DeploymentVolumeOwnership
-        Invoke-PsqlScript "INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_ids,manifest_path,sha256) VALUES ('$epochId','CREATED','$lsn',$generationIdsSql,'$id/epoch.json','$epochHash');" | Out-Null
+        Invoke-PsqlScript "INSERT INTO oscar_backup_epoch(id,state,postgres_lsn,archive_generation_count,archive_generation_inventory_sha256,archive_generation_inventory_bytes,manifest_path,sha256) VALUES ('$epochId','CREATED','$lsn',$($inventory.Count),'$($inventory.Sha256)',$($inventory.Bytes),'$id/epoch.json','$epochHash');" | Out-Null
     } catch {
         Write-Warning "Backup payload is complete, but its live catalog receipt could not be inserted: $($_.Exception.Message)"
     }
@@ -2124,7 +2471,7 @@ function Invoke-RetentionHold([string]$Mode) {
     Assert-Administrator; Assert-Configured
     switch ($Mode) {
         'list' {
-            Invoke-Psql "SELECT id,store_key,id_scope,subject_type,subject_id,reason,created_by,created_at,released_at,released_by FROM oscar_retention_hold ORDER BY (released_at IS NULL) DESC,store_key,id_scope,created_at DESC;" -Table
+            Invoke-Psql "SELECT id,store_key,id_scope,subject_type,subject_id,resolution_mode,reason,created_by,created_at,released_at,released_by FROM oscar_retention_hold ORDER BY (released_at IS NULL) DESC,store_key,id_scope,created_at DESC;" -Table
         }
         'create' {
             $subjectType = $null
@@ -2143,56 +2490,68 @@ function Invoke-RetentionHold([string]$Mode) {
             $safeReason = $Reason.Replace("'", "''")
             $numericSubject = if ($subjectType -eq 'OBSERVATION') { $subjectId } else { '0' }
             $generationSubject = if ($subjectType -eq 'ARCHIVE_GENERATION') { $subjectId } else { '00000000-0000-4000-8000-000000000000' }
+            # ID blocks are coarse for sparse/interleaved generations. An
+            # exact hot row is authoritative; ranges are a cold-only fallback.
             $sql = @"
 BEGIN;
 LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE;
 WITH eligible AS (
-    SELECT 1 WHERE
-        ('$subjectType'='ARCHIVE_GENERATION' AND EXISTS (
+    SELECT CASE
+        WHEN '$subjectType'='ARCHIVE_GENERATION' AND EXISTS (
             SELECT 1 FROM oscar_archive_generation
              WHERE id='$generationSubject' AND store_key='$StoreKey' AND id_scope=$IdScope
                AND state IN ('ACTIVE','SEALED')
-        )) OR
-        ('$subjectType'='OBSERVATION' AND
-            (EXISTS (
-                SELECT 1 FROM "$StoreKey" observation_row
-                 WHERE observation_row.id='$numericSubject'::numeric
-                   AND (observation_row.archivegenerationid IS NULL OR EXISTS (
-                       SELECT 1 FROM oscar_archive_generation owner
-                        WHERE owner.id=observation_row.archivegenerationid
-                          AND owner.store_key='$StoreKey' AND owner.id_scope=$IdScope
-                          AND owner.state IN ('ACTIVE','SEALED')
-                   ))
-            ) OR EXISTS (
-                SELECT 1 FROM oscar_archive_id_block b
-                JOIN oscar_archive_generation g ON g.id=b.generation_id
-                 WHERE '$numericSubject'::numeric BETWEEN b.min_id AND b.max_id
-                   AND g.store_key='$StoreKey' AND g.id_scope=$IdScope
-                   AND g.state IN ('ACTIVE','SEALED')
-            )) AND
-            NOT EXISTS (
-                SELECT 1 FROM oscar_archive_id_block b
-                JOIN oscar_archive_generation g ON g.id=b.generation_id
-                 WHERE '$numericSubject'::numeric BETWEEN b.min_id AND b.max_id
-                   AND g.store_key='$StoreKey' AND g.id_scope=$IdScope
-                   AND g.state IN ('DELETING','PURGED')
-            ) AND NOT EXISTS (
+        ) THEN 'GENERATION_EXACT'
+        WHEN '$subjectType'='OBSERVATION' AND NOT EXISTS (
                 SELECT 1 FROM oscar_tombstone
                  WHERE subject_type='OBSERVATION' AND store_key='$StoreKey' AND id_scope=$IdScope
                    AND subject_id='$subjectId'
-            ))
+            ) THEN CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM "$StoreKey" any_hot_row
+                     WHERE any_hot_row.id='$numericSubject'::bigint
+                ) THEN CASE WHEN EXISTS (
+                        SELECT 1 FROM "$StoreKey" exact_hot_row
+                         WHERE exact_hot_row.id='$numericSubject'::bigint
+                           AND (exact_hot_row.archivegenerationid IS NULL OR EXISTS (
+                               SELECT 1 FROM oscar_archive_generation exact_owner
+                                WHERE exact_owner.id=exact_hot_row.archivegenerationid
+                                  AND exact_owner.store_key='$StoreKey' AND exact_owner.id_scope=$IdScope
+                                  AND exact_owner.state IN ('ACTIVE','SEALED')
+                           ))
+                    ) THEN 'HOT_EXACT' END
+                WHEN EXISTS (
+                        SELECT 1 FROM oscar_archive_id_block active_block
+                        JOIN oscar_archive_generation active_generation ON active_generation.id=active_block.generation_id
+                         WHERE '$numericSubject'::bigint BETWEEN active_block.min_id AND active_block.max_id
+                           AND active_generation.store_key='$StoreKey' AND active_generation.id_scope=$IdScope
+                           AND active_generation.state IN ('ACTIVE','SEALED')
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM oscar_archive_id_block retired_block
+                        JOIN oscar_archive_generation retired_generation ON retired_generation.id=retired_block.generation_id
+                         WHERE '$numericSubject'::bigint BETWEEN retired_block.min_id AND retired_block.max_id
+                           AND retired_generation.store_key='$StoreKey' AND retired_generation.id_scope=$IdScope
+                           AND retired_generation.state IN ('DELETING','PURGED')
+                    ) THEN 'COLD_RANGE_CONSERVATIVE'
+            END
+    END AS resolution_mode
 ), inserted AS (
-    INSERT INTO oscar_retention_hold(id,store_key,id_scope,subject_type,subject_id,reason,created_by)
-    SELECT gen_random_uuid(),'$StoreKey',$IdScope,'$subjectType','$subjectId','$safeReason','$creator' FROM eligible
-    RETURNING id
+    INSERT INTO oscar_retention_hold(id,store_key,id_scope,subject_type,subject_id,resolution_mode,reason,created_by)
+    SELECT gen_random_uuid(),'$StoreKey',$IdScope,'$subjectType','$subjectId',resolution_mode,'$safeReason','$creator'
+      FROM eligible WHERE resolution_mode IS NOT NULL
+    RETURNING id,resolution_mode
 )
-SELECT coalesce((SELECT id::text FROM inserted),'REJECTED');
+SELECT coalesce((SELECT id::text||chr(9)||resolution_mode FROM inserted),'REJECTED');
 COMMIT;
 "@
-            $id = Invoke-Psql $sql
-            if ($id -ceq 'REJECTED') { Fail 'The hold target is unknown, already purged/tombstoned, or currently being deleted.' }
-            if (-not (Test-Uuid $id)) { Fail 'PostgreSQL did not return a valid hold ID.' }
-            Write-Host "Retention hold created: $id (store=$StoreKey, id-scope=$IdScope)" -ForegroundColor Green
+            $result = Invoke-Psql $sql
+            if ($result -ceq 'REJECTED') { Fail 'The hold target is unknown, already purged/tombstoned, or currently being deleted.' }
+            $fields = $result -split "`t", 2
+            if ($fields.Count -ne 2 -or -not (Test-Uuid $fields[0]) -or
+                $fields[1] -cnotin @('GENERATION_EXACT','HOT_EXACT','COLD_RANGE_CONSERVATIVE')) {
+                Fail 'PostgreSQL did not return a valid hold ID and resolution mode.'
+            }
+            Write-Host "Retention hold created: $($fields[0]) (store=$StoreKey, id-scope=$IdScope, resolution=$($fields[1]))" -ForegroundColor Green
         }
         'release' {
             if (-not (Test-Uuid $HoldId)) { Fail 'A valid -HoldId UUID is required.' }
@@ -2208,17 +2567,111 @@ COMMIT;
 
 function Confirm-ArchiveObjects([switch]$RejectPartials) {
     Assert-Configured
-    $lines = @(Invoke-PsqlLines "SELECT relative_path||E'\\t'||sha256 FROM oscar_archive_object WHERE state='ACTIVE' ORDER BY relative_path;")
-    foreach ($line in $lines) {
-        if (-not $line) { continue }
-        $fields = $line -split "`t", 2
-        if ($fields.Count -ne 2) { Fail "Unsafe catalog row: $line" }
-        $path = Resolve-ConfinedArchivePath $fields[0]
-        $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actual -cne $fields[1]) { Fail "Archive checksum mismatch: $($fields[0])" }
+    $sql = @"
+WITH required(kind) AS (
+    VALUES ('OBSERVATIONS_PARQUET'),('GENERATION_MANIFEST'),('DATASTREAM_SCHEMAS')
+), required_rows AS (
+    SELECT 'REQUIRED'::text row_type,g.id::text generation_id,required.kind,
+           count(o.generation_id)::text object_count,coalesce(min(o.state),'') object_state,
+           coalesce(min(o.relative_path),'') relative_path,coalesce(min(o.sha256),'') object_sha,
+           coalesce(g.object_path,'') generation_object_path,coalesce(g.sha256,'') generation_sha,
+           coalesce(g.manifest_path,'') generation_manifest_path
+      FROM oscar_archive_generation g CROSS JOIN required
+      LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.kind=required.kind
+     WHERE g.state IN ('ACTIVE','SEALED')
+     GROUP BY g.id,required.kind,g.object_path,g.sha256,g.manifest_path
+), additional_rows AS (
+    SELECT 'ADDITIONAL'::text,g.id::text,coalesce(o.kind,''),'1'::text,coalesce(o.state,''),
+           coalesce(o.relative_path,''),coalesce(o.sha256,''),
+           coalesce(g.object_path,''),coalesce(g.sha256,''),coalesce(g.manifest_path,'')
+      FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id
+     WHERE o.state='ACTIVE'
+       AND g.state IN ('ACTIVE','SEALED')
+       AND (o.kind IS NULL OR o.kind NOT IN ('OBSERVATIONS_PARQUET','GENERATION_MANIFEST','DATASTREAM_SCHEMAS'))
+), invalid_owner_rows AS (
+    SELECT 'INVALID_OWNER'::text,g.id::text,coalesce(o.kind,''),'1'::text,coalesce(o.state,''),
+           coalesce(o.relative_path,''),coalesce(o.sha256,''),
+           coalesce(g.object_path,''),coalesce(g.sha256,''),coalesce(g.manifest_path,'')
+      FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id
+     WHERE o.state='ACTIVE' AND g.state NOT IN ('ACTIVE','SEALED')
+), integrity_rows AS (
+    SELECT 'RELATIONAL'::text,g.id::text,'ID_BLOCK_AND_SCHEMAS'::text,
+           (SELECT count(*)::text FROM oscar_archive_id_block block
+             WHERE block.generation_id=g.id),
+           CASE WHEN (SELECT count(*) FROM oscar_archive_id_block block
+                       WHERE block.generation_id=g.id)=1
+                     AND EXISTS (SELECT 1 FROM oscar_archive_id_block block
+                                  WHERE block.generation_id=g.id
+                                    AND block.min_id=g.min_id AND block.max_id=g.max_id)
+                THEN 'MATCH' ELSE 'MISMATCH' END,
+           (SELECT count(*)::text FROM oscar_archive_schema schema_row
+             WHERE schema_row.generation_id=g.id),
+           ''::text,coalesce(g.object_path,''),coalesce(g.sha256,''),coalesce(g.manifest_path,'')
+      FROM oscar_archive_generation g
+     WHERE g.state IN ('ACTIVE','SEALED')
+)
+SELECT row_type||chr(31)||generation_id||chr(31)||kind||chr(31)||object_count||chr(31)||
+       object_state||chr(31)||relative_path||chr(31)||object_sha||chr(31)||
+       generation_object_path||chr(31)||generation_sha||chr(31)||generation_manifest_path
+  FROM (SELECT * FROM required_rows UNION ALL SELECT * FROM additional_rows
+        UNION ALL SELECT * FROM invalid_owner_rows UNION ALL SELECT * FROM integrity_rows) snapshot
+ ORDER BY generation_id,row_type,kind,relative_path,object_sha;
+"@
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ("oscar-archive-verify-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    try {
+        Protect-PrivateDirectory $scratch
+        $before = Join-Path $scratch 'catalog-before.tsv'
+        $after = Join-Path $scratch 'catalog-after.tsv'
+        Write-PsqlLinesToFile $sql $before
+        foreach ($line in [IO.File]::ReadLines($before)) {
+            if (-not $line) { continue }
+            $fields = $line -split ([char]31), 10
+            if ($fields.Count -ne 10 -or -not (Test-Uuid $fields[1])) {
+                Fail "Unsafe archive catalog snapshot row: $line"
+            }
+            if ($fields[0] -ceq 'REQUIRED') {
+                if ($fields[2] -cnotin @('OBSERVATIONS_PARQUET','GENERATION_MANIFEST','DATASTREAM_SCHEMAS') -or
+                    $fields[3] -cne '1' -or $fields[4] -cne 'ACTIVE' -or
+                    $fields[6] -cnotmatch '^[0-9a-f]{64}$' -or -not $fields[7] -or
+                    $fields[8] -cnotmatch '^[0-9a-f]{64}$' -or -not $fields[9] -or
+                    ($fields[2] -ceq 'OBSERVATIONS_PARQUET' -and
+                        ($fields[5] -cne $fields[7] -or $fields[6] -cne $fields[8])) -or
+                    ($fields[2] -ceq 'GENERATION_MANIFEST' -and $fields[5] -cne $fields[9])) {
+                    Fail "Incomplete query-visible archive generation: $line"
+                }
+            } elseif ($fields[0] -ceq 'ADDITIONAL') {
+                if (-not $fields[2] -or $fields[3] -cne '1' -or $fields[4] -cne 'ACTIVE' -or
+                    $fields[6] -cnotmatch '^[0-9a-f]{64}$') {
+                    Fail "Unsafe additional archive catalog row: $line"
+                }
+            } elseif ($fields[0] -ceq 'INVALID_OWNER') {
+                Fail "Active archive object belongs to a non-query-visible generation: $line"
+            } elseif ($fields[0] -ceq 'RELATIONAL') {
+                if ($fields[2] -cne 'ID_BLOCK_AND_SCHEMAS' -or $fields[3] -cne '1' -or
+                    $fields[4] -cne 'MATCH' -or $fields[5] -cnotmatch '^[1-9][0-9]*$') {
+                    Fail "Invalid archive relational metadata: $line"
+                }
+                continue
+            } else {
+                Fail "Unsafe archive catalog snapshot row type: $line"
+            }
+            $path = Resolve-ConfinedArchivePath $fields[5]
+            $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $fields[6]) { Fail "Archive checksum mismatch: $($fields[5])" }
+        }
+        Test-ArchiveFilesystemRegistration -RejectPartials:$RejectPartials
+        # Re-read the same canonical single-statement snapshot after hashing and
+        # filesystem reconciliation. Background publication or concurrent purge
+        # must make verification fail/retry rather than certify a mixed instant.
+        Write-PsqlLinesToFile $sql $after
+        if (-not (Test-FileContentEqual $before $after)) {
+            Fail 'Archive catalog changed during verification; no stable result was certified. Re-run archive verify.'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force }
     }
-    Test-ArchiveFilesystemRegistration -RejectPartials:$RejectPartials
-    Write-Host 'All cataloged active archive objects passed checksum verification.' -ForegroundColor Green
+    Write-Host 'Every query-visible generation has exact ID-block bounds, schema rows, one required active object of each kind, and valid checksums.' -ForegroundColor Green
 }
 
 function New-DeletionPlan([string]$Cutoff, [string]$Requester) {
@@ -2245,7 +2698,7 @@ WITH candidate AS (
                            (h.subject_type='OBSERVATION' AND h.subject_id~'^[0-9]+$' AND EXISTS (
                                SELECT 1 FROM oscar_archive_id_block held_block
                                 WHERE held_block.generation_id=g.id
-                                  AND h.subject_id::numeric BETWEEN held_block.min_id AND held_block.max_id)))) held
+                                  AND h.subject_id::bigint BETWEEN held_block.min_id AND held_block.max_id)))) held
       FROM oscar_archive_generation g
       LEFT JOIN oscar_archive_object o ON o.generation_id=g.id AND o.state='ACTIVE'
      WHERE g.store_key='$StoreKey' AND g.id_scope=$IdScope
@@ -2293,7 +2746,7 @@ function Remove-ArchivePlan([string]$PlanId, [string]$ConfirmationToken) {
         # below rechecks holds under the same lock used by hold creation, then makes each complete
         # generation non-queryable before any file is removed. OSCAR remains stopped across the
         # verification/transition/delete sequence, closing the host path-swap window.
-        $preflight = @(Invoke-PsqlLines "SELECT g.id||E'\\t'||o.relative_path||E'\\t'||o.sha256||E'\\t'||o.state FROM oscar_deletion_plan_item i JOIN oscar_deletion_plan p ON p.id=i.plan_id JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope JOIN oscar_archive_object o ON o.generation_id=g.id WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='PLANNED' AND o.state IN ('ACTIVE','DELETING') ORDER BY g.id,o.relative_path;")
+        $preflight = @(Invoke-PsqlLines "SELECT g.id||chr(9)||o.relative_path||chr(9)||o.sha256||chr(9)||o.state FROM oscar_deletion_plan_item i JOIN oscar_deletion_plan p ON p.id=i.plan_id JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope JOIN oscar_archive_object o ON o.generation_id=g.id WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='PLANNED' AND o.state IN ('ACTIVE','DELETING') ORDER BY g.id,o.relative_path;")
         foreach ($line in $preflight) {
             if (-not $line) { continue }
             $fields = $line -split "`t", 4
@@ -2328,7 +2781,7 @@ UPDATE oscar_deletion_plan_item i
         (h.subject_type='OBSERVATION' AND h.subject_id~'^[0-9]+$' AND EXISTS (
             SELECT 1 FROM oscar_archive_id_block held_block
              WHERE held_block.generation_id=g.id
-               AND h.subject_id::numeric BETWEEN held_block.min_id AND held_block.max_id))));
+               AND h.subject_id::bigint BETWEEN held_block.min_id AND held_block.max_id))));
 SELECT 1 / CASE WHEN EXISTS (
     SELECT 1 FROM oscar_deletion_plan_item i
     JOIN oscar_deletion_plan p ON p.id=i.plan_id
@@ -2367,7 +2820,7 @@ COMMIT;
 "@
         Invoke-Psql $transitionSql | Out-Null
 
-        $objects = @(Invoke-PsqlLines "SELECT g.id||E'\\t'||o.relative_path||E'\\t'||o.sha256||E'\\t'||o.state FROM oscar_deletion_plan_item i JOIN oscar_deletion_plan p ON p.id=i.plan_id JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope JOIN oscar_archive_object o ON o.generation_id=g.id WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='PLANNED' AND g.state='DELETING' AND o.state='DELETING' ORDER BY g.id,o.relative_path;")
+        $objects = @(Invoke-PsqlLines "SELECT g.id||chr(9)||o.relative_path||chr(9)||o.sha256||chr(9)||o.state FROM oscar_deletion_plan_item i JOIN oscar_deletion_plan p ON p.id=i.plan_id JOIN oscar_archive_generation g ON g.id=i.generation_id AND g.store_key=p.store_key AND g.id_scope=p.id_scope JOIN oscar_archive_object o ON o.generation_id=g.id WHERE i.plan_id='$PlanId' AND p.store_key='$StoreKey' AND p.id_scope=$IdScope AND i.state='PLANNED' AND g.state='DELETING' AND o.state='DELETING' ORDER BY g.id,o.relative_path;")
         foreach ($line in $objects) {
             if (-not $line) { continue }
             $fields = $line -split "`t", 4
@@ -2461,7 +2914,7 @@ function Export-ArchiveGeneration([string]$GenerationId, [string]$Target) {
         $running = @(Get-ComposeOutput @('ps', '--status', 'running', '--services'))
         $resumeOscar = $running -contains 'oscar'
         if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
-        $objects = @(Invoke-PsqlLines "SELECT o.relative_path||E'\\t'||o.sha256 FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id WHERE o.generation_id='$GenerationId' AND g.store_key='$StoreKey' AND g.id_scope=$IdScope AND g.state IN ('ACTIVE','SEALED') AND o.state='ACTIVE' AND NOT EXISTS (SELECT 1 FROM oscar_archive_object unsafe WHERE unsafe.generation_id=g.id AND unsafe.state<>'ACTIVE') ORDER BY o.relative_path;")
+        $objects = @(Invoke-PsqlLines "SELECT o.relative_path||chr(9)||o.sha256 FROM oscar_archive_object o JOIN oscar_archive_generation g ON g.id=o.generation_id WHERE o.generation_id='$GenerationId' AND g.store_key='$StoreKey' AND g.id_scope=$IdScope AND g.state IN ('ACTIVE','SEALED') AND o.state='ACTIVE' AND NOT EXISTS (SELECT 1 FROM oscar_archive_object unsafe WHERE unsafe.generation_id=g.id AND unsafe.state<>'ACTIVE') ORDER BY o.relative_path;")
         $copied = 0
         foreach ($line in $objects) {
             if (-not $line) { continue }
