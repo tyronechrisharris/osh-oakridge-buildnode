@@ -19,6 +19,12 @@ if (process.argv.length > 3 || !semanticVersion.test(version ?? '')) {
     process.exit(2);
 }
 
+function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const escapedVersion = escapeRegExp(version);
+
 function read(relativePath) {
     return fs.readFileSync(path.join(repositoryRoot, relativePath), 'utf8');
 }
@@ -42,7 +48,25 @@ function requireOnlyOscarVersion(relativePath) {
     }
 }
 
+function requirePattern(relativePath, pattern, description) {
+    if (!pattern.test(read(relativePath))) {
+        throw new Error(`${relativePath}: missing ${description}.`);
+    }
+}
+
+function forbidPattern(relativePath, pattern, description) {
+    if (pattern.test(read(relativePath))) {
+        throw new Error(`${relativePath}: contains forbidden ${description}.`);
+    }
+}
+
 requireMatch('build.gradle', /^\s*version\s*=\s*"([^"]+)"\s*$/m, version, 'version');
+requireMatch(
+    '.github/workflows/release.yml',
+    /^\s*RELEASE_VERSION:\s*'([^']+)'\s*$/m,
+    version,
+    'release workflow version',
+);
 requireMatch(
     'dist/config/standard/config.json',
     /^\s*"deploymentName"\s*:\s*"OSCAR ([^"]+)"\s*,?\s*$/m,
@@ -57,16 +81,120 @@ requireMatch(
     'OSCAR image-version build argument fallback',
 );
 requireMatch(
+    'dist/release/compose.yaml',
+    /^\s+image:\s*"oscar-postgis:\$\{OSCAR_VERSION:-([^}]+)\}"\s*$/m,
+    'local',
+    'PostGIS image-version fallback',
+);
+requireMatch(
     'dist/release/docker/oscar/Dockerfile',
     /^ARG OSCAR_VERSION=(.+)$/m,
     'local',
     'OSCAR image-version argument fallback',
+);
+requirePattern(
+    'dist/release/docker/oscar/Dockerfile',
+    /COPY --chown=root:root docker\/oscar\/atomic-publish\.c \/tmp\/oscar-atomic-publish\.c/,
+    'atomic publisher source included in image build',
+);
+requirePattern(
+    'dist/release/docker/oscar/Dockerfile',
+    /sha256sum \/tmp\/oscar-atomic-publish\.c \| awk '\{print \$1\}' > \/usr\/local\/share\/oscar-atomic-publish\.source\.sha256/,
+    'atomic publisher source-provenance stamp',
+);
+requireMatch('dist/release/postgis/Dockerfile', /^ARG OSCAR_VERSION=(.+)$/m, 'local', 'PostGIS image-version argument fallback');
+requireMatch(
+    'dist/release/postgis/Dockerfile',
+    /^\s*org\.opencontainers\.image\.version="([^"\n]+)"/m,
+    '${OSCAR_VERSION}',
+    'PostGIS OCI image-version label source',
+);
+requireMatch(
+    'dist/release/postgis/Dockerfile',
+    /^\s*com\.botts\.oscar\.storage-profile="([^"\n]+)"/m,
+    '${OSCAR_VERSION}',
+    'PostGIS storage-profile label source',
+);
+requireMatch(
+    'dist/release/postgis/Dockerfile',
+    /^ENV OSCAR_STORAGE_PROFILE_VERSION="([^"\n]+)"/m,
+    '${OSCAR_VERSION}',
+    'PostGIS runtime storage-profile source',
+);
+requirePattern(
+    'dist/release/postgis/init-app-role.sh',
+    /profile_version="\$\{OSCAR_STORAGE_PROFILE_VERSION:\?OSCAR_STORAGE_PROFILE_VERSION is required\}"/,
+    'runtime-provided storage-profile marker version',
+);
+requirePattern(
+    'dist/release/postgis/init-app-role.sh',
+    /printf 'version=%s\\n' "\$\{profile_version\}"/,
+    'dynamic storage-profile receipt version',
+);
+requirePattern(
+    'dist/release/oscar-storage.sh',
+    /required_release_version=\$\(awk [^\n]+OSCAR_VERSION[^\n]+\.env\.example/,
+    'release version derived from .env.example',
+);
+requirePattern(
+    'dist/release/oscar-storage.ps1',
+    /\$RequiredReleaseVersion = \$releaseVersionLine\[0\]\.Substring\('OSCAR_VERSION='\.Length\)/,
+    'release version derived from .env.example',
+);
+forbidPattern('dist/release/oscar-storage.sh', /required_release_version=['"]?\d+\.\d+\.\d+/, 'hard-coded storage release version');
+forbidPattern('dist/release/oscar-storage.ps1', /\$RequiredReleaseVersion\s*=\s*['"]\d+\.\d+\.\d+/, 'hard-coded storage release version');
+requirePattern(
+    'dist/release/oscar-setup.sh',
+    /OSCAR \$\(release_version\) storage deployment is not supported on macOS/,
+    'dynamic setup macOS boundary version',
+);
+forbidPattern(
+    'dist/release/oscar-setup.sh',
+    /OSCAR \d+\.\d+\.\d+ storage deployment is not supported on macOS/,
+    'hard-coded setup macOS boundary version',
 );
 requireMatch(
     'dist/release/docker/oscar/Dockerfile',
     /^\s*org\.opencontainers\.image\.version="([^"\n]+)"\s*$/m,
     '${OSCAR_VERSION}',
     'OCI image-version label source',
+);
+requirePattern(
+    'README.md',
+    new RegExp(`OSCAR ${escapedVersion} storage-profile deployment is intentionally blocked on macOS`),
+    'macOS storage deployment safety boundary',
+);
+requirePattern(
+    'dist/release/DEPLOYMENT.md',
+    new RegExp(`The ${escapedVersion} storage profile fails closed on macOS`),
+    'administrator-guide macOS safety boundary',
+);
+requirePattern(
+    'dist/release/QUICKSTART.md',
+    new RegExp(`OSCAR ${escapedVersion} deployment and storage operation are supported only on Windows 11`),
+    'quick-start supported-host boundary',
+);
+forbidPattern(
+    'README.md',
+    /^- Apple Silicon macOS with Docker Desktop/m,
+    'unsupported macOS deployment claim',
+);
+for (const relativePath of [
+    'README.md',
+    'changelog.md',
+    'dist/release/DEPLOYMENT.md',
+    'dist/release/QUICKSTART.md',
+]) {
+    forbidPattern(
+        relativePath,
+        /\b(?:re-authenticates|authenticated (?:bundle|image archive|installer paths))\b/i,
+        'origin-authentication claim for an unsigned offline checksum manifest',
+    );
+}
+forbidPattern(
+    'docs/BACKUP_RESTORE.md',
+    /\bexact signed\/offline OSCAR release\b/i,
+    'signed-release claim without a release signature',
 );
 requireMatch('changelog.md', /^##\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\s|$)/m, version, 'current changelog version');
 requireMatch(
@@ -140,7 +268,13 @@ requireMatch(
 for (const relativePath of [
     'README.md',
     'dist/release/DEPLOYMENT.md',
+    'dist/release/QUICKSTART.md',
+    'docs/ARCHIVE_FORMAT.md',
+    'docs/BACKUP_RESTORE.md',
+    'docs/DATA_LIFECYCLE.md',
     'docs/LIVE_VIDEO.md',
+    'docs/STORAGE_ARCHITECTURE.md',
+    'docs/STORAGE_OPERATIONS.md',
     'docs/STATUS_OF_HEALTH.md',
     'include/osh-oakridge-modules/README.md',
     'include/osh-oakridge-modules/docs/oscar-operator-manual/README.md',

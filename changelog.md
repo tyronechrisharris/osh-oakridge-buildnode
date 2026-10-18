@@ -1,11 +1,66 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.9.2 2026-10-17
+### Storage-profile changes and rollout
+- Introduce the `OscarTieredObsSystemDatabase` storage profile with sequential observation IDs, batched writes, archive ownership markers, and a versioned PostgreSQL archive catalog
+- Initialize new PostgreSQL clusters with data checksums, WAL archiving, I/O timing, and `pg_stat_statements`; an existing cluster is not recreated by `upgrade`
+- Preserve an upgraded deployment's saved `config.json` and database, so a pre-3.9.2 deployment is not silently converted to the complete 3.9.2 storage profile
+- Require a fresh 3.9.2 database and standard configuration for the current test systems and new production deployments; preserve any required pre-3.9.2 production history through a separately validated migration
+- Ship cold archiving in copy-only mode (`deleteHotAfterArchive=false`); enable hot-row deletion only after mixed-tier parity, archive-integrity checks, a coordinated backup, and an isolated restore drill pass
+- Replace aging-video keyframe reduction with an additive exact-five JPEG retained-media format; keep the legacy occupancy `videoPaths` field and Viewer playback fallback for old/unconverted events
+
+### Storage and data lifecycle
+- Add a crash-recoverable, per-lane direct daily-file journal that captures Rapiscan and RS350 input before parsing and Aspect register snapshots before observation publication
+- Make the daily journal a required driver dependency by default so startup or append failures cannot silently bypass source-record capture
+- Frame journal records with timestamp, length, and CRC32C; bound unforced data by time, record count, and byte count; recover only incomplete tails and fail visibly on complete-frame corruption
+- Publish immutable legacy daily CSVs with exact time-zone windows, SHA-256 manifests, atomic commit ordering, and a manifest-gated compatibility-observation cleanup path
+- Batch observation inserts with immediate `DataBlock` snapshots, prepared statements, PostgreSQL batch rewriting, and one statement-level datastream-range update per batch
+- Correct observation natural-key uniqueness for null fields, make exact replays idempotent and same-key corrections last-write-wins under the stable OSH ID, route archived corrections through generation-owned overlays even after hot-row deletion, and fail index creation visibly when a legacy database contains ambiguous duplicates
+- Preserve the sequential observation-ID high-water from every cataloged archive state so a restart cannot reuse public IDs after a cold copy is cataloged and the corresponding hot rows are optionally deleted
+- Export configured high-volume detector streams from a read-only repeatable-read snapshot into Hive-partitioned, sorted, ZSTD Parquet generations with gzip OSH datastream-schema snapshots
+- Verify Parquet count/ID range before activation, publish manifests last, and atomically mark the exact exported hot rows so late arrivals remain eligible for later generations
+- Serialize archive activation/sealing against ingestion, updates, removals, overlays, tombstones, and exact hot-row deletion with transaction-scoped store and ordered observation locks, while keeping file export outside the critical section
+- Merge PostgreSQL and catalog-authorized Parquet reads behind the OSH observation-store contract, preferring hot overlap and applying archived overlays and tombstones without rewriting immutable files
+- Preserve open and closed temporal bounds through archive candidate pruning and DuckDB pushdown so cold selection, count, limit, and filtered removal match hot PostgreSQL semantics
+- Add exact hot/cold row-digest parity receipts, a configurable rollback grace, bounded exact-ID hot deletion, generation/observation holds, and deferred sealing while held rows remain
+- Add versioned archive jobs, generations, objects, ID blocks, schemas, locators, overlays, tombstones, holds, verifications, deletion plans/ledger, media records, and backup epochs
+- Add embedded DuckDB query pushdown over explicit catalog-authorized file lists and portable generation export for independent Parquet inspection
+
+### Media retention
+- Retain exactly five distinct decoded positions (`FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`) from each eligible alarm camera clip
+- Encode each retained asset as an independently decodable opaque baseline sRGB JPEG with configurable quality (85 by default), SHA-256, dimensions, decoded ordinal, source PTS, and lifecycle metadata
+- Publish frames before a versioned manifest commit marker, use a durable identity-keyed job ledger for idempotent retry, and preserve the source MP4 on every failure or fewer-than-five-frame result
+- Preserve a successfully converted source for a configurable 24-hour rollback grace and delete it only on a later verified, unheld lifecycle pass
+- Add an authenticated read-only event media API and Viewer five-frame gallery, with `404` fallback to unchanged legacy video playback
+- Enforce streaming catalog/asset transfer limits plus bounded retained-media camera, frame-byte, dimension, decoded-pixel, and event-wide budgets in the Viewer; fetch only each camera's selected frame and limit event-wide frame-request concurrency
+- Restrict storage-pressure cleanup to complete cataloged media sets, honor holds and source grace, publish `DELETING` before removal, and leave legacy video, daily files, adjudications, reports, and archives untouched
+
+### Backup, deletion, and operations
+- Add coordinated backup commands for a streamed PostgreSQL base backup, OSCAR state, cold archive, WAL archive, release metadata, and AES-256-CBC/PBKDF2-encrypted deployment credentials
+- Automatically verify each new backup with SHA-256 and `pg_verifybackup`, retain versioned backup-epoch manifests and `VERIFIED` markers, and run count-based pruning after new-backup creation while preserving WAL from the oldest retained base-backup boundary; manual verification and restore do not prune their target
+- Authenticate each backup inventory with HMAC-SHA-256, require the exact 3.9.2 epoch and image identities, and issue daily-journal confirmation receipts only after the recovery point has passed structural and cryptographic verification
+- Authenticate the exact top-level backup payload inventory, require an explicit member allowlist for the release-configuration archive, reject duplicate names, path aliases, prefix collisions, links, reparse points, traversal, and out-of-root paths in every archive, and serialize every storage-administration mutation with a cross-command lock
+- Publish backup and portable-export directories through a compiled Linux `renameat2(RENAME_NOREPLACE)` helper after durability barriers; stamp the helper's packaged-source SHA-256 into the image and regression-test collision preservation
+- Keep coordinated backups outside every long-running service mount, give a network-scoped `pg_basebackup` client only its fresh staging directory, exclude only verified image-owned state links from the mutable-state snapshot, stop PostgreSQL for the final archived-WAL snapshot, and resume it before catalog receipt/verification
+- Publish archived WAL from a flushed temporary inode through an atomic no-replace hard link, accept an existing name only when bytes are identical, fail hard on mismatch, fsync file/directory durability, and fail closed when managed storage paths overlap, contain symlink/reparse components, or point into the versioned release directory
+- Reconcile the entire cold-archive root against the catalog and approved `datasets/` shape, including an otherwise empty/missing `datasets` tree, so unexpected top-level objects fail status, verification, and backup before publication
+- Re-verify every payload against the bundle's exact SHA-256 inventory and always load the checksum-verified `offline-images.tar` during offline initialization or upgrade, even when same-version tags already exist locally, so stale development images cannot shadow the selected bundle; the co-packaged unsigned manifest provides integrity but not publisher/origin authentication
+- Label persistent Docker volumes with a deployment UUID, reject missing, foreign, or mixed ownership, and require an explicit audited adoption receipt before reusing unlabelled legacy volumes
+- Add explicit-confirmation restore and preservation of pre-restore deployment credentials
+- Add external archive and WAL service bind mounts, an isolated administrator-owned backup root exposed only to scoped one-shot helpers, and size-rotated Docker logs
+- Add archive status and full object-checksum verification commands
+- Add supported generation/observation hold list/create/release commands with persistent actor, reason, and release audit fields
+- Add a two-step cold-deletion workflow that freezes eligible sealed generations in a 24-hour plan, emits a one-time token, rechecks holds and each object hash, validates relative paths, persists restartable `DELETING` intent, and retains generation tombstones plus catalog/deletion-ledger audit records
+- Add atomic portable archive generation packages with catalog-relative data/schema/manifest objects, catalog JSON, README, ready-to-run DuckDB query, and package checksums
+- Add complete architecture, lifecycle, archive-format, backup/restore, operations, monitoring, failure-recovery, privacy, and staged-rollout documentation
+- Fail closed on macOS for 3.9.2 deployment/storage operations because Docker Desktop for Mac cannot meet the protected bind-root ownership and recovery-media isolation contract; production hosts are Ubuntu 24.04 or Windows 11/WSL 2
+
 ## 3.9.1
-## Upgrade notes
+### Upgrade notes
 - This release changes operator-facing navigation and adds operational-view URL scoping; train operators and validate workstation URLs before production rollout
 - Build or import the versioned `oscar:3.9.1` image and run `oscar upgrade`; `oscar restart` alone continues to use the previously installed image
 - The upgrade retains the existing `oscar_state` and `postgres_data` volumes and does not require a database reset
-## Changes
+### Changes
 - Add exact Event UUID lookup from the Events page and durable, node-qualified Event Details links that retain operational-view scope and fail closed for inaccessible lanes
 - Show the canonical occupancy observation identifier in Event Details and browser-generated PDFs, and include/display it in compact QR and portable alarm transfers while retaining legacy version-1 import compatibility
 - Add a localized Status of Health page showing every visible lane, RPM and camera connectivity, gamma high/low, neutron high, tamper, and configurable extended-occupancy faults
@@ -44,7 +99,7 @@ All notable changes to this project will be documented in this file.
 - Stamp and validate the OSCAR semantic version in the container image's OCI metadata instead of inheriting the base operating-system version label
 
 ## 3.9.0 2026-09-23
-## Changes
+### Changes
 - Add nested AND/OR alarm filtering on the dashboard and Events page
 - Add inclusive numeric filters for occupancy ID, maximum gamma, and maximum neutron values
 - Add individual, cross-page, and all-filtered alarm selection with bulk adjudication
@@ -54,8 +109,6 @@ All notable changes to this project will be documented in this file.
 - Add complete English, Spanish, French, and Greek administrator/operator manuals
 - Publish validated, screenshot-complete PDF manuals with each GitHub release
 ## TODO
-- Add daily file changes (for accurate timezone)
-- Extended occupancy handling
 - Set default reconnect attempts to infinity
 
 ## 3.8.2 2026-09-21

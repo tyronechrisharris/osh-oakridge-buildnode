@@ -1,0 +1,271 @@
+# OSCAR 3.9.2 storage architecture
+
+OSCAR 3.9.2 separates live operational data, durable RPM source records, retained media, and
+long-term observation history. PostgreSQL remains the authoritative hot store and metadata catalog;
+immutable files carry the high-volume history. This keeps normal Open Sensor Hub (OSH) reads and
+identities intact while removing the requirement that every raw count remain in PostgreSQL forever.
+
+This guide describes the architecture. See [Data lifecycle](DATA_LIFECYCLE.md) for retention rules,
+[archive format](ARCHIVE_FORMAT.md) for the portable file contract,
+[backup and restore](BACKUP_RESTORE.md) for protection procedures, and
+[storage operations](STORAGE_OPERATIONS.md) for the operator runbook.
+
+Deployment and storage operation are supported only on Ubuntu Server 24.04 x86-64 and Windows 11
+x86-64 with Docker Desktop/WSL 2. macOS is source/build-inspection only for this storage profile;
+deployment and storage commands fail closed there.
+
+## Design goals
+
+- Preserve OSH system, datastream, feature-of-interest, and observation identities.
+- Keep recent and operational records in PostgreSQL for low-latency application workflows.
+- Copy eligible high-volume detector observations to queryable ZSTD Parquet generations without
+  locking the live tables or pausing ingestion.
+- Capture the exact RPM input needed for a daily file before parsing can reject it.
+- Retain exactly five independently decodable JPEGs from an aging alarm video, while keeping the
+  legacy `videoPaths` field and source video during a rollback grace period.
+- Make publication restartable and integrity-checkable by using immutable objects, checksums,
+  durable job/catalog state, and commit markers.
+- Make backup, restore, archival export, and irreversible deletion explicit operator workflows.
+
+## Components and ownership
+
+| Data | Primary location | Owner | Default lifecycle |
+| --- | --- | --- | --- |
+| Recent observations and OSH metadata | PostgreSQL `postgres_data` volume | Tiered OSH database | Eligible detector streams are copied after 30 days and remain hot in the shipping copy-only profile; business records remain in PostgreSQL |
+| Cold detector observations | `${OSCAR_ARCHIVE_DIR}` bind mount | Tiered OSH database and archive catalog | Immutable Parquet generation plus manifest and schema snapshot |
+| Daily-file source journal | `files/.dailyfile-journal` in `oscar_state` | Daily File Journal service | Per-lane framed segments and publication ledger |
+| Published daily files | `files/dailyfiles` in `oscar_state` | Daily File Journal service | Immutable legacy CSV plus versioned SHA-256 manifest |
+| Current alarm video | `files/videos` in `oscar_state` | Bucket and OSCAR services | Source MP4 until the retention age and successful five-frame conversion |
+| Retained alarm media | `files/videos/retained-media/v1` in `oscar_state` | Retained-media backend | Five JPEGs, manifest, and job ledger; source kept for the configured rollback grace |
+| Reports, adjudication artifacts, sitemap | Bucket directories in `oscar_state` | Bucket and OSCAR services | Not deleted by cold-observation or storage-pressure maintenance |
+| PostgreSQL WAL archive | `${OSCAR_WAL_ARCHIVE_DIR}` bind mount | PostgreSQL | Atomically published continuous WAL copies; verified-backup retention removes only segments older than the oldest retained base-backup start WAL |
+| Coordinated backups | Administrator-owned `${OSCAR_BACKUP_DIR}` host root | OSCAR storage CLI | Never mounted into a long-running service; one-shot helpers receive only selected inputs/outputs; creating a new verified backup retains the 14 newest verified backups by default |
+| Container logs | Docker `json-file` storage | Docker | Size-rotated per service by Compose |
+
+Paths beginning with `files/` are relative to OSCAR's persistent application directory inside the
+container. Initialization writes absolute host paths under a stable sibling `oscar-storage`
+directory into `.env`; a clean version-directory upgrade therefore reuses the same archive, WAL,
+and backup trees instead of silently attaching empty replacements. Site-specific alternatives must
+also be absolute. The OSCAR service mounts only its cold archive at `/var/lib/oscar/archive`;
+recovery media are deliberately not exposed to the long-running application. PostgreSQL mounts
+only its WAL archive; a network-scoped one-shot `pg_basebackup` client receives only the fresh
+staging directory for the recovery point it is creating. The administrator CLI otherwise accesses
+backups through narrowly scoped one-shot containers, so no long-running service can modify the
+backup root and none of these large trees is hidden in a Docker named volume.
+
+The three managed host roots are not interchangeable. Archive and WAL are the two long-lived service
+bind roots; the backup root is exposed only to scoped one-shot helpers. Each carries an administrator-owned, no-follow
+`.oscar-storage-root` version-1 identity binding its root kind to `OSCAR_DEPLOYMENT_ID` and recording
+new creation or explicit legacy adoption. Live storage commands validate all three identities and
+both deployment-owned named volumes before accessing data; the only exception is genuinely offline
+`backup-verify`. On Ubuntu, archive and WAL roots are root-owned mode `1770` with the corresponding
+service group, so the service can create data but the sticky bit prevents it from replacing the
+root-owned marker. Backup storage is root-only. Backups exclude these host-local identities, and
+restore preserves and revalidates the target identities instead of trusting source markers.
+
+PostgreSQL WAL publication uses a flushed temporary inode and an atomic, no-replace hard link for
+the final name, followed by file and directory fsync. A replay of an existing name succeeds only
+when its bytes compare identical; a mismatch or unsafe existing object fails hard so PostgreSQL
+retains and retries the source WAL. Cold-archive writers name work files `<final>.partial`; the WAL
+helper uses `.<wal-name>.partial.<random>`. Reconciliation recognizes the `.partial` token and a
+quiesced coordinated backup rejects every such variant, including links, rather than silently
+excluding incomplete bytes.
+
+## Write and query path
+
+```text
+RPM record
+  |-- synchronous per-lane journal append --> framed segment --> daily CSV + manifest
+  `-- parse/publish --> in-memory batch --> PostgreSQL hot observations
+                                              |
+                                              | repeatable-read snapshot after hot-retention age
+                                              v
+                          Parquet + schema snapshot + manifest
+                                              |
+                           catalog activation + exact-row ownership marker
+                                              |
+              hot/cold parity receipt + rollback grace
+                 + deleteHotAfterArchive=true
+                                              v
+                           bounded deletion of exact hot row IDs
+
+Viewer/OSH query --> PostgreSQL candidates + catalog-authorized Parquet candidates
+                    --> overlays/tombstones --> de-duplicate (hot wins) --> order/limit
+```
+
+Catalog activation makes an `ACTIVE` generation queryable. With the shipping
+`deleteHotAfterArchive=false` setting, its PostgreSQL copy remains indefinitely and the generation
+stays `ACTIVE`. When a site explicitly enables deletion after acceptance, exact hot IDs are removed
+after parity and grace and the generation becomes `SEALED`; both `ACTIVE` and `SEALED` generations
+are online query candidates. Confirmed cold purge first makes a `SEALED` generation `DELETING` and
+non-queryable, then removes its files and ends in the retained audit state `PURGED`.
+
+The direct journal and PostgreSQL observation path are deliberately separate. A journal append is
+the durable source for a daily file; a parsed observation remains available to OSH clients. This
+avoids reconstructing a regulatory/source artifact from an already-purged database.
+
+### PostgreSQL hot store
+
+The 3.9.2 database configuration uses sequential observation IDs, snapshots mutable OSH `DataBlock`
+values when they are accepted, and commits a prepared-statement batch at 10,000 rows or the
+configured `autoCommitPeriod` (one second in the standard configuration). The PostgreSQL JDBC
+driver rewrites compatible batches into multi-row inserts. A statement-level transition-table
+trigger updates each affected datastream's time range once per statement instead of once per
+observation.
+
+The allocator raises its startup high-water from both live rows and every cataloged archive state
+for the same store/scope. Archive activation and sealing take an exclusive transaction-scoped store
+lock; observation batches and logical mutations take its shared form and then acquire affected
+observation locks in ascending numeric order. File export stays outside that critical section. This
+preserves public IDs and makes a hot-to-cold ownership transition atomic with concurrent writes,
+overlays, tombstones, and hot-row deletion without introducing a global runtime mutex.
+
+PostgreSQL remains the catalog of record for systems, datastreams, schemas, event locators,
+archive generations, integrity receipts, overlays, tombstones, retention holds, deletion plans,
+media references, and backup epochs. An archive object is not query-visible merely because a file
+exists; it must be `ACTIVE` or `SEALED` in this catalog.
+
+### Parquet cold tier
+
+An hourly background cycle finds the oldest eligible unarchived row before the 30-day cutoff. To
+catch up without monopolizing the host, a cycle starts at most 24 generations and stops starting
+new work after 15 minutes by default; an in-progress generation is allowed to finish safely. Each
+normal UTC window is one hour and is halved down to one second if it would exceed
+`maximumRowsPerGeneration` (2,000,000 by default) or
+`maximumUncompressedBytesPerGeneration` (2 GiB by default). The byte estimate uses the same
+per-row JSON accounting enforced by the exporter. If even a one-second prefix exceeds either cap,
+the cycle fails closed and retains the hot rows rather than retrying an impossible hour forever.
+
+The exporter uses a read-only PostgreSQL `REPEATABLE READ` transaction and does not update or lock
+the selected rows while producing the files. It sorts observations by datastream and time, writes
+ZSTD Parquet, verifies the row count and ID range through DuckDB, records a compressed datastream
+schema snapshot, and publishes the manifest last. Catalog activation then marks the exact exported
+rows with the generation UUID and requires the marked count to equal the manifest count. New or
+late rows remain unmarked and are picked up by a later generation.
+
+Normal reads merge PostgreSQL and all catalog-authorized Parquet generations. PostgreSQL wins if a
+row intentionally exists in both tiers during rollback grace. Archived updates are stored as small
+PostgreSQL overlays, and archived deletes become PostgreSQL tombstones; immutable Parquet files are
+not rewritten for individual mutations. If a live datastream schema is no longer present, the
+generation's schema snapshot is used to decode its observations.
+
+DuckDB is embedded in OSCAR for archive reads. There is no required FDW, archive server, or external
+query service. An exported generation can also be inspected with ordinary DuckDB or other Parquet
+tools; see [Archive format](ARCHIVE_FORMAT.md).
+
+### Direct daily-file journal
+
+Rapiscan data is journaled before CSV parsing, RS350 N42 data before XML normalization/parsing, and
+Aspect data immediately after its register snapshot is rendered. Each record is appended
+synchronously to its lane's `.open` segment as a length, CRC32C, timestamp, and exact UTF-8 payload.
+The default durability bounds are one second, 128 records, or 1 MiB between forces, whichever is
+reached first.
+
+Driver capture is enabled and required by default. If the journal service cannot start, a required
+driver does not start. If a required append fails, the driver stops its reader instead of silently
+continuing without the source record. At day rollover, the service publishes the legacy CSV and a
+SHA-256 manifest atomically and marks the ledger `PUBLISHED` only after both verify.
+
+The full journal contract is maintained in the modules repository at
+[`include/osh-oakridge-modules/docs/daily-file-journal-v1.md`](../include/osh-oakridge-modules/docs/daily-file-journal-v1.md).
+
+### Five-frame retained media
+
+After the configured video retention age (seven days by default), each camera clip is decoded and
+sampled at `FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`. The five selections must be
+distinct decoded frame ordinals. Each output is an opaque baseline sRGB JPEG; default quality is
+85. Frames are written, forced, decoded and verified independently, then a typed manifest is
+published as the set's commit marker.
+
+The source MP4 is kept for 24 hours by default after successful publication. A later idempotent pass
+deletes it only if the complete media set still verifies and no hold is active. A corrupt clip, a
+clip with fewer than five decoded frames, or any write/verification failure leaves the MP4 intact.
+The occupancy's legacy `videoPaths` value is not rewritten. The Viewer asks the authenticated media
+API for the five-frame set and falls back to legacy video playback on `404`. Before decoding images,
+the Viewer applies a 1 MiB streaming catalog limit plus bounded camera-count, frame-byte, dimension,
+pixel, and event-wide budgets. Asset bodies are also stopped at their manifest byte limit. It
+then fetches only each camera's selected frame and admits at most three frame requests concurrently,
+so an event with several cameras does not create an eager memory or network burst.
+
+The complete media contract is maintained at
+[`include/osh-oakridge-modules/docs/retained-media-v1.md`](../include/osh-oakridge-modules/docs/retained-media-v1.md).
+
+## Integrity and failure boundaries
+
+The storage layers use the same publication pattern:
+
+1. Write a hidden or `.partial` object in the destination directory.
+2. Force file contents to stable storage.
+3. Reopen and verify structure, counts, dimensions, or checksum as appropriate.
+4. Rename into place; daily-file and media stores require same-directory atomic rename.
+5. Publish the manifest or catalog transition last.
+
+Incomplete files are therefore not normal read candidates. Complete corruption is fail-visible:
+the system preserves the original source or hot rows and records/logs the failure. Archive readers
+also verify a Parquet object's SHA-256 before first use in the process. Operators must investigate a
+missing or mismatched catalog object; they must not remove its catalog row to hide the error.
+
+## Performance characteristics
+
+The design reduces the two largest historical sources of PostgreSQL work: individual insert
+transactions/range-trigger updates and indefinite storage of high-frequency detector counts.
+Batching lowers transaction and WAL overhead, while Parquet provides columnar compression and
+min/max row-group pruning for bounded archive searches. Event, adjudication, reporting, and recent
+telemetry workflows remain on the hot path.
+
+Archiving and media conversion are intentionally background work and still consume CPU and I/O.
+Each archive generation is bounded, and a catch-up cycle starts no more than 24 generations or 15
+minutes of new work by default; media extraction decodes one source twice to make time-positioned,
+independently decodable JPEGs. Provision spare capacity and measure the site under
+its real lane/camera rate before enabling hot-row deletion. See
+[Storage operations](STORAGE_OPERATIONS.md#capacity-and-performance-monitoring).
+
+## Security and privacy
+
+Detector observations, vehicle/alarm images, adjudications, reports, and daily records may be
+sensitive operational data. Apply the same access, retention, incident-response, and legal-hold
+policy to hot, cold, exported, and backup copies.
+
+- Archive and WAL directories are long-lived service bind mounts. The backup directory is an
+  administrator-owned host root used only through scoped one-shot helpers. Restrict host access to
+  all three and include them in disk encryption, monitoring, and endpoint protection.
+- The retained-media API is authenticated, read-only, enforces the `videos` bucket GET permission,
+  and does not expose internal job/catalog paths. It is not a public image server.
+- Deployment credentials and TLS private material are encrypted in a coordinated backup with
+  AES-256-CBC/PBKDF2. The encrypted `secrets/` payload contains a recovery copy of the backup-key
+  file, but there is no usable plaintext key in the backup: an independently protected external
+  copy is still required to decrypt that payload.
+- Parquet exports and copied JPEGs are intentionally portable. A copy outside OSCAR no longer has
+  OSCAR authorization controls; encrypt it, control recipients, and record its destruction.
+- Do not include secrets, full manifests, raw records, or images in ordinary support tickets or
+  unredacted diagnostic bundles.
+
+## 3.9.2 compatibility boundary
+
+OSCAR 3.9.2 is a substantial storage-profile update. A new installation uses:
+
+- `OscarTieredObsSystemDatabaseConfig` with sequential IDs and batched writes;
+- additional archive ownership metadata on observations and a versioned archive catalog;
+- a required direct daily-file journal for Rapiscan, Aspect, and RS350 drivers;
+- exact-five JPEG retained media rather than keyframe-only MP4 reduction; and
+- PostgreSQL data checksums, WAL archiving, external archive/WAL service bind mounts, and an isolated
+  administrator-owned backup root in the release deployment.
+
+The legacy occupancy `videoPaths` field, legacy daily CSV syntax, and OSH identities are retained.
+However, an existing deployment's persistent `config.json` is intentionally not overwritten by
+`oscar upgrade`, and PostgreSQL data checksums are selected only when a new database cluster is
+initialized. There is no automatic conversion of an old database/configuration into the complete
+3.9.2 storage profile. The corrected 3.9.2 observation natural-key index also treats null fields as
+equal; index creation fails safely if a legacy database contains duplicates under that definition,
+and those rows require an explicit reviewed migration decision.
+Exact natural-key replays are no-ops, while corrected values retain the original OSH observation
+ID. If the observation is already archive-owned, OSCAR writes the correction to the immutable
+generation's PostgreSQL overlay—both during hot-copy grace and after the hot row has been deleted—
+instead of modifying Parquet or inserting a duplicate hot identity.
+
+For the current test systems and for new production deployments, initialize a fresh 3.9.2 database
+and configuration. For a production system whose history must be preserved, keep the old deployment
+read-only, take and verify a backup, export records required by policy, and perform a separately
+validated migration rather than deleting volumes or assuming `upgrade` enabled the new lifecycle.
+The staged rollout in [Storage operations](STORAGE_OPERATIONS.md#production-rollout) keeps hot-row
+deletion off until archive parity and a restore drill pass.
