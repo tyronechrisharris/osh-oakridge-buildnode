@@ -13,6 +13,9 @@ $storageScript = Join-Path $repoRoot 'dist\release\oscar-storage.ps1'
 $setupScript = Join-Path $repoRoot 'dist\release\oscar-setup.ps1'
 $verifyScript = Join-Path $repoRoot 'dist\release\verify-bundle.ps1'
 $offlineBuilderScript = Join-Path $repoRoot 'tools\offline\build-offline-bundle.ps1'
+$composeFile = Join-Path $repoRoot 'dist\release\compose.yaml'
+$oscarDockerfile = Join-Path $repoRoot 'dist\release\docker\oscar\Dockerfile'
+$oscarEntrypoint = Join-Path $repoRoot 'dist\release\docker\oscar\entrypoint.sh'
 $releasePowerShellScripts = @($storageScript, $setupScript, $verifyScript, $offlineBuilderScript)
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('oscar-storage-ps5-' + [Guid]::NewGuid().ToString('N'))
 $createdDockerGroup = $false
@@ -55,6 +58,30 @@ try {
             Assert-True (-not ([IO.File]::ReadAllText($script).Contains($forbidden))) "$script uses a .NET API absent from Windows PowerShell 5.1: $forbidden"
         }
     }
+
+    # Windows packaging consumes the same Linux Compose contract. Validate it
+    # here as plain text so PowerShell release builds cannot silently weaken it.
+    $compose = [IO.File]::ReadAllText($composeFile)
+    $oscarService = [Text.RegularExpressions.Regex]::Match(
+        $compose, '^  oscar:\r?\n.*?(?=^  postgres:)',
+        [Text.RegularExpressions.RegexOptions]::Multiline -bor [Text.RegularExpressions.RegexOptions]::Singleline).Value
+    $nativeTmpfs = '/run/oscar-native:rw,exec,nosuid,nodev,size=256m,mode=0700,uid=10001,gid=10001'
+    Assert-True ($oscarService.Contains('- /tmp:rw,noexec,nosuid,nodev')) 'Compose does not keep OSCAR /tmp noexec.'
+    Assert-True ($oscarService.Contains("- $nativeTmpfs")) 'Compose is missing the bounded owner-only executable native tmpfs.'
+    Assert-True (([Text.RegularExpressions.Regex]::Matches($compose, [Text.RegularExpressions.Regex]::Escape($nativeTmpfs))).Count -eq 1) 'The executable native tmpfs must be scoped to OSCAR only.'
+
+    $dockerfile = [IO.File]::ReadAllText($oscarDockerfile)
+    Assert-True ($dockerfile.Contains('/var/lib/oscar /run/oscar-native')) 'The OSCAR image is missing its private native-tmpfs mount point.'
+    $entrypoint = [IO.File]::ReadAllText($oscarEntrypoint)
+    $javaOptionsIndex = $entrypoint.IndexOf('exec java ${JAVA_OPTS:-}')
+    Assert-True ($javaOptionsIndex -ge 0) 'The OSCAR entrypoint is missing its managed Java launch.'
+    foreach ($managedProperty in @(
+        '-Djava.io.tmpdir="${NATIVE_TMP_DIR}"',
+        '-Dorg.bytedeco.javacpp.cachedir="${NATIVE_TMP_DIR}/javacpp"',
+        '-Doscar.data.tmpdir=/tmp')) {
+        Assert-True ($entrypoint.IndexOf($managedProperty) -gt $javaOptionsIndex) "Managed JVM property must follow JAVA_OPTS: $managedProperty"
+    }
+    Assert-True ($entrypoint.Contains('if [ -n "${_JAVA_OPTIONS:-}" ]')) 'The OSCAR entrypoint must reject late _JAVA_OPTIONS overrides.'
 
     $bundle = Join-Path $temporaryRoot 'bundle'
     New-Item -ItemType Directory -Path $bundle | Out-Null

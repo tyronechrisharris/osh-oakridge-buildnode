@@ -77,6 +77,11 @@ jobs:
       - name: Build and test the connected release
         run: ./build-all.sh
 
+      - name: Prove DuckDB JNI loading with noexec general temporary storage
+        run: |
+          ./gradlew --no-parallel installRelDist
+          ./tools/test-duckdb-native-temp.sh
+
       - name: Validate the packaged release
         run: |
           version=$(sed -n 's/^[[:space:]]*version = "\([^"]*\)"/\1/p' build.gradle | head -n1)

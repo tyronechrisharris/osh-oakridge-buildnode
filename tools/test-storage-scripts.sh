@@ -10,6 +10,8 @@ setup_powershell_script="$repo_root/dist/release/oscar-setup.ps1"
 compose_file="$repo_root/dist/release/compose.yaml"
 archive_validator="$repo_root/dist/release/validate-storage-archive.sh"
 archive_object_helper="$repo_root/dist/release/docker/oscar/archive-object-helper.sh"
+oscar_dockerfile="$repo_root/dist/release/docker/oscar/Dockerfile"
+oscar_entrypoint="$repo_root/dist/release/docker/oscar/entrypoint.sh"
 test_root=$(mktemp -d "$repo_root/.storage-script-test.XXXXXX")
 
 cleanup() {
@@ -49,6 +51,7 @@ bash -n "$shell_script"
 bash -n "$setup_shell_script"
 sh -n "$archive_validator"
 sh -n "$archive_object_helper"
+sh -n "$oscar_entrypoint"
 
 # Target-side bundle verification must authenticate the exact inventory on
 # every run. A stale receipt, an extra privileged installer, a duplicate
@@ -161,6 +164,42 @@ assert_contains 'grep -Fq "\\"objClass\\": \\"com\.botts\.impl\.service\.dailyfi
 assert_not_contains "grep -Fq '\"objClass" "$setup_shell_script"
 assert_contains 'for \(\$attempt = 1; \$attempt -le 30; \$attempt\+\+\)' "$setup_powershell_script"
 assert_contains 'after 30 seconds' "$setup_powershell_script"
+
+# Java native libraries need one executable extraction point without weakening
+# the general-purpose temporary mount. The entrypoint owns java.io.tmpdir and
+# must reject a missing, shared, permissive, or non-executable native tmpfs.
+oscar_service_block=$(sed -n '/^  oscar:$/,/^  postgres:$/p' "$compose_file")
+[[ $(grep -Fxc '      - /tmp:rw,noexec,nosuid,nodev' <<<"$oscar_service_block") == 1 &&
+   $(grep -Fxc '      - /run/oscar-native:rw,exec,nosuid,nodev,size=256m,mode=0700,uid=10001,gid=10001' <<<"$oscar_service_block") == 1 &&
+   $(grep -Fxc '      - /run/oscar-native:rw,exec,nosuid,nodev,size=256m,mode=0700,uid=10001,gid=10001' "$compose_file") == 1 ]] || {
+    printf 'Compose must keep /tmp noexec and grant only OSCAR a bounded owner-only native tmpfs.\n' >&2
+    exit 1
+}
+assert_contains 'install --directory --owner=oscar --group=oscar --mode=0700' "$oscar_dockerfile"
+assert_contains '/var/lib/oscar /run/oscar-native' "$oscar_dockerfile"
+assert_contains '^NATIVE_TMP_DIR=/run/oscar-native$' "$oscar_entrypoint"
+assert_contains 'if \[ -n "\$\{_JAVA_OPTIONS:-\}" \]' "$oscar_entrypoint"
+assert_contains 'is_tmpfs_mount /tmp' "$oscar_entrypoint"
+assert_contains 'mount_has_option /tmp noexec' "$oscar_entrypoint"
+assert_contains 'mount_has_option /tmp nosuid' "$oscar_entrypoint"
+assert_contains 'mount_has_option /tmp nodev' "$oscar_entrypoint"
+assert_contains 'mount_has_option "\$\{NATIVE_TMP_DIR\}" nosuid' "$oscar_entrypoint"
+assert_contains 'mount_has_option "\$\{NATIVE_TMP_DIR\}" nodev' "$oscar_entrypoint"
+assert_contains 'stat -c .*%u:%g:%a.*NATIVE_TMP_DIR' "$oscar_entrypoint"
+assert_contains 'native_exec_probe=.*NATIVE_TMP_DIR' "$oscar_entrypoint"
+assert_contains '-Djava\.io\.tmpdir="\$\{NATIVE_TMP_DIR\}"' "$oscar_entrypoint"
+assert_contains '-Dorg\.bytedeco\.javacpp\.cachedir="\$\{NATIVE_TMP_DIR\}/javacpp"' "$oscar_entrypoint"
+assert_contains '-Doscar\.data\.tmpdir=/tmp' "$oscar_entrypoint"
+java_opts_line=$(grep -n -m1 'exec java \${JAVA_OPTS:-}' "$oscar_entrypoint" | cut -d: -f1)
+managed_tmp_line=$(grep -n -m1 -- '-Djava.io.tmpdir="${NATIVE_TMP_DIR}"' "$oscar_entrypoint" | cut -d: -f1)
+managed_javacpp_line=$(grep -n -m1 -- '-Dorg.bytedeco.javacpp.cachedir="${NATIVE_TMP_DIR}/javacpp"' "$oscar_entrypoint" | cut -d: -f1)
+managed_data_tmp_line=$(grep -n -m1 -- '-Doscar.data.tmpdir=/tmp' "$oscar_entrypoint" | cut -d: -f1)
+[[ -n $java_opts_line && -n $managed_tmp_line && -n $managed_javacpp_line &&
+   -n $managed_data_tmp_line && $java_opts_line -lt $managed_tmp_line &&
+   $java_opts_line -lt $managed_javacpp_line && $java_opts_line -lt $managed_data_tmp_line ]] || {
+    printf 'Managed native and data temp directories must follow and override administrator JAVA_OPTS.\n' >&2
+    exit 1
+}
 
 # Setup owns the named-volume lifecycle and validates either the immutable
 # deployment label or an exact legacy-adoption receipt before Compose starts.

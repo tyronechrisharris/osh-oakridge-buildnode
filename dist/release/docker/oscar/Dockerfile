@@ -28,7 +28,8 @@ COPY --chown=root:root docker/oscar/archive-object-helper.sh /usr/local/bin/osca
 RUN chmod 0555 /usr/local/bin/oscar-entrypoint /usr/local/bin/oscar-archive-object \
     && find /opt/oscar -type d -exec chmod 0555 {} \; \
     && find /opt/oscar -type f -exec chmod 0444 {} \; \
-    && install --directory --owner=oscar --group=oscar --mode=0700 /var/lib/oscar
+    && install --directory --owner=oscar --group=oscar --mode=0700 \
+        /var/lib/oscar /run/oscar-native
 
 USER oscar:oscar
 WORKDIR /var/lib/oscar

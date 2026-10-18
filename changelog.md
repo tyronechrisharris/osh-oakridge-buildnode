@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - Add exact hot/cold row-digest parity receipts, a configurable rollback grace, bounded exact-ID hot deletion, generation/observation holds, and deferred sealing while held rows remain
 - Add versioned archive jobs, generations, objects, ID blocks, schemas, locators, overlays, tombstones, holds, verifications, deletion plans/ledger, media records, and backup epochs
 - Add embedded DuckDB query pushdown over explicit catalog-authorized file lists and portable generation export for independent Parquet inspection
+- Keep general-purpose container temporary storage `noexec` while routing JVM native-library extraction to a bounded, owner-only executable tmpfs that is verified before startup
 
 ### Media retention
 - Retain exactly five distinct decoded positions (`FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`) from each eligible alarm camera clip

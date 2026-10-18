@@ -69,7 +69,11 @@ services:
         target: /var/lib/oscar/archive
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:rw,noexec,nosuid,nodev
+      # DuckDB JDBC and the other JVM JNI loaders must map their extracted
+      # libraries. Keep that narrowly scoped exception private and bounded;
+      # the general-purpose temporary directory remains non-executable.
+      - /run/oscar-native:rw,exec,nosuid,nodev,size=256m,mode=0700,uid=10001,gid=10001
     cap_drop:
       - ALL
     security_opt:

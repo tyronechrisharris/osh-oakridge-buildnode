@@ -35,6 +35,10 @@ node --test tools/update-version.test.js
     :sensorhub-service-dailyfile-journal:test
 
 ./gradlew --no-parallel \
+    :sensorhub-utils-rad:test \
+    --tests org.sensorhub.impl.utils.rad.cambio.CambioTempDirectoryTest
+
+./gradlew --no-parallel \
     :sensorhub-driver-aspect:test \
     --tests com.botts.impl.sensor.aspect.MessageHandlerJournalTest \
     :sensorhub-driver-ffmpeg:test \

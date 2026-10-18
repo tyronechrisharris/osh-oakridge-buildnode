@@ -148,6 +148,19 @@ Docker Compose mounts secrets read-only. On Ubuntu, the setup CLI makes `secrets
 
 The application configuration is copied into the `oscar_state` volume on first startup. Runtime configuration saves update only that persistent copy. Application libraries and viewer assets remain read-only in the image. PostgreSQL data is stored in the `postgres_data` volume. OSCAR 3.9.2 uses long-lived host bind mounts configured in `.env` for the Parquet archive (`OSCAR_ARCHIVE_DIR`) and PostgreSQL WAL archive (`OSCAR_WAL_ARCHIVE_DIR`). `OSCAR_BACKUP_DIR` is a separate administrator-owned host root that is never mounted into a long-running service; the storage CLI exposes only a selected input or output to a narrowly scoped one-shot helper. Monitor and protect all five persistent locations; a Docker named-volume backup alone is incomplete.
 
+The OSCAR service keeps the general-purpose `/tmp` tmpfs `noexec`. Embedded Java native libraries,
+including DuckDB JDBC and JavaCPP/FFmpeg, are extracted instead to a separate 256 MiB tmpfs at
+`/run/oscar-native`. That mount is executable only because the JVM must map shared objects; it is
+still ephemeral, `nosuid`, `nodev`, owned by the non-root OSCAR user, and mode `0700`. The entrypoint
+forces `java.io.tmpdir` to that path after `OSCAR_JAVA_OPTS` and refuses to start unless `/tmp` is a
+dedicated `noexec` tmpfs and the native mount has the expected type, ownership, permissions, and
+execution behavior. User-supplied multipart and spectrum-conversion temporary files remain on
+`/tmp` through the separately managed `oscar.data.tmpdir` property, so they never enter the
+executable native directory. Do not override either mount or add `-Djava.io.tmpdir` or
+`-Dorg.bytedeco.javacpp.cachedir` or `-Doscar.data.tmpdir` to `OSCAR_JAVA_OPTS`. The entrypoint
+also rejects `_JAVA_OPTIONS`, which OpenJDK applies after command-line options; custom launchers
+must reproduce this two-mount contract.
+
 The backup key encrypts `.env`, deployment secrets, and TLS private material inside coordinated backups. The encrypted `secrets/` payload contains a recovery copy of the key file, but there is no usable plaintext key in the backup: store an external protected copy in an independent secret escrow or failure domain.
 
 The gateway gives content-hashed Viewer files under `/_next/static/` a private, one-year immutable browser cache policy, while `/sw.js` is always revalidated. This prevents repeated full-route navigations from downloading the same application bundles again without allowing a shared proxy to cache an authenticated response. HTML and API responses keep their normal revalidation behavior.

@@ -51,6 +51,7 @@ if (env.OSCAR_DEPLOYMENT_ID !== '') fail('OSCAR_DEPLOYMENT_ID must be empty in t
 const expected = [
     'oscar-storage.sh', 'oscar-storage.ps1', 'validate-storage-archive.sh',
     'postgis/archive-wal.sh', 'postgis/merge-wal-restore.sh', 'postgis/prepare-restore.sh',
+    'docker/oscar/Dockerfile', 'docker/oscar/entrypoint.sh',
     'docker/oscar/archive-object-helper.sh',
     'docker/oscar/atomic-publish.c',
     'documentation/QUICKSTART.md', 'documentation/DEPLOYMENT.md',
@@ -87,6 +88,35 @@ for (const [modelName, externalName] of [
 }
 if (compose.includes('com.botts.oscar.deployment-id')) {
     fail('compose.yaml must not reconcile immutable deployment labels on named volumes');
+}
+
+const oscarService = compose.match(/^  oscar:\r?\n[\s\S]*?(?=^  postgres:)/m)?.[0];
+const nativeTmpfs = '/run/oscar-native:rw,exec,nosuid,nodev,size=256m,mode=0700,uid=10001,gid=10001';
+if (!oscarService?.includes('- /tmp:rw,noexec,nosuid,nodev')) {
+    fail('the OSCAR service must keep /tmp on an explicit noexec tmpfs');
+}
+if (!oscarService?.includes(`- ${nativeTmpfs}`) || compose.split(nativeTmpfs).length !== 2) {
+    fail('only the OSCAR service may receive the bounded owner-only executable native tmpfs');
+}
+
+const oscarDockerfile = fs.readFileSync(path.join(root, 'docker/oscar/Dockerfile'), 'utf8');
+if (!/install --directory --owner=oscar --group=oscar --mode=0700[\s\\]*\n\s*\/var\/lib\/oscar \/run\/oscar-native/.test(oscarDockerfile)) {
+    fail('the OSCAR image must provide a private native-tmpfs mount point');
+}
+
+const oscarEntrypoint = fs.readFileSync(path.join(root, 'docker/oscar/entrypoint.sh'), 'utf8');
+const javaOptions = oscarEntrypoint.indexOf('exec java ${JAVA_OPTS:-}');
+const managedJavaTmp = oscarEntrypoint.indexOf('-Djava.io.tmpdir="${NATIVE_TMP_DIR}"');
+const managedJavaCppTmp = oscarEntrypoint.indexOf('-Dorg.bytedeco.javacpp.cachedir="${NATIVE_TMP_DIR}/javacpp"');
+const managedDataTmp = oscarEntrypoint.indexOf('-Doscar.data.tmpdir=/tmp');
+if (!oscarEntrypoint.includes('NATIVE_TMP_DIR=/run/oscar-native') ||
+    !oscarEntrypoint.includes('if [ -n "${_JAVA_OPTIONS:-}" ]') ||
+    !oscarEntrypoint.includes('is_tmpfs_mount /tmp') ||
+    !oscarEntrypoint.includes('mount_has_option /tmp noexec') ||
+    !oscarEntrypoint.includes('native_exec_probe=') ||
+    javaOptions < 0 || managedJavaTmp < javaOptions ||
+    managedJavaCppTmp < javaOptions || managedDataTmp < javaOptions) {
+    fail('the OSCAR entrypoint must verify both tmpfs mounts and force managed native/data temp paths after JAVA_OPTS');
 }
 
 const expectedStorageDefaults = {
