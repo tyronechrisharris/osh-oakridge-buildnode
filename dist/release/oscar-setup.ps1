@@ -1118,7 +1118,12 @@ try {
             Invoke-StorageCommand 'prepare-directories' $null
             Remove-LegacyEmbeddedBackupDirectory
             Invoke-Compose @('config', '--quiet')
-            Invoke-Compose @('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')
+            # A clean-directory upgrade changes every release-local
+            # secret/config bind source even if the service model and image ID
+            # are unchanged. Recreate every container so its mounts and
+            # Compose provenance belong to this release. External roots and
+            # named data volumes remain attached and are never removed here.
+            Invoke-Compose @('up', '--detach', '--force-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')
             Enable-StorageDatabaseFeatures
             Complete-PendingFreshInit
             Write-Host 'Upgrade deployment completed. Persistent OSCAR and PostgreSQL volumes were retained.' -ForegroundColor Green

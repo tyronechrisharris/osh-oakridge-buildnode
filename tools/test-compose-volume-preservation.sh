@@ -25,7 +25,7 @@ compose_model=$(printf '%s\n' \
     'services:' \
     '  probe:' \
     "    image: $probe_image" \
-    '    command: ["sh", "-eu", "-c", "test -f /state/canary; test -f /postgres/canary; sleep 30"]' \
+    '    command: ["sh", "-eu", "-c", "test -f /state/canary; test -f /postgres/canary; sleep 300"]' \
     '    volumes:' \
     '      - state:/state' \
     '      - postgres:/postgres' \
@@ -75,8 +75,26 @@ compose_output=$(printf '%s\n' "$compose_model" |
     docker compose --project-name "$project" --file - up --detach --no-build --pull never 2>&1)
 printf '%s\n' "$compose_output"
 
-if printf '%s\n' "$compose_output" | grep -Eqi \
-    'recreate[^[:cntrl:]]*volume|volume[^[:cntrl:]]*(does not match|doesn.t match|recreate)|data[^[:cntrl:]]*(will be lost|loss)|already exists[^[:cntrl:]]*not created'; then
+container_name="${project}-probe-1"
+container_before=$(docker container inspect --format '{{.Id}}' "$container_name")
+ordinary_output=$(printf '%s\n' "$compose_model" |
+    docker compose --project-name "$project" --file - up --detach --no-build --pull never 2>&1)
+container_after_ordinary=$(docker container inspect --format '{{.Id}}' "$container_name")
+[[ $container_after_ordinary == "$container_before" ]] || {
+    printf 'Ordinary Compose up unexpectedly recreated an unchanged service.\n' >&2
+    exit 1
+}
+
+recreate_output=$(printf '%s\n' "$compose_model" |
+    docker compose --project-name "$project" --file - up --detach --force-recreate --no-build --pull never 2>&1)
+container_after_recreate=$(docker container inspect --format '{{.Id}}' "$container_name")
+[[ $container_after_recreate != "$container_before" ]] || {
+    printf 'Compose --force-recreate retained the old service container.\n' >&2
+    exit 1
+}
+
+if printf '%s\n%s\n%s\n' "$compose_output" "$ordinary_output" "$recreate_output" | grep -Eqi \
+    'volume[^[:cntrl:]]*(does not match|doesn.t match|will be (recreated|removed)|data loss)|data[^[:cntrl:]]*(will be lost|loss)|already exists[^[:cntrl:]]*not created'; then
     printf 'Compose offered to reconcile or recreate an adopted data volume.\n' >&2
     exit 1
 fi
@@ -97,4 +115,4 @@ for volume in "$state_volume" "$postgres_volume"; do
         sh -eu -c 'test "$(cat /data/canary)" = preserved'
 done
 
-printf 'Compose preserved both adopted external volumes without a recreation prompt.\n'
+printf 'Compose recreated only the requested service container and preserved both adopted external volumes.\n'

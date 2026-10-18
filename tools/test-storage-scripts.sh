@@ -165,6 +165,44 @@ assert_not_contains "grep -Fq '\"objClass" "$setup_shell_script"
 assert_contains 'for \(\$attempt = 1; \$attempt -le 30; \$attempt\+\+\)' "$setup_powershell_script"
 assert_contains 'after 30 seconds' "$setup_powershell_script"
 
+# A clean-directory upgrade must move every release-local bind and Compose
+# provenance label to the new directory, including an otherwise unchanged
+# PostgreSQL service. Ordinary start remains non-recreating. Keep the exact
+# Bash/PowerShell contracts in parity and never renew/remove persistent data.
+extract_case_body() {
+    local file=$1 start=$2 end=$3
+    awk -v start="$start" -v end="$end" '
+        $0 == start { capture=1 }
+        capture { print }
+        capture && index($0, end) == 1 { exit }
+    ' "$file"
+}
+bash_start_case=$(extract_case_body "$setup_shell_script" '    start)' '    stop)')
+bash_upgrade_case=$(extract_case_body "$setup_shell_script" '    upgrade)' '    *)')
+ps_start_case=$(extract_case_body "$setup_powershell_script" "        'start' {" "        'stop' {")
+ps_upgrade_case=$(extract_case_body "$setup_powershell_script" "        'upgrade' {" "        'backup' {")
+
+[[ $(grep -Fxc '        compose up --detach --no-build --pull never --wait --wait-timeout 240' <<<"$bash_start_case") == 1 &&
+   $bash_start_case != *--force-recreate* ]] || {
+    printf 'Bash ordinary start must remain non-recreating.\n' >&2
+    exit 1
+}
+[[ $(grep -Fxc '        compose up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240' <<<"$bash_upgrade_case") == 1 &&
+   $bash_upgrade_case != *--renew-anon-volumes* && $bash_upgrade_case != *'compose down'* ]] || {
+    printf 'Bash upgrade must force-recreate all services without replacing persistent data.\n' >&2
+    exit 1
+}
+[[ $(grep -Fxc "            Invoke-Compose @('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')" <<<"$ps_start_case") == 1 &&
+   $ps_start_case != *--force-recreate* ]] || {
+    printf 'PowerShell ordinary start must remain non-recreating.\n' >&2
+    exit 1
+}
+[[ $(grep -Fxc "            Invoke-Compose @('up', '--detach', '--force-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')" <<<"$ps_upgrade_case") == 1 &&
+   $ps_upgrade_case != *--renew-anon-volumes* && $ps_upgrade_case != *"Invoke-Compose @('down'"* ]] || {
+    printf 'PowerShell upgrade must force-recreate all services without replacing persistent data.\n' >&2
+    exit 1
+}
+
 # Java native libraries need one executable extraction point without weakening
 # the general-purpose temporary mount. The entrypoint owns java.io.tmpdir and
 # must reject a missing, shared, permissive, or non-executable native tmpfs.

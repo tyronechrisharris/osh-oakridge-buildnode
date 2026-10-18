@@ -952,7 +952,12 @@ case "$command_name" in
         bash "$script_dir/oscar-storage.sh" "${prepare_storage_args[@]}"
         remove_legacy_embedded_backup_directory
         compose config --quiet
-        compose up --detach --no-build --pull never --wait --wait-timeout 240
+        # A clean-directory upgrade changes every release-local secret/config
+        # bind source even when the service model and image ID are unchanged.
+        # Recreate all containers so none retains the previous release path in
+        # its mounts or Compose provenance. External data roots and named
+        # volumes remain attached; this command never removes them.
+        compose up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240
         ensure_storage_database_features
         finalize_pending_fresh_init
         printf 'Upgrade deployment completed. Persistent OSCAR and PostgreSQL volumes were retained.\n'

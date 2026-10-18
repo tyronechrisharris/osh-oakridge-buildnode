@@ -205,9 +205,20 @@ bindings: deployment identity, absolute external storage roots, and the canonica
 binding. A legacy deployment may also receive a generated backup key plus explicit volume/root
 adoption metadata when the corresponding adoption options are supplied. After those guarded
 normalizations it updates `OSCAR_VERSION`, validates Compose, prepares the versioned images,
-recreates changed services, waits for health checks, and retains the fixed `oscar_state` and
-`postgres_data` volumes. It never removes volumes. Confirm the result with `oscar.bat status`
+force-recreates all service containers, waits for health checks, and retains the fixed `oscar_state`
+and `postgres_data` volumes plus the exact external archive/WAL/backup roots. Recreating every
+container is required even when an image and service model are unchanged: release-local secret,
+certificate, and gateway-config bind sources and the Compose `working_dir`/`config_files` provenance
+must point to the new clean release directory. It never removes volumes or external storage roots.
+Confirm the result with `oscar.bat status`
 (Windows) or `sudo bash oscar.sh status` (Ubuntu).
+
+Retire the previous extracted release directory only after all upgraded services are healthy and
+`docker inspect` confirms that every container's release-local bind sources and Compose
+`working_dir`/`config_files` labels refer to the new directory. The absolute archive, WAL, and backup
+roots intentionally continue to refer to the persistent paths copied in `.env`; do not remove a
+previous release's parent or sibling storage directory merely because its service containers were
+replaced.
 
 Setup creates both named volumes with an `OSCAR_DEPLOYMENT_ID` label and refuses missing, mixed, or
 foreign ownership. Compose treats those exact names as external resources and never creates or

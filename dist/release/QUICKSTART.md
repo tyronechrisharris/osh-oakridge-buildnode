@@ -143,7 +143,10 @@ one-time `-AdoptLegacyVolumes` (Windows) or `--adopt-legacy-volumes` (Ubuntu) pr
 Administrator Guide. Preserve its `.oscar-volume-adoption` receipt with `.env`, `secrets`, and
 `tls` during later clean-directory upgrades; never use adoption to join unrelated volumes. Run
 upgrades through `oscar.bat` or `oscar.sh`, not a direct `docker compose up`: setup validates the
-exact external named volumes before Compose attaches them.
+exact external named volumes before Compose attaches them and force-recreates every service so no
+container retains a secret/config bind or Compose provenance from the prior extracted release.
+Delete the prior extracted release only after health and container-mount verification, and never
+delete a persistent archive, WAL, or backup root preserved by `.env`.
 If verified pre-3.9.2 archive/WAL/backup roots are nonempty and have no root marker, the upgrade
 also requires the separate one-time `-AdoptLegacyStorageRoots` (Windows) or
 `--adopt-legacy-storage-roots` (Ubuntu) switch. It records audited adoption metadata in each
