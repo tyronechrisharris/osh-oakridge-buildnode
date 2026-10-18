@@ -1609,28 +1609,84 @@ fi
 
 journal_isolation_root="$test_root/journal-isolation-bash"
 journal_isolation_capture="$journal_isolation_root/java.args"
+journal_extractor_capture="$journal_isolation_root/extractor.args"
+journal_chown_capture="$journal_isolation_root/chown.args"
 mkdir -p "$journal_isolation_root/$acceptance_id"
 : >"$journal_isolation_root/$acceptance_id/oscar-state.tar.gz"
 bash -c '
-    storage_script=$1; fixture_root=$2; backup_id=$3; capture=$4
+    storage_script=$1; fixture_root=$2; backup_id=$3; capture=$4; extractor_capture=$5; chown_capture=$6
     set -- help; source "$storage_script" >/dev/null
     backup_dir=$fixture_root; script_dir=$fixture_root
-    chown() { :; }; chmod() { :; }
+    chown() { printf "%s\n" "$*" >"$chown_capture"; }; chmod() { :; }
     compose() {
         [[ ${1:-} != run ]] || { : >"$fixture_root/UNSAFE-COMPOSE-RUN"; return 1; }
         return 0
     }
     docker() {
-        if [[ " $* " == *" --entrypoint java "* ]]; then printf "%s\n" "$*" >"$capture"; fi
+        if [[ " $* " == *" --entrypoint java "* ]]; then
+            printf "%s\n" "$*" >"$capture"
+        elif [[ " $* " == *" --entrypoint sh "* && " $* " != *" /validate-storage-archive.sh oscar-state "* ]]; then
+            printf "%s\n" "$*" >"$extractor_capture"
+        fi
         return 0
     }
     confirm_daily_journal_backup "$backup_id" "$fixture_root/$backup_id" oscar:test aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-' _ "$shell_script" "$journal_isolation_root" "$acceptance_id" "$journal_isolation_capture"
+' _ "$shell_script" "$journal_isolation_root" "$acceptance_id" "$journal_isolation_capture" \
+    "$journal_extractor_capture" "$journal_chown_capture"
+snapshot_path=$(awk '{print $NF}' "$journal_chown_capture")
 [[ -s $journal_isolation_capture && ! -e $journal_isolation_root/UNSAFE-COMPOSE-RUN ]] &&
+[[ -s $journal_extractor_capture && -s $journal_chown_capture ]] &&
+grep -Fq -- '--network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$journal_extractor_capture" &&
+grep -Fq -- '--user 0:0 --entrypoint sh' "$journal_extractor_capture" &&
+grep -Fq -- "--volume $journal_isolation_root/$acceptance_id/oscar-state.tar.gz:/oscar-state.tar.gz:ro" "$journal_extractor_capture" &&
+grep -Eq -- "--volume $journal_isolation_root/\\.journal-confirm-$acceptance_id\\.[^ ]+:/snapshot" "$journal_extractor_capture" &&
+! grep -Fq -- "--volume $journal_isolation_root/$acceptance_id:/" "$journal_extractor_capture" &&
+! grep -Fq -- '--cap-add' "$journal_extractor_capture" &&
+grep -Fq -- 'tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz' "$journal_extractor_capture" &&
+grep -Fq -- 'find /snapshot -type d -exec chmod 0700' "$journal_extractor_capture" &&
+grep -Fq -- 'find /snapshot -type f -exec chmod 0600' "$journal_extractor_capture" &&
+grep -Fq -- "-R 10001:10001 $snapshot_path" "$journal_chown_capture" &&
 grep -Fq -- '--network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$journal_isolation_capture" &&
 grep -Fq -- '--tmpfs /tmp:rw,noexec,nosuid,nodev --user 10001:10001 --entrypoint java' "$journal_isolation_capture" &&
-grep -Fq -- '--volume oscar_oscar_state:/var/lib/oscar' "$journal_isolation_capture" || {
+grep -Fq -- '--volume oscar_oscar_state:/var/lib/oscar' "$journal_isolation_capture" &&
+grep -Fq -- "--volume $snapshot_path:/verified-snapshot:ro" "$journal_isolation_capture" || {
     printf 'Bash journal confirmation is not confined to the state volume and offline hardened container.\n' >&2
+    exit 1
+}
+
+# A failure after both validation and extraction must remove the private
+# snapshot and resume exactly the application services that were running.
+journal_resume_root="$test_root/journal-resume-bash"
+journal_resume_actions="$journal_resume_root/compose.actions"
+mkdir -p "$journal_resume_root/$acceptance_id"
+: >"$journal_resume_root/$acceptance_id/oscar-state.tar.gz"
+if bash -c '
+    storage_script=$1; fixture_root=$2; backup_id=$3; actions=$4
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root; script_dir=$fixture_root
+    chown() { :; }; chmod() { :; }
+    compose() {
+        case "$*" in
+            "ps --status running --services") printf "gateway\noscar\npostgres\n" ;;
+            "stop gateway") printf "stop-gateway\n" >>"$actions" ;;
+            "stop oscar") printf "stop-oscar\n" >>"$actions" ;;
+            "up --detach --no-build --pull never oscar gateway") printf "resume-oscar-gateway\n" >>"$actions" ;;
+        esac
+    }
+    docker() {
+        [[ " $* " != *" --entrypoint java "* ]] || return 73
+        return 0
+    }
+    confirm_daily_journal_backup "$backup_id" "$fixture_root/$backup_id" oscar:test aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+' _ "$shell_script" "$journal_resume_root" "$acceptance_id" "$journal_resume_actions" >/dev/null 2>&1; then
+    printf 'Bash journal confirmation ignored an injected post-extraction failure.\n' >&2
+    exit 1
+fi
+[[ $(grep -Fxc stop-gateway "$journal_resume_actions") == 1 &&
+   $(grep -Fxc stop-oscar "$journal_resume_actions") == 1 &&
+   $(grep -Fxc resume-oscar-gateway "$journal_resume_actions") == 1 &&
+   -z $(find "$journal_resume_root" -mindepth 1 -maxdepth 1 -type d -name ".journal-confirm-$acceptance_id.*" -print -quit) ]] || {
+    printf 'Bash journal confirmation did not clean its snapshot and resume the prior services after failure.\n' >&2
     exit 1
 }
 wait "$lock_holder"

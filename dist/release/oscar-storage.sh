@@ -1046,7 +1046,6 @@ confirm_daily_journal_backup() (
     resume_oscar=false; resume_gateway=false
     [[ $oscar_state_sha =~ ^[0-9a-f]{64}$ ]] || fail 'Authenticated oscar-state.tar.gz SHA-256 is missing.'
     snapshot=$(mktemp -d "$backup_dir/.journal-confirm-$backup_id.XXXXXX")
-    chown 10001:10001 "$snapshot"
     chmod 0700 "$snapshot"
     cleanup_journal_confirmation() {
         local status=$?
@@ -1075,15 +1074,21 @@ confirm_daily_journal_backup() (
         --volume "$script_dir/validate-storage-archive.sh:/validate-storage-archive.sh:ro" \
         "$image" -eu -c 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz'
     # Extract only that validated snapshot into a private disposable directory
-    # for the offline journal receipt bridge.
+    # for the offline journal receipt bridge. The authenticated backup tree and
+    # payload are deliberately administrator-only (0700/0600), so this narrowly
+    # confined extractor must run as root to read the exact file bind. It has no
+    # capabilities, network, or writable path beyond the private snapshot.
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 10001:10001 --entrypoint sh \
+        --user 0:0 --entrypoint sh \
         --volume "$root/oscar-state.tar.gz:/oscar-state.tar.gz:ro" --volume "$snapshot:/snapshot" "$image" -eu -c '
         umask 077
         tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz
         find /snapshot -type d -exec chmod 0700 {} +
         find /snapshot -type f -exec chmod 0600 {} +
     '
+    # Keep CAP_CHOWN out of the extractor. The already-elevated host CLI makes
+    # the validated snapshot readable only by the non-root confirmation JVM.
+    chown -R 10001:10001 "$snapshot"
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --tmpfs /tmp:rw,noexec,nosuid,nodev --user 10001:10001 --entrypoint java \
         --volume oscar_oscar_state:/var/lib/oscar --volume "$snapshot:/verified-snapshot:ro" "$image" \
