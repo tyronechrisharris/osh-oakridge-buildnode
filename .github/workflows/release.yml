@@ -160,17 +160,35 @@ jobs:
         shell: powershell
         run: .\tools\test-storage-powershell.ps1
 
+  postgres-restore-timeline:
+    name: PostgreSQL restore timeline and WAL proof
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Run destructive disposable restore drill
+        run: ./tools/test-postgres-restore.sh
+
   platform-acceptance:
     name: Manual Platform Acceptance
     needs:
       - tiered-storage-postgres
       - windows-powershell-5-1
+      - postgres-restore-timeline
     runs-on: ubuntu-latest
     environment: oscar-release-acceptance
     steps:
       - name: Record protected-environment approval
         run: |
           echo "The release-acceptance reviewer confirms that the OSCAR ${RELEASE_VERSION} checklist in README.md is recorded."
+          echo "Required automated release gates have completed in this workflow."
           echo "It includes Windows 11 Docker Desktop/WSL 2, Ubuntu 24.04, backup/restore, archive export/purge, retained-media, offline-full/offline-images, and macOS fail-closed results."
 
   build:
