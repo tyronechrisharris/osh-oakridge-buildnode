@@ -2296,7 +2296,7 @@ archive_purge() (
          ORDER BY g.id,o.relative_path;")
     while IFS=$'\t' read -r generation relative expected_sha object_state; do
         [[ -n $generation && -n $relative && -n $expected_sha ]] || continue
-        delete_outcome=$(archive_object_helper delete "$relative" "$expected_sha" rw)
+        delete_outcome=$(archive_object_helper delete "$relative" "$expected_sha" rw </dev/null)
         [[ $delete_outcome == DELETED || $delete_outcome == ALREADY_ABSENT ]] ||
             fail "Archive deletion helper returned an invalid outcome for: $relative"
         psql_admin --command "WITH changed AS (
@@ -2304,7 +2304,7 @@ archive_purge() (
              WHERE generation_id='$generation' AND relative_path='$relative' AND state='DELETING'
              RETURNING 1
         ) INSERT INTO oscar_deletion_ledger(plan_id,store_key,id_scope,subject_type,subject_id,object_path,outcome)
-            SELECT '$plan','$store_key',$id_scope,'ARCHIVE_GENERATION','$generation','$relative','$delete_outcome' FROM changed;" >/dev/null
+            SELECT '$plan','$store_key',$id_scope,'ARCHIVE_GENERATION','$generation','$relative','$delete_outcome' FROM changed;" </dev/null >/dev/null
     done <<<"$delete_rows"
     psql_admin --command "BEGIN;
         UPDATE oscar_deletion_plan_item i SET state='COMPLETED', updated_at=now()

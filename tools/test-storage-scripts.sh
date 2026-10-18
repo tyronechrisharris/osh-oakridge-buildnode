@@ -1413,6 +1413,81 @@ bash -c '
         --observation 42 --reason test --created-by tester
 ' _ "$shell_script" >/dev/null
 
+# A purge object list is a here-string. Commands inside that loop must not
+# inherit it as stdin, or the first Docker/psql child can consume the remaining
+# rows and strand a confirmed plan after deleting only its first object.
+purge_stream_fixture="$test_root/purge-stream-bash"
+mkdir -p "$purge_stream_fixture"
+bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    require_admin() { :; }; require_configured() { :; }
+    token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    token_hash=$(printf "%s" "$token" | sha256sum | awk "{print \$1}")
+    fixture_generation=12345678-1234-4234-8234-123456789abc
+    plan=87654321-4321-4234-8234-cba987654321
+    digest=$(printf "%064d" 0 | tr 0 a)
+    compose() { :; }
+    archive_object_helper() {
+        case $1 in
+            verify) return 0 ;;
+            delete)
+                printf "%s\n" "$2" >>"$fixture/deleted"
+                printf "DELETED\n"
+                ;;
+            *) return 2 ;;
+        esac
+    }
+    psql_admin() {
+        local query=${!#}
+        case $query in
+            *"SELECT subject_id, state, confirmation_hash"*)
+                printf "2026-01-01T00:00:00Z|PLANNED|%s\n" "$token_hash"
+                ;;
+            *"o.state IN ('\''ACTIVE'\'','\''DELETING'\'')"*)
+                for suffix in parquet manifest schemas; do
+                    printf "%s\tdatasets/test/object.%s\t%s\tACTIVE\n" "$fixture_generation" "$suffix" "$digest"
+                done
+                ;;
+            *"g.state='\''DELETING'\'' AND o.state='\''DELETING'\''"*)
+                for suffix in parquet manifest schemas; do
+                    printf "%s\tdatasets/test/object.%s\t%s\tDELETING\n" "$fixture_generation" "$suffix" "$digest"
+                done
+                ;;
+            *"UPDATE oscar_archive_object SET state='\''DELETED'\''"*)
+                # Deliberately attempt to consume one input row. The production
+                # call must provide /dev/null, leaving the loop stream intact.
+                IFS= read -r swallowed || true
+                printf "updated\n" >>"$fixture/catalog-updates"
+                ;;
+            *"UPDATE oscar_deletion_plan_item i SET state='\''COMPLETED'\''"*)
+                : >"$fixture/finalized"
+                ;;
+            *"SELECT state FROM oscar_deletion_plan"*)
+                if [[ -f $fixture/finalized &&
+                      $(wc -l <"$fixture/deleted") -eq 3 &&
+                      $(wc -l <"$fixture/catalog-updates") -eq 3 ]]; then
+                    printf "COMPLETED\n"
+                else
+                    printf "CONFIRMED\n"
+                fi
+                ;;
+        esac
+    }
+    archive_purge --store-key obs --id-scope 4 --plan "$plan" --token "$token"
+' _ "$shell_script" "$purge_stream_fixture" >/dev/null
+[[ -f $purge_stream_fixture/finalized &&
+   $(wc -l <"$purge_stream_fixture/deleted") -eq 3 &&
+   $(wc -l <"$purge_stream_fixture/catalog-updates") -eq 3 ]] || {
+    printf 'Bash archive purge did not finalize all three streamed objects and its plan.\n' >&2
+    exit 1
+}
+
+# PowerShell materializes database rows into an array before invoking helpers,
+# so child process stdin cannot consume the remaining purge work.
+assert_contains '\$objects = @\(Invoke-PsqlLines' "$powershell_script"
+assert_contains 'foreach \(\$line in \$objects\)' "$powershell_script"
+
 # Retention decisions are based on fully reverified usable recovery points. A
 # single corrupt candidate must prevent intent creation and every deletion.
 prune_fixture="$test_root/prune-preflight-bash"
