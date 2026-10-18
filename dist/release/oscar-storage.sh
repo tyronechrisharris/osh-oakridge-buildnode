@@ -92,6 +92,7 @@ required_release_version=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, ind
 readonly required_release_version
 readonly max_backup_archive_generation_ids=1000000
 readonly max_backup_archive_generation_inventory_bytes=37000000
+readonly validator_scratch_tmpfs=/tmp:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=0,gid=0
 
 valid_deployment_id() {
     [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
@@ -589,7 +590,7 @@ validate_image_inventory() {
 validate_release_config_archive() {
     local root=$1 image=$2
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh \
+        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh \
         --volume "$root:/backup:ro" --volume "$script_dir:/validator:ro" "$image" -eu -c '
         sh /validator/validate-storage-archive.sh release-config /backup/release-config.tar.gz
     '
@@ -598,7 +599,7 @@ validate_release_config_archive() {
 validate_backup_archive_members() {
     local root=$1 image=$2
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev --user 0 --entrypoint sh \
+        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh \
         --volume "$root:/backup:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
         --volume "$script_dir:/validator:ro" "$image" -eu -c '
         secret_archive=$(mktemp /tmp/oscar-secrets.XXXXXX.tar.gz)
@@ -1053,7 +1054,8 @@ confirm_daily_journal_backup() (
     # immutable core has already passed full verification. This keeps the
     # retention bridge independently fail-closed against a swapped payload.
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 0 --entrypoint sh --volume "$root/oscar-state.tar.gz:/oscar-state.tar.gz:ro" \
+        --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh \
+        --volume "$root/oscar-state.tar.gz:/oscar-state.tar.gz:ro" \
         --volume "$script_dir/validate-storage-archive.sh:/validate-storage-archive.sh:ro" \
         "$image" -eu -c 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz'
     # Extract only that validated snapshot into a private disposable directory

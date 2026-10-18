@@ -35,6 +35,7 @@ $RequiredReleaseVersion = $releaseVersionLine[0].Substring('OSCAR_VERSION='.Leng
 if ($RequiredReleaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?$') { throw 'The packaged OSCAR release version is invalid.' }
 $MaxBackupArchiveGenerationIds = 1000000
 $MaxBackupArchiveGenerationInventoryBytes = 37000000
+$ValidatorScratchTmpfs = '/tmp:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=0,gid=0'
 $script:StorageAdminLock = $null
 
 function Fail([string]$Message) { throw $Message }
@@ -1078,7 +1079,7 @@ function Confirm-ChecksumHmac([string]$Root, [string]$Image) {
 
 function Confirm-ReleaseConfigArchive([string]$Root, [string]$Image) {
     $validation = 'sh /validator/validate-storage-archive.sh release-config /backup/release-config.tar.gz'
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
 }
 
 function Confirm-BackupArchiveMembers([string]$Root, [string]$Image) {
@@ -1093,7 +1094,7 @@ sh /validator/validate-storage-archive.sh \
     release-config /backup/release-config.tar.gz \
     deployment-secrets "$secret_archive"
 '@
-    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
+    Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-eu', '-c', $validation)
 }
 
 function Write-VerifiedMarker([string]$Root) {
@@ -1299,7 +1300,7 @@ function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, 
     try {
         if ($resumeGateway) { Invoke-Compose @('stop', 'gateway') }
         if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-eu', '-c', 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz')
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-eu', '-c', 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz')
         $extract = 'umask 077; tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz; find /snapshot -type d -exec chmod 0700 {} +; find /snapshot -type f -exec chmod 0600 {} +'
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-eu', '-c', $extract)
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshot}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)

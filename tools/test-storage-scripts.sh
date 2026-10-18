@@ -53,6 +53,21 @@ sh -n "$archive_validator"
 sh -n "$archive_object_helper"
 sh -n "$oscar_entrypoint"
 
+# Every tar-validator container is otherwise read-only and must receive the
+# same bounded, private scratch mount. Keep TMPDIR pinned so a future image
+# environment cannot redirect validator writes outside that mount.
+validator_tmpfs_spec='/tmp:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=0,gid=0'
+[[ $(grep -Fxc "readonly validator_scratch_tmpfs=$validator_tmpfs_spec" "$shell_script") == 1 &&
+   $(grep -F -- '--tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --user 0 --entrypoint sh' "$shell_script" | wc -l | tr -d ' ') == 3 ]] || {
+    printf 'Bash tar-validator launches do not all use the exact bounded scratch tmpfs.\n' >&2
+    exit 1
+}
+[[ $(grep -Fxc "\$ValidatorScratchTmpfs = '$validator_tmpfs_spec'" "$powershell_script") == 1 &&
+   $(grep -F -- "'--tmpfs', \$ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--user', '0', '--entrypoint', 'sh'" "$powershell_script" | wc -l | tr -d ' ') == 3 ]] || {
+    printf 'PowerShell tar-validator launches do not all use the exact bounded scratch tmpfs.\n' >&2
+    exit 1
+}
+
 # Target-side bundle verification must authenticate the exact inventory on
 # every run. A stale receipt, an extra privileged installer, a duplicate
 # manifest path, or a link/reparse entry must never be accepted.
@@ -1000,6 +1015,55 @@ mkdir -p "$test_root/tar-good/data" "$test_root/tar-bad-link" "$test_root/tar-ba
 printf 'safe payload\n' >"$test_root/tar-good/data/value.txt"
 tar -czf "$test_root/good.tar.gz" -C "$test_root/tar-good" .
 sh "$archive_validator" good "$test_root/good.tar.gz"
+missing_validator_scratch="$test_root/missing-validator-scratch"
+if scratch_failure=$(TMPDIR="$missing_validator_scratch" sh "$archive_validator" good "$test_root/good.tar.gz" 2>&1); then
+    printf 'Archive validator succeeded without a writable scratch directory.\n' >&2
+    exit 1
+fi
+grep -Fq "archive validator cannot create its private scratch directory: $missing_validator_scratch" <<<"$scratch_failure" || {
+    printf 'Archive validator scratch failure was not actionable.\n' >&2
+    exit 1
+}
+
+# Concurrent validators sharing one scratch root must use collision-resistant
+# private directories and clean them all. A symlink at the former PID-derived
+# name must remain untouched, proving it is no longer a write target.
+validator_shared_scratch="$test_root/validator-shared-scratch"
+validator_sentinel="$test_root/validator-old-name-sentinel"
+mkdir -p "$validator_shared_scratch"
+printf 'unchanged\n' >"$validator_sentinel"
+# shellcheck source=/dev/null
+. "$archive_validator"
+old_validator_name="$validator_shared_scratch/oscar-tar-validation-$$.names"
+ln -s "$validator_sentinel" "$old_validator_name"
+work=caller-work-sentinel
+scratch_root=caller-scratch-sentinel
+caller_exit_trap=$(trap -p EXIT)
+if TMPDIR="$missing_validator_scratch" validate_storage_archive good "$test_root/good.tar.gz" >/dev/null 2>&1; then
+    printf 'Sourced archive validator succeeded without scratch.\n' >&2
+    exit 1
+fi
+[[ $work == caller-work-sentinel && $scratch_root == caller-scratch-sentinel &&
+   $(trap -p EXIT) == "$caller_exit_trap" ]] || {
+    printf 'Sourced archive validator leaked work state or replaced its caller EXIT trap.\n' >&2
+    exit 1
+}
+unset work scratch_root
+validator_pids=()
+for _ in {1..8}; do
+    TMPDIR="$validator_shared_scratch" sh "$archive_validator" good "$test_root/good.tar.gz" &
+    validator_pids+=("$!")
+done
+for validator_pid in "${validator_pids[@]}"; do wait "$validator_pid"; done
+TMPDIR="$validator_shared_scratch" validate_storage_archive good "$test_root/good.tar.gz"
+[[ $(cat "$validator_sentinel") == unchanged && -L $old_validator_name ]] || {
+    printf 'Archive validator followed or replaced the former predictable scratch name.\n' >&2
+    exit 1
+}
+if find "$validator_shared_scratch" -mindepth 1 -maxdepth 1 -type d -name 'oscar-tar-validation.*' -print -quit | grep -q .; then
+    printf 'Concurrent archive validators left private scratch directories behind.\n' >&2
+    exit 1
+fi
 
 ln -s /etc/passwd "$test_root/tar-bad-link/link"
 tar -czf "$test_root/link.tar.gz" -C "$test_root/tar-bad-link" .

@@ -4,18 +4,35 @@ set -eu
 # Validate a tar.gz payload before a privileged restore extracts it.  Listing the
 # archive is intentionally separate from extraction: no archive-controlled path
 # is ever materialized while these checks run.
-validate_storage_archive() {
+validate_storage_archive() (
     label=$1
     archive=$2
-    work=${TMPDIR:-/tmp}/oscar-tar-validation-$$
-    names=$work.names
-    details=$work.details
-    sorted_names=$work.names.sorted
-    sorted_expected=$work.expected.sorted
-    expected=$work.expected
-    types=$work.types
-    records=$work.records
-    trap 'rm -f -- "$names" "$details" "$expected" "$sorted_names" "$sorted_expected" "$types" "$records"' EXIT HUP INT TERM
+    scratch_root=${TMPDIR:-/tmp}
+    work=
+    work_created=false
+    cleanup_validation_scratch() {
+        if [ "$work_created" = true ]; then
+            case "$work" in
+                "$scratch_root"/oscar-tar-validation.*)
+                    [ ! -L "$work" ] && [ -d "$work" ] && rm -rf -- "$work"
+                    ;;
+            esac
+        fi
+    }
+    work=$(mktemp -d "$scratch_root/oscar-tar-validation.XXXXXX") || {
+        echo "$label archive validator cannot create its private scratch directory: $scratch_root" >&2
+        return 1
+    }
+    work_created=true
+    names=$work/names
+    details=$work/details
+    sorted_names=$work/names.sorted
+    sorted_expected=$work/expected.sorted
+    expected=$work/expected
+    types=$work/types
+    records=$work/records
+    trap cleanup_validation_scratch EXIT
+    trap 'exit 1' HUP INT TERM
 
     [ -f "$archive" ] || {
         echo "$label archive is missing or is not a regular file: $archive" >&2
@@ -232,9 +249,10 @@ EOF
         fi
     fi
 
-    rm -f -- "$names" "$details" "$expected" "$sorted_names" "$sorted_expected" "$types" "$records"
+    cleanup_validation_scratch
+    work_created=false
     trap - EXIT HUP INT TERM
-}
+)
 
 if [ "${0##*/}" = validate-storage-archive.sh ]; then
     [ "$#" -ge 2 ] && [ $(($# % 2)) -eq 0 ] || {

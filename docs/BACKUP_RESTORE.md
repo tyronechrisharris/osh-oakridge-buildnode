@@ -245,6 +245,9 @@ Verification:
   absolute, contain `..`, use backslash traversal, contain control characters, alias another path,
   repeat a name, or create file/directory prefix collisions, and only regular files/directories are
   allowed (links, devices, FIFOs, sockets, and unknown types are rejected);
+- confines tar-listing scratch data to a private, root-only `/tmp` tmpfs capped at 256 MiB in the
+  otherwise read-only, networkless, capability-free validator container. Scratch exhaustion fails
+  verification before extraction or acceptance and leaves no host-side temporary files;
 - requires the exact top-level payload inventory and exactly one copy of every mandatory
   release-config file;
 - validates the bounded canonical archive-generation UUID inventory and uses only that authenticated
