@@ -444,10 +444,27 @@ try {
     $ScriptRoot = $originalScriptRoot
     Assert-True $rejectedUnc 'Managed-environment preflight accepted a UNC storage root.'
 
-    & net.exe localgroup docker-users *> $null
-    if ($LASTEXITCODE -ne 0) {
-        & net.exe localgroup docker-users /add *> $null
-        if ($LASTEXITCODE -ne 0) { throw 'Could not create the temporary docker-users group for ACL validation.' }
+    # Windows PowerShell 5 promotes stderr from a nonzero native command to a
+    # terminating NativeCommandError while ErrorActionPreference is Stop.  A
+    # missing group is the expected probe result on clean hosted runners, so
+    # capture only the native exit code without weakening the rest of the test.
+    $savedErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & net.exe localgroup docker-users *> $null
+        $dockerGroupExists = ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $savedErrorPreference
+    }
+    if (-not $dockerGroupExists) {
+        try {
+            $ErrorActionPreference = 'Continue'
+            & net.exe localgroup docker-users /add *> $null
+            $dockerGroupCreated = ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $savedErrorPreference
+        }
+        if (-not $dockerGroupCreated) { throw 'Could not create the temporary docker-users group for ACL validation.' }
         $createdDockerGroup = $true
     }
 
