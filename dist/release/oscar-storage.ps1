@@ -2591,9 +2591,9 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
         if (-not [UInt64]::TryParse($sourceTimelineText, [ref]$sourceTimeline) -or $sourceTimeline -eq 0) {
             Fail 'PostgreSQL restore preparation did not emit the authenticated source timeline.'
         }
-        $restoreState = 'find /state -mindepth 1 -maxdepth 1 ! -name archive -exec rm -rf -- {} +; tar --no-same-owner --no-overwrite-dir -C /state -xzf /restore-state.tar.gz'
+        $restoreState = 'find /state -mindepth 1 -maxdepth 1 ! -name archive -exec rm -rf -- {} +; tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /state -xzf /restore-state.tar.gz'
         Invoke-DockerShellInput $restoreState @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', '--volume', "$(Join-Path $restoreStage 'oscar-state.tar.gz'):/restore-state.tar.gz:ro", $image, '-seu')
-        $restoreArchive = 'find /archive -mindepth 1 -maxdepth 1 ! -name .oscar-storage-root -exec rm -rf -- {} +; tar --no-same-owner --no-overwrite-dir -C /archive -xzf /restore-archive.tar.gz'
+        $restoreArchive = 'find /archive -mindepth 1 -maxdepth 1 ! -name .oscar-storage-root -exec rm -rf -- {} +; tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /archive -xzf /restore-archive.tar.gz'
         Invoke-DockerShellInput $restoreArchive @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive", '--volume', "$(Join-Path $restoreStage 'archive.tar.gz'):/restore-archive.tar.gz:ro", $image, '-seu')
         Assert-StorageRootIdentities
         Install-PreparedDeploymentCredentials $restoreTemp $ScriptRoot

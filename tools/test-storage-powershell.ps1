@@ -139,8 +139,8 @@ try {
     $storageSource = [IO.File]::ReadAllText($storageScript)
     $setupSource = [IO.File]::ReadAllText($setupScript)
     foreach ($restoreCommand in @(
-        'tar --no-same-owner --no-overwrite-dir -C /state -xzf /restore-state.tar.gz',
-        'tar --no-same-owner --no-overwrite-dir -C /archive -xzf /restore-archive.tar.gz')) {
+        'tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /state -xzf /restore-state.tar.gz',
+        'tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /archive -xzf /restore-archive.tar.gz')) {
         Assert-True (([Text.RegularExpressions.Regex]::Matches(
             $storageSource, [Text.RegularExpressions.Regex]::Escape($restoreCommand))).Count -eq 1) `
             "Restore extraction can overwrite mounted-root metadata: $restoreCommand"
