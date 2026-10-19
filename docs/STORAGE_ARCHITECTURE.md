@@ -233,9 +233,14 @@ distinct decoded frame ordinals. Each output is an opaque baseline sRGB JPEG; de
 85. Frames are written, forced, decoded and verified independently, then a typed manifest is
 published as the set's commit marker.
 
+New OSCAR camera recordings are published only after at least five video packets have been muxed.
+If an alarm ends sooner, the recorder collects a bounded post-roll before closing its hidden
+partial. This preserves the distinct-frame evidence contract without lengthening the occupancy.
+
 The source MP4 is kept for 24 hours by default after successful publication. A later idempotent pass
 deletes it only if the complete media set still verifies and no hold is active. A corrupt clip, a
-clip with fewer than five decoded frames, or any write/verification failure leaves the MP4 intact.
+legacy or externally supplied clip with fewer than five decoded frames, or any write/verification
+failure leaves the MP4 intact.
 The occupancy's legacy `videoPaths` value is not rewritten. The Viewer asks the authenticated media
 API for the five-frame set and falls back to legacy video playback on `404`. Before decoding images,
 the Viewer applies a 1 MiB streaming catalog limit plus bounded camera-count, frame-byte, dimension,

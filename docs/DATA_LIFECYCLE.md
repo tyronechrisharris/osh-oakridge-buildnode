@@ -309,8 +309,10 @@ its configured share of `maintenanceWorkLimit`, so lifecycle/ledger repair remai
 does not enumerate the retained-media tree. A pre-manifest crash leaves only a stale slot that the
 worker discards; a post-manifest crash always leaves durable repair work.
 
-The source is never deleted on the creation attempt. Any error, including fewer than five decoded
-frames, preserves the source and records a failed job. After successful publication the source is
+New OSCAR-managed alarm clips receive a bounded post-roll until five video packets have been
+muxed. The source is never deleted on the creation attempt. Any error, including a legacy or
+externally supplied clip with fewer than five decoded frames, preserves the source and records a
+failed job. After successful publication the source is
 `PRESERVED_FOR_ROLLBACK` for `sourceRollbackGraceHours` (24 by default). A subsequent retention pass
 re-verifies the set and, if no hold applies, advances through `ELIGIBLE_FOR_DELETION` to `DELETED`.
 

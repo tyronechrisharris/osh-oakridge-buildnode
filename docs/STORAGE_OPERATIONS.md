@@ -623,8 +623,9 @@ to the occupancy's legacy `videoPaths`. It is normal for legacy/pre-3.9.2 events
 referenced frame is missing or corrupt is not normal; the API withholds that asset, and the source
 or backup should be used for recovery.
 
-Release acceptance must include both a clip that publishes exactly five distinct JPEG positions and
-a clip with fewer than five decoded frames. The latter must retain its MP4, record a failed
+Release acceptance must include a one-second alarm whose saved OSCAR camera clip still publishes
+exactly five distinct JPEG positions after bounded post-roll, plus an injected legacy clip with
+fewer than five decoded frames. The legacy negative fixture must retain its MP4, record a failed
 conversion, publish no partial media set, and continue through the Viewer's `404` legacy-video
 fallback.
 

@@ -44,6 +44,7 @@ All notable changes to this project will be documented in this file.
 - Cancel non-alarm recordings and fail closed on close timeouts, invalid output, or publication failure, while retaining authoritative late-close cleanup so delayed camera work cannot leave an orphaned clip
 - Make camera, occupancy, and state-listener delivery race-safe so lifecycle transitions cannot lose, duplicate, or leak recording callbacks
 - Retain exactly five distinct decoded positions (`FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`) from each eligible alarm camera clip
+- Give short saved alarm recordings a bounded post-roll until at least five video packets have been muxed, so one-second occupancies remain eligible for five-frame retention
 - Encode each retained asset as an independently decodable opaque baseline sRGB JPEG with configurable quality (85 by default), SHA-256, dimensions, decoded ordinal, source PTS, and lifecycle metadata
 - Publish frames before a versioned manifest commit marker, use a durable identity-keyed job ledger for idempotent retry, and preserve the source MP4 on every failure or fewer-than-five-frame result
 - Preserve a successfully converted source for a configurable 24-hour rollback grace and delete it only on a later verified, unheld lifecycle pass
