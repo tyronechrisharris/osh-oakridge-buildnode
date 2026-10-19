@@ -46,6 +46,14 @@ progress independently. Each start creates a generation-qualified name of the fo
 `<timestamp>-g<generation>.mp4`; a later reconnect or occupancy must never overwrite or claim that
 path.
 
+An MP4 OPEN remains pending until that exact recording generation successfully muxes its first
+keyframe. OSCAR drops preceding mid-GOP packets, waits at most five seconds, and accepts the command
+only while the same generation is still active. Stop, packet-write failure, timeout, or a stale
+generation wakes and rejects the wait, cancels the output, and removes its hidden partial. Because
+the per-camera FIFO queues CLOSE behind OPEN, a short occupancy can still save the first decodable
+keyframe instead of finalizing a header-only, zero-packet clip. This adds only one volatile readiness
+read to the steady-state packet path after the gate has opened.
+
 The close operation's validated result is authoritative. OSCAR attaches only that returned path to
 the alarm that requested it, and verifies its exact lane, camera, and recording generation. It does
 not rediscover the clip by scanning a directory or by reading a mutable current-filename field.
@@ -68,7 +76,7 @@ occupancy.
 4. Repeat on the first, middle, and last configured lanes, then switch rapidly between two lanes and confirm the old stream is stopped.
 5. Stop an emulator publisher or disconnect a test camera. Confirm the Viewer eventually shows **Live video could not be played** and a **Retry** action instead of remaining at `0:00` indefinitely.
 6. Restore the source, select **Retry**, and confirm playback resumes.
-7. Run an alarm occupancy and confirm exactly one nonblank, unique `videoPaths` entry exists for each configured camera; every path must include a generation suffix, belong to that camera, exist, be nonzero, finalize, and decode in the browser.
+7. Start or reconnect a test camera and immediately run a short alarm occupancy. Confirm OPEN is not acknowledged before a muxed keyframe and exactly one nonblank, unique `videoPaths` entry exists for each configured camera; every path must include a generation suffix, belong to that camera, exist, contain a leading keyframe, finalize, and decode in the browser.
 8. Run a non-alarm occupancy and confirm its unpublished MP4 and any partial file are removed.
 9. Trigger back-to-back alarms and a camera reconnect during recording. Confirm each alarm references only its own camera generations, no new orphan or partial appears, and every retained-media ledger row names the same event, lane, camera, and source clip with one successful attempt.
 10. Exercise a delayed close past the command timeout. Confirm later recording commands for that camera fail closed until cleanup completes and the late clip is removed rather than attached to another alarm.
@@ -82,5 +90,6 @@ occupancy.
 | Player remains at `0:00` | Confirm the deployed OSCAR 3.9.2 image includes the keyframe-gated HLS and Viewer recovery fixes; inspect the first segment for a leading keyframe and valid H.264 parameter sets. |
 | Emulator playback is slow to start | Run the emulator asset-preparation and validation scripts, then recreate the publisher containers. Runtime publishing should continue to use stream copy rather than live transcoding. |
 | Recordings fail after a live-video change | Treat this as a regression. Live HLS and MP4 share camera input but have separate output rules; run the recording acceptance test before release. |
+| Alarm recording preparation times out | Confirm the camera produces an H.264 keyframe within five seconds and that the packet path has no write failure. OSCAR deliberately rejects the OPEN and removes the hidden partial instead of attaching a zero-packet MP4. |
 | An alarm references a clip from another event or camera | Stop release qualification. Recordings are bound by lane, camera, event, and generation; inspect the per-camera command queue and recording-coordinator logs. Never repair the database by guessing a nearby filename. |
 | A timed-out close later leaves an MP4 | Stop release qualification. The late authoritative result should be observed and removed after invalidation; capture the queue timeout and cleanup logs before restarting the camera module. |

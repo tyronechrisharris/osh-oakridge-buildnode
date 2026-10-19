@@ -39,6 +39,7 @@ All notable changes to this project will be documented in this file.
 
 ### Media retention
 - Serialize recording commands in a bounded per-camera FIFO and use generation-qualified filenames so reconnects and back-to-back occupancies cannot finalize or reuse another recording's clip
+- Acknowledge occupancy MP4 OPEN only after the current recording generation has successfully muxed its first keyframe; bound readiness to five seconds, wake on stop/failure, reject stale generations, and remove the hidden partial instead of producing a zero-packet alarm clip
 - Bind every published recording to its exact lane, camera, and alarm; reject blank, duplicate, cross-camera, stale-generation, or otherwise unowned paths instead of attaching them heuristically
 - Cancel non-alarm recordings and fail closed on close timeouts, invalid output, or publication failure, while retaining authoritative late-close cleanup so delayed camera work cannot leave an orphaned clip
 - Make camera, occupancy, and state-listener delivery race-safe so lifecycle transitions cannot lose, duplicate, or leak recording callbacks

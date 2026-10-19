@@ -1185,7 +1185,7 @@ fi
 ps_restore_body=$(awk '/^function Restore-Backup\(/,/^function Show-ArchiveStatus/' "$powershell_script")
 ps_merge_line=$(grep -n -m1 'oscar-merge-wal-restore' <<<"$ps_restore_body" | cut -d: -f1)
 ps_safety_line=$(grep -n -m1 'pre-restore-' <<<"$ps_restore_body" | cut -d: -f1)
-ps_stop_line=$(grep -n -m1 "'stop', 'gateway', 'oscar', 'postgres'" <<<"$ps_restore_body" | cut -d: -f1)
+ps_stop_line=$(grep -n -m1 '^[[:space:]]*Stop-DeploymentOrdered$' <<<"$ps_restore_body" | cut -d: -f1)
 [[ -n $ps_merge_line && -n $ps_safety_line && -n $ps_stop_line &&
    $ps_merge_line -lt $ps_safety_line && $ps_merge_line -lt $ps_stop_line ]] || {
     printf 'PowerShell restore does not complete WAL merge preflight before safety copy and service stop.\n' >&2
