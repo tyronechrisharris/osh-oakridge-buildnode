@@ -16,7 +16,9 @@ CSV files exported by earlier releases remain importable. Their lanes have no vi
 
 When importing a lane CSV in **SensorHub Admin → Services → OSCAR Service Module**, a successful
 upload loads the lanes immediately and records the persistent bucket object key in the edited
-service configuration. Click **Apply Changes**, then the global **Save** action. Perform one
+service configuration. Click **Apply Changes**, then the global **Save** action, confirm **Yes**
+in the dialog, and wait for **SensorHub Configuration Saved**. Merely opening the confirmation
+dialog does not persist the configuration. Perform one
 supported OSCAR restart and verify that the live Lane, RPM, and camera modules return; finding the
 lane UIDs in historical database results alone is not a persistence check. If Apply Changes and
 Save are omitted, the uploaded runtime modules are not an accepted durable configuration.
