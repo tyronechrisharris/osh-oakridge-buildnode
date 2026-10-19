@@ -753,6 +753,30 @@ function Assert-DeploymentImagesAvailable {
     }
 }
 
+function Build-ConnectedDeploymentImages {
+    Assert-DeploymentPathsSafe
+    $version = Get-ReleaseVersion
+    $postgisPlatform = Get-ConfiguredEnvValue 'OSCAR_POSTGIS_PLATFORM'
+    if (-not $postgisPlatform) { $postgisPlatform = 'linux/amd64' }
+    if ($postgisPlatform -cnotmatch '^linux/(amd64|arm64)$') {
+        throw "Unsupported OSCAR_POSTGIS_PLATFORM for a connected build: $postgisPlatform"
+    }
+
+    # Compose 5 uses Bake by default. Buildx 0.37.2 on Windows can misclassify
+    # an in-context Dockerfile as external and demand a broad fs.read
+    # entitlement that `docker compose build` cannot pass. These two explicit
+    # builds use only the validated release directories and preserve the same
+    # tags, version argument, and PostgreSQL platform as compose.yaml.
+    Invoke-External 'docker' @(
+        'build', '--build-arg', "OSCAR_VERSION=$version", '--tag', "oscar:$version",
+        '--file', (Join-Path $ScriptRoot 'docker\oscar\Dockerfile'), $ScriptRoot)
+    $postgisRoot = Join-Path $ScriptRoot 'postgis'
+    Invoke-External 'docker' @(
+        'build', '--platform', $postgisPlatform, '--build-arg', "OSCAR_VERSION=$version",
+        '--tag', "oscar-postgis:$version", '--file', (Join-Path $postgisRoot 'Dockerfile'),
+        $postgisRoot)
+}
+
 function Prepare-DeploymentImages {
     $requiredImages = @(Get-RequiredImages)
     $offlineArchive = Join-Path $ScriptRoot 'offline-images.tar'
@@ -766,7 +790,7 @@ function Prepare-DeploymentImages {
         $missingImages = @($requiredImages | Where-Object { -not (Test-ContainerImage $_) })
         if ($missingImages.Count -eq 0) { return }
         Write-Heading 'Building deployment images'
-        Invoke-Compose @('build', 'oscar', 'postgres')
+        Build-ConnectedDeploymentImages
 
         # Recheck the complete inventory after building the two local images.
         # If the pinned gateway tag is already present, pulling it again is

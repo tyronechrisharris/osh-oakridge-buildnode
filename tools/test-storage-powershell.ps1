@@ -160,11 +160,14 @@ try {
         }
         function Write-Heading([string]$Message) {}
         function Invoke-External([string]$Program, [string[]]$Arguments) { throw 'Offline import was not expected.' }
+        function Build-ConnectedDeploymentImages {
+            $script:ImagePreparationActions.Add('build-local')
+            $script:ImagesBuilt = $true
+        }
         function Invoke-Compose([string[]]$Arguments) {
             $action = [string]::Join('|', $Arguments)
             $script:ImagePreparationActions.Add($action)
             switch ($action) {
-                'build|oscar|postgres' { $script:ImagesBuilt = $true }
                 'pull|gateway' { $script:GatewayPresent = $true }
                 default { throw "Unexpected Compose action: $action" }
             }
@@ -173,7 +176,7 @@ try {
 
         Prepare-DeploymentImages
         Assert-True ($script:ImagePreparationActions.Count -eq 1 -and
-            $script:ImagePreparationActions[0] -ceq 'build|oscar|postgres') `
+            $script:ImagePreparationActions[0] -ceq 'build-local') `
             'Windows connected image preparation pulled an already-cached gateway image.'
 
         $script:ImagesBuilt = $false
@@ -181,7 +184,7 @@ try {
         $script:ImagePreparationActions.Clear()
         Prepare-DeploymentImages
         Assert-True ($script:ImagePreparationActions.Count -eq 2 -and
-            $script:ImagePreparationActions[0] -ceq 'build|oscar|postgres' -and
+            $script:ImagePreparationActions[0] -ceq 'build-local' -and
             $script:ImagePreparationActions[1] -ceq 'pull|gateway') `
             'Windows connected image preparation did not pull a genuinely missing gateway image.'
 
@@ -192,6 +195,12 @@ try {
         Assert-True ($script:ImagePreparationActions.Count -eq 0) `
             'Windows connected image preparation mutated a complete local image inventory.'
     }
+    Assert-True ($setupSource.Contains("'build', '--build-arg', `"OSCAR_VERSION=`$version`", '--tag', `"oscar:`$version`"")) `
+        'Windows connected setup does not build the OSCAR image from its exact local release context.'
+    Assert-True ($setupSource.Contains("'build', '--platform', `$postgisPlatform, '--build-arg', `"OSCAR_VERSION=`$version`"")) `
+        'Windows connected setup does not preserve the configured PostgreSQL build platform.'
+    Assert-True (-not $setupSource.Contains('BUILDX_BAKE_ENTITLEMENTS_FS')) `
+        'Windows setup disables Bake filesystem checks instead of using bounded build contexts.'
     foreach ($astFixture in @(
         @{ Path = $setupScript; ExpectedShellRuns = 2 },
         @{ Path = $storageScript; ExpectedShellRuns = 18 })) {
