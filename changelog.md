@@ -105,6 +105,7 @@ All notable changes to this project will be documented in this file.
 - Make FFmpeg transcoder queues thread-safe and blocking, preserve native packet ownership and delayed-output flushing, surface worker failures, and prevent overlapping pipeline generations during stop, restart, or reinitialization
 - Keep MP4 packet delivery ordered with recording close so healthy occupancy clips cannot finalize before queued video packets are written
 - Reject and remove incomplete video recordings instead of retaining zero-byte or unfinalized clips, with live-camera recording/HLS coverage plus reconnect and failure-cleanup regression tests
+- Start each per-camera recording-command watchdog only after FIFO and bounded alarm/save-decision waits finish and the camera operation is submitted, preventing healthy short occupancies and keyframe-gated startup from falsely quarantining a camera while retaining bounded hung-operation cleanup
 - Start live HLS output on the first decodable H.264 keyframe and withhold unavailable playlists instead of serving an empty manifest or a segment that begins mid-GOP
 - Treat rapid lane switches before the first HLS keyframe as successful cancellations while preventing queued packets from leaking into a restart and preserving real write or cleanup failures
 - Show localized live-video preparation, terminal failure, and retry states in the Viewer, with bounded recovery for transient playlist, network, and media errors

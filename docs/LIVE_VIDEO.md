@@ -68,6 +68,12 @@ Camera reconnects, overlapping lifecycle callbacks, and concurrent listener regi
 use generation gates and race-safe listener collections so a callback cannot migrate to a later
 occupancy.
 
+The eight-second command watchdog starts only after a command reaches the head of its per-camera
+FIFO, any pre-submission alarm/save decision resolves, and the camera operation is actually
+submitted. It counts neither legitimate FIFO wait nor the bounded decision wait. Each active
+operation remains bounded independently, genuinely hung operations still quarantine the queue,
+and the four-command pending cap prevents unbounded growth.
+
 ## Acceptance test
 
 1. Open Lane Details for a lane with a connected camera.
@@ -79,7 +85,9 @@ occupancy.
 7. Start or reconnect a test camera and immediately run a short alarm occupancy. Confirm OPEN is not acknowledged before a muxed keyframe and exactly one nonblank, unique `videoPaths` entry exists for each configured camera; every path must include a generation suffix, belong to that camera, exist, contain a leading keyframe, finalize, and decode in the browser.
 8. Run a non-alarm occupancy and confirm its unpublished MP4 and any partial file are removed.
 9. Trigger back-to-back alarms and a camera reconnect during recording. Confirm each alarm references only its own camera generations, no new orphan or partial appears, and every retained-media ledger row names the same event, lane, camera, and source clip with one successful attempt.
-10. Exercise a delayed close past the command timeout. Confirm later recording commands for that camera fail closed until cleanup completes and the late clip is removed rather than attached to another alarm.
+10. Queue a short-occupancy `CLOSE` behind a keyframe-gated `OPEN`, with each operation individually below eight seconds but their cumulative queue time above eight seconds. Confirm the camera is not quarantined and the next occupancy receives only its own generation-qualified path.
+11. Let the bounded alarm/save decision consume eight seconds before submitting `CLOSE`. Confirm the pre-submission wait does not quarantine the camera and that `CLOSE` receives its own full operation timeout.
+12. Exercise a delayed active close past the command timeout. Confirm later recording commands for that camera fail closed until cleanup completes and the late clip is removed rather than attached to another alarm.
 
 ## Troubleshooting
 
