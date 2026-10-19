@@ -1191,6 +1191,14 @@ ps_stop_line=$(grep -n -m1 '^[[:space:]]*Stop-DeploymentOrdered$' <<<"$ps_restor
     printf 'PowerShell restore does not complete WAL merge preflight before safety copy and service stop.\n' >&2
     exit 1
 }
+shell_restore_body=$(awk '/^restore_backup\(\)/,/^archive_status\(\)/' "$shell_script")
+[[ $(grep -Fc 'tar --no-same-owner --no-overwrite-dir -C /state -xzf /restore-state.tar.gz' <<<"$shell_restore_body") == 1 &&
+   $(grep -Fc 'tar --no-same-owner --no-overwrite-dir -C /archive -xzf /restore-archive.tar.gz' <<<"$shell_restore_body") == 1 &&
+   $(grep -Fc 'tar --no-same-owner --no-overwrite-dir -C /state -xzf /restore-state.tar.gz' <<<"$ps_restore_body") == 1 &&
+   $(grep -Fc 'tar --no-same-owner --no-overwrite-dir -C /archive -xzf /restore-archive.tar.gz' <<<"$ps_restore_body") == 1 ]] || {
+    printf 'Restore extraction can overwrite metadata on an existing Docker volume or bind-mount root.\n' >&2
+    exit 1
+}
 
 credential_invalid="$credential_live/invalid"
 mkdir -p "$credential_invalid/secrets"

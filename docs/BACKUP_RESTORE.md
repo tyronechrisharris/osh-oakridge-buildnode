@@ -363,7 +363,9 @@ The restore workflow:
 6. stops the gateway, waits for OSCAR's bounded writer/module drain to finish while PostgreSQL is
    still available, and only then stops PostgreSQL;
 7. replaces the named PostgreSQL volume contents with the base backup;
-8. replaces OSCAR application state and the configured archive tree;
+8. replaces OSCAR application state and the configured archive tree while preserving the existing
+   Docker volume and bind-mount root metadata (archive member metadata is still applied below each
+   root);
 9. preserves and revalidates the target host's archive/WAL root identities rather than extracting,
    trusting, or chowning a marker from the source backup;
 10. installs the already validated credential set from same-filesystem staging;
