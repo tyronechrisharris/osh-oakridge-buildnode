@@ -38,6 +38,7 @@ All notable changes to this project will be documented in this file.
 - Preserve 64-bit Admin configuration values with type-correct Long, Integer, Short, and range converters, including the 2 GiB archive-generation limit, instead of narrowing every whole number through a 32-bit converter
 - Bound Viewer health snapshots to ten stream IDs per request with two global workers and a ten-second per-batch deadline, preventing large accumulated databases from leaving every RPM and camera indicator stuck at `Waiting`
 - Persist the successfully uploaded lane-CSV bucket key in the OSCAR Service configuration, so Apply Changes plus the global Save action recreates live Lane, RPM, and camera modules after a supported restart instead of leaving only historical system records in PostgreSQL
+- Serialize the legacy ERNIE VM250 XML-schema initialization across Rapiscan lanes, preventing 50-lane Windows restarts from racing the process-global registry and leaving apparently Started RPM modules with an unusable analyzer
 
 ### Media retention
 - Serialize recording commands in a bounded per-camera FIFO and use generation-qualified filenames so reconnects and back-to-back occupancies cannot finalize or reuse another recording's clip
