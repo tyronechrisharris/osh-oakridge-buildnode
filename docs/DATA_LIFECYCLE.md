@@ -331,15 +331,16 @@ ledger fields, one successful attempt, and no failure record. Release qualificat
 disposable test deployment to zero retention days and a one-minute query period; shipped production
 defaults remain seven days and must not be accelerated merely to make a test complete sooner.
 
-The retained-media worker captures this profile when OSCAR starts. After saving an accelerated
-profile in SensorHub Admin, perform a supported OSCAR restart before creating the qualification
-alarms, then verify the startup log and scan checkpoint use the new eligible-through cutoff. Saving
-the form alone does not reconfigure an already running worker. A checkpoint created under the
-seven-day profile deliberately resumes from its durable cursor instead of jumping over unexamined
-history. On a disposable, newly initialized test site with no recordings or retained-media jobs,
-the qualification harness may stop OSCAR, remove only the fresh retained-media scan/checkpoint
-files, and restart to establish a current zero-day cursor. Never delete or fast-forward those files
-on a production system; allow bounded oldest-first catch-up or use a reviewed migration procedure.
+The retained-media worker captures this profile when OSCAR starts. On a newly initialized
+qualification site, save the accelerated profile and perform a supported OSCAR restart **before**
+importing lanes or permitting emulator traffic. Verify the startup log and scan checkpoint use the
+new eligible-through cutoff, then provision the lanes and perform the fixture's supported restart.
+Saving the form alone does not reconfigure an already running worker. A checkpoint created under
+the seven-day profile deliberately resumes from its durable cursor instead of jumping over
+unexamined history. Never delete or fast-forward a scan or reconciliation checkpoint to accelerate
+a test. If a disposable site was initialized in the wrong order, recreate its disposable database
+and state, or allow bounded oldest-first catch-up. Production requires catch-up or a reviewed
+migration procedure.
 
 ### Viewer behavior
 

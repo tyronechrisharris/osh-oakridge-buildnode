@@ -611,10 +611,11 @@ The retained-media worker loads its retention interval and query cadence at OSCA
 administrator changes those values, use the supported `oscar restart` command and confirm the next
 startup reports the expected eligible-through cutoff before relying on the new policy. Durable scan
 checkpoints are intentionally monotonic and are not reset by a configuration edit. Do not delete or
-edit them on a production system. For release qualification only, a completely fresh disposable
-site with no recordings or retained-media jobs may be stopped, have only its newly created
-retained-media scan/checkpoint files removed by the test harness, and be restarted after the
-accelerated profile is saved.
+edit or fast-forward them. For release qualification, save the accelerated profile on a newly
+initialized disposable site and perform the supported restart before importing lanes or permitting
+emulator traffic. Verify the current checkpoint first, then provision the lane fixture. If that
+order was not followed, recreate the disposable database and application state or allow normal
+oldest-first catch-up; checkpoint deletion is not an accepted shortcut.
 
 For an event older than the configured seven-day retention age:
 
