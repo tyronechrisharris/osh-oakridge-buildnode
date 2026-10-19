@@ -233,6 +233,12 @@ distinct decoded frame ordinals. Each output is an opaque baseline sRGB JPEG; de
 85. Frames are written, forced, decoded and verified independently, then a typed manifest is
 published as the set's commit marker.
 
+The manifest lane identity is always the containing OSH lane-system UID
+(`urn:osh:system:lane:*`), not the child RPM UID that owns the occupancy datastream. Resolution
+walks the standard OSH system-parent relationship supplied by the active datastore and fails closed
+if no authoritative lane is available; OSCAR does not publish an `unknown-lane` or child-system
+substitute.
+
 New OSCAR camera recordings are published only after at least five video packets have been muxed.
 If an alarm ends sooner, the recorder collects a bounded post-roll before closing its hidden
 partial. This preserves the distinct-frame evidence contract without lengthening the occupancy.
@@ -280,6 +286,9 @@ minutes of new work by default; media extraction decodes one source twice to mak
 independently decodable JPEGs. Provision spare capacity and measure the site under
 its real lane/camera rate before enabling hot-row deletion. See
 [Storage operations](STORAGE_OPERATIONS.md#capacity-and-performance-monitoring).
+The media scanner opens its PostgreSQL reads inside a worker-scoped cancellation boundary and
+checks interruption between bounded maintenance entries. A supported stop therefore cancels only
+that scanner's statements and waits for its thread to finish before PostgreSQL is stopped.
 
 ## Security and privacy
 

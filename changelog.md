@@ -27,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - Serialize archive activation/sealing against ingestion, updates, removals, overlays, tombstones, and exact hot-row deletion with transaction-scoped store and ordered observation locks, while keeping file export outside the critical section
 - Merge PostgreSQL and catalog-authorized Parquet reads behind the OSH observation-store contract, preferring hot overlap and applying archived overlays and tombstones without rewriting immutable files
 - Push mutation-free explicit-stream `resultTime=latest` queries into indexed PostgreSQL lateral probes and DuckDB latest-per-stream reduction before merging the two tiers, so health refreshes read at most one hot and one cold candidate per stream instead of paging the complete hot history
+- Implement PostgreSQL feature-parent lookup through the standard OSH datastore contract, so lane-scoped retention and purge code resolves the authoritative lane system instead of silently falling back to a child RPM identity
 - Preserve open and closed temporal bounds through archive candidate pruning and DuckDB pushdown so cold selection, count, limit, and filtered removal match hot PostgreSQL semantics
 - Add exact hot/cold row-digest parity receipts, a configurable rollback grace, bounded exact-ID hot deletion, generation/observation holds, and deferred sealing while held rows remain
 - Add versioned archive jobs, generations, objects, ID blocks, schemas, locators, overlays, tombstones, holds, verifications, deletion plans/ledger, media records, and backup epochs
@@ -47,6 +48,8 @@ All notable changes to this project will be documented in this file.
 - Give short saved alarm recordings a bounded post-roll until at least five video packets have been muxed, so one-second occupancies remain eligible for five-frame retention
 - Encode each retained asset as an independently decodable opaque baseline sRGB JPEG with configurable quality (85 by default), SHA-256, dimensions, decoded ordinal, source PTS, and lifecycle metadata
 - Publish frames before a versioned manifest commit marker, use a durable identity-keyed job ledger for idempotent retry, and preserve the source MP4 on every failure or fewer-than-five-frame result
+- Fail closed unless retained media can resolve the authoritative `urn:osh:system:lane:*` parent, preventing a camera set from being committed under an RPM UID
+- Bind each retention scan to a cancellable PostgreSQL operation and honor interruption between bounded maintenance items, allowing the supported OSCAR-before-PostgreSQL restart sequence to drain a historical backlog without leaving a database query running
 - Preserve a successfully converted source for a configurable 24-hour rollback grace and delete it only on a later verified, unheld lifecycle pass
 - Add an authenticated read-only event media API and Viewer five-frame gallery, with `404` fallback to unchanged legacy video playback
 - Enforce streaming catalog/asset transfer limits plus bounded retained-media camera, frame-byte, dimension, decoded-pixel, and event-wide budgets in the Viewer; fetch only each camera's selected frame and limit event-wide frame-request concurrency

@@ -614,6 +614,8 @@ For an event older than the configured seven-day retention age:
   permission;
 - the manifest should report five distinct `sourceFrameOrdinal` values and the positions `FIRST`,
   `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`;
+- every manifest `laneUid` should be the event's authoritative `urn:osh:system:lane:*` parent, never
+  an RPM/sensor UID or `unknown-lane`;
 - the source MP4 should remain during the 24-hour rollback grace; and
 - after grace and a later successful retention pass, the manifest should report source state
   `DELETED` while the five frames remain viewable.
@@ -754,12 +756,13 @@ Track at least:
 | Cataloged archive object missing/hash mismatch, ID block mismatch, or missing generation schema rows | Reader/verify/purge fails | Stop destructive work, preserve evidence, restore the coordinated database and exact archive objects from the same backup epoch, then verify again |
 | Unregistered/`DELETED` archive file or stale `.partial` | Archive status/verify fails without changing the file | Correlate UUID/path with export jobs and logs; reconcile under an approved recovery procedure, never delete merely to clear the check |
 | Source video has fewer than five decodable frames | No retained manifest; MP4 preserved | Correct camera/recording health; keep source under legacy playback and investigate |
+| Retained-media lane parent cannot be resolved | No new manifest; source and retry state remain | Verify the RPM/camera systems are members of the intended OSH lane and that the deployed PostgreSQL datastore supports `getParent`; do not relabel an existing manifest by hand |
 | Media publication fails | Partial set stays invisible; source preserved; retry ledger records failure | Check FFmpeg, source integrity, filesystem/rename/space; allow idempotent retry |
 | Pressure cleanup cannot reach target | Protected data stays; error is logged | Add capacity or perform approved cold/media retention; never remove journal/adjudication files ad hoc |
 | WAL archive path full/unwritable | PostgreSQL retries archiving and local `pg_wal` can grow | Restore archive path immediately, verify PostgreSQL logs and backup chain; use verified-backup pruning rather than deleting WAL blindly |
 | Backup fails | `.partial` or finalized-but-unverified directory remains; services are resumed where possible | Check `status`, preserve diagnostics, correct the cause, then re-verify or run a new backup |
 | Restore fails | Deployment may remain stopped/partial | Keep producers disconnected; preserve `pre-restore-*`; repair cause and repeat from the same verified backup or escalate |
-| PostgreSQL shutdown errors appear during OSCAR stop/restart | Qualification fails; OSCAR may not complete its database-backed module drain | Use the release `oscar` launcher, which stops gateway, OSCAR, and PostgreSQL sequentially; preserve logs and do not substitute an unscoped multi-service Compose stop/restart |
+| PostgreSQL shutdown errors appear during OSCAR stop/restart | Qualification fails; OSCAR may not complete its database-backed module drain | Use the release `oscar` launcher, which stops gateway, OSCAR, and PostgreSQL sequentially; confirm the media-retention cancellation log completes, preserve logs, and do not substitute an unscoped multi-service Compose stop/restart |
 
 ## Monthly storage audit
 
