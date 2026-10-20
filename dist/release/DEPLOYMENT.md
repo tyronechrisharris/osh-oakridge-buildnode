@@ -67,7 +67,7 @@ Initialization defaults to `-Prerequisites auto`, which uses a working existing 
 
 ## Initial setup options
 
-The defaults are hostname `oscar.local`, HTTPS port `443`, and a self-signed certificate. Setup asks for an administrator password of at least 14 characters, generates unique database credentials, validates TLS, and starts the deployment.
+The defaults are hostname `oscar.local`, HTTPS port `443`, and a self-signed certificate. Setup asks for an administrator password of at least 14 characters, generates unique database credentials, validates TLS, and starts the deployment. For a new self-signed installation, setup automatically adds active non-container LAN IPv4 addresses, active Tailscale IPv4/IPv6 addresses, and the connected Tailscale MagicDNS name (when discoverable) to the certificate. It prints every covered client URL when initialization completes. Ordinary SLAAC privacy IPv6 addresses are intentionally excluded because they rotate before the certificate expires; add a site-stable IPv6 address explicitly when required.
 
 With the default HTTPS port, entering the configured hostname without a scheme is supported: the gateway redirects the browser from HTTP to HTTPS while preserving the requested path. Deployments using a nonstandard HTTPS port must include that port in the URL printed by setup.
 
@@ -79,6 +79,13 @@ Windows example with an imported certificate:
     -PrivateKeyPath C:\certs\server.key
 ```
 
+Windows self-signed LAN/Tailscale example with additional stable names:
+
+```powershell
+.\oscar.bat init -Hostname oscar-site.example.org -Port 443 `
+    -TlsSan 192.168.0.61,oscar-site.example-tailnet.ts.net
+```
+
 Ubuntu equivalent:
 
 ```sh
@@ -87,11 +94,55 @@ sudo bash oscar.sh init --hostname oscar.example.org --port 443 \
     --private-key /secure/server.key
 ```
 
+Ubuntu self-signed LAN/Tailscale example with additional stable names:
+
+```sh
+sudo bash oscar.sh init --hostname oscar-site.example.org --port 443 \
+    --tls-san 192.168.0.57 \
+    --tls-san oscar-site.example-tailnet.ts.net
+```
+
+`--tls-san` is repeatable on Ubuntu. `-TlsSan` accepts a comma-separated list on Windows. Automatic
+network SAN discovery is enabled only for newly generated self-signed certificates. Use
+`--no-auto-network-sans` or `-NoAutoNetworkSans` when a deliberately hostname-only certificate is
+required. Container bridge, Docker, WSL, loopback, and link-local addresses are excluded. If
+Tailscale is enabled after initialization, replace the certificate through the controlled
+certificate-renewal process or initialize with the expected stable Tailscale IP/MagicDNS name
+explicitly; do not edit a certificate in place.
+
 By default, setup maps the hostname only on the OSCAR host. Use `-SkipHostsEntry` or `--skip-hosts-entry` to leave local host resolution unchanged. Site DNS or a hosts entry is still required on every workstation that connects to OSCAR.
 
 `server.crt` must be a PEM certificate or chain. `server.key` must be its matching unencrypted PEM private key. The certificate subject alternative names must contain every DNS name or IP address used to reach OSCAR.
 
 For an isolated deployment, administrators may use a deployment-specific certificate authority and install only its public certificate on workstations. Never place the certificate-authority private key in this release directory, a container, or a diagnostic bundle.
+
+### LAN and Tailscale client trust
+
+The generated `tls/server.crt` is public and may be copied to operator workstations. Verify its
+SHA-256 fingerprint against the value obtained directly from the OSCAR host before trusting it.
+Never copy `tls/server.key`. Installing the public certificate trusts only this deployment's
+self-signed identity; it does not make an unlisted hostname or IP valid.
+
+- Windows client, from an elevated PowerShell window:
+  `certutil -addstore -f Root .\server.crt`
+- Ubuntu client: copy it to `/usr/local/share/ca-certificates/oscar-site.crt`, then run
+  `sudo update-ca-certificates`. A browser configured with a separate certificate store must also
+  import the public certificate there.
+- macOS client: use Keychain Access to add `server.crt` to the System keychain and mark it trusted,
+  after verifying the fingerprint.
+
+For ordinary LAN operation, create a site DNS record pointing the configured hostname at the
+OSCAR host's static address. A per-workstation hosts entry is an acceptable isolated-test fallback,
+but it does not scale and must map the same hostname that appears in the certificate. Direct access
+such as `https://192.168.0.57/` requires that exact IP SAN; accepting a warning for a certificate
+issued only to `oscar.local` is not a supported substitute.
+
+For Tailscale access, prefer the stable MagicDNS name and include it explicitly when it is not
+discoverable during setup. Direct Tailscale-IP access is supported when the printed certificate
+URL contains that IP. Tailscale connectivity does not distribute OSCAR's certificate trust: each
+client must still trust `server.crt`, or the deployment must import a certificate already trusted
+by those clients. Restrict Tailscale ACLs separately so only authorized operators can reach the
+OSCAR HTTPS port.
 
 ## Windows offline installation
 

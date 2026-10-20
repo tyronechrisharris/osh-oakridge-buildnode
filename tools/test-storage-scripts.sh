@@ -53,6 +53,65 @@ sh -n "$archive_validator"
 sh -n "$archive_object_helper"
 sh -n "$oscar_entrypoint"
 
+# Generated TLS must cover the configured name plus every explicit LAN or
+# Tailscale address, deduplicate repeated entries, and label IP/DNS SANs
+# correctly. Keep this test independent of host network discovery.
+tls_san_result=$(bash -c '
+    setup_script=$1
+    set -- help
+    source "$setup_script" >/dev/null
+    tls_mode=self-signed
+    auto_network_sans=false
+    tls_sans=(192.168.0.57 node.example-tailnet.ts.net 192.168.0.57)
+    resolve_tls_sans oscar.local
+    printf "%s\n%s\n" "${resolved_tls_sans[*]}" "$(tls_san_extension)"
+' _ "$setup_shell_script")
+expected_tls_san_result=$'oscar.local 192.168.0.57 node.example-tailnet.ts.net\nDNS:oscar.local,IP:192.168.0.57,DNS:node.example-tailnet.ts.net'
+[[ $tls_san_result == "$expected_tls_san_result" ]] || {
+    printf 'Bash TLS SAN resolution did not preserve the LAN/Tailscale certificate contract.\n' >&2
+    exit 1
+}
+auto_tls_san_result=$(bash -c '
+    setup_script=$1
+    set -- help
+    source "$setup_script" >/dev/null
+    ip() {
+        printf "%s\n" \
+            "4: tailscale0 inet 100.86.149.49/32 scope global tailscale0" \
+            "4: tailscale0 inet6 fd7a:115c:a1e0::f139:9532/128 scope global" \
+            "5: docker0 inet 172.17.0.1/16 scope global docker0" \
+            "28: eno1 inet 192.168.0.57/24 scope global eno1" \
+            "28: eno1 inet6 fd5b:ad6:c937:50f1::1234/64 scope global temporary dynamic"
+    }
+    tailscale() { printf "%s\n" "{\"Self\":{\"DNSName\":\"node.example-tailnet.ts.net.\"}}"; }
+    tls_mode=self-signed
+    auto_network_sans=true
+    tls_sans=()
+    resolve_tls_sans oscar.local
+    printf "%s" "${resolved_tls_sans[*]}"
+' _ "$setup_shell_script")
+[[ $auto_tls_san_result == 'oscar.local 100.86.149.49 fd7a:115c:a1e0::f139:9532 192.168.0.57 node.example-tailnet.ts.net' ]] || {
+    printf 'Bash automatic TLS SAN discovery included a container/temporary address or missed LAN/Tailscale identity.\n' >&2
+    exit 1
+}
+if bash -c '
+    setup_script=$1
+    set -- help
+    source "$setup_script" >/dev/null
+    tls_mode=self-signed
+    auto_network_sans=false
+    tls_sans=("invalid SAN")
+    resolve_tls_sans oscar.local
+' _ "$setup_shell_script" >/dev/null 2>&1; then
+    printf 'Bash TLS SAN resolution accepted an invalid name.\n' >&2
+    exit 1
+fi
+assert_contains 'ip -o address show up scope global' "$setup_shell_script"
+assert_contains 'lo\|docker\*\|br-\*\|veth\*\|virbr\*\|cni\*\|podman\*' "$setup_shell_script"
+assert_contains 'address == \*:\* && \$interface != tailscale\*' "$setup_shell_script"
+assert_contains 'tailscale status --json' "$setup_shell_script"
+assert_contains 'Copy only server\.crt to clients; never copy tls/server\.key' "$setup_shell_script"
+
 # Docker Compose does not serialize a multi-service stop. Exercise the real
 # storage helper with a mocked Compose boundary, and require the setup helper
 # source to express the same gateway -> application -> database contract.
@@ -304,7 +363,7 @@ assert_contains 'case \$output in \*" does match certificate"\)' "$setup_shell_s
 assert_contains '\$nameOutput = Get-DockerOutput @\(' "$setup_powershell_script"
 assert_contains "'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges'.*'--user', '0:0', '--entrypoint', 'openssl'.*tlsDirectory.*:/tls:ro" "$setup_powershell_script"
 assert_contains "'x509', '-in', '/tls/server\.crt', '-noout'" "$setup_powershell_script"
-assert_contains '\$nameCheck, \$Name\)' "$setup_powershell_script"
+assert_contains '\$nameCheck, \$sanName\)' "$setup_powershell_script"
 assert_contains 'if \(\$nameOutput -cne \$expectedNameOutput\)' "$setup_powershell_script"
 assert_not_contains '\$nameCommand' "$setup_powershell_script"
 assert_contains "Get-ComposeShellInputOutput \\\$markerCheck @\\('exec', '-T', 'postgres', 'sh', '-seu', \\\$expectedVersion\\)" "$setup_powershell_script"
@@ -1779,14 +1838,14 @@ awk '
         if (index(previous "\n" $0, "--workdir /") == 0) missing++
     }
     { previous=$0 }
-    END { exit !(root_helpers == 15 && missing == 0) }
+    END { exit !(root_helpers == 16 && missing == 0) }
 ' "$shell_script" "$setup_shell_script" || {
     printf 'Bash root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
 windows_root_helper_count=$(grep -hE -- "'--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
 windows_neutral_root_helper_count=$(grep -hE -- "'--workdir', '/', '--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
-[[ $windows_root_helper_count == 16 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
+[[ $windows_root_helper_count == 17 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
     printf 'PowerShell root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }

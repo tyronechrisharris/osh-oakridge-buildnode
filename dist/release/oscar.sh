@@ -88,6 +88,7 @@ OSCAR Administration
 Enter a command and any options. Examples:
   init
   init --hostname oscar.local --port 443
+  init --hostname oscar.local --tls-san oscar-site.example.org
   start
   stop
   restart

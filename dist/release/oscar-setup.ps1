@@ -11,6 +11,8 @@ param(
     [string]$TlsMode = 'self-signed',
     [string]$CertificatePath,
     [string]$PrivateKeyPath,
+    [string[]]$TlsSan = @(),
+    [switch]$NoAutoNetworkSans,
     [switch]$AddHostsEntry,
     [switch]$SkipHostsEntry,
     [switch]$NonInteractive,
@@ -291,6 +293,84 @@ function Test-ValidHostname([string]$Value) {
     $parsedIp = $null
     if ([Net.IPAddress]::TryParse($Value, [ref]$parsedIp)) { return $true }
     return $Value -match '^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+}
+
+function Get-TlsSubjectAlternativeNames([string]$PrimaryName) {
+    $names = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $addName = {
+        param([string]$Candidate)
+        $Candidate = $Candidate.Trim().TrimEnd('.')
+        if (-not (Test-ValidHostname $Candidate)) { throw "Invalid TLS subject alternative name: $Candidate" }
+        if ($seen.Add($Candidate)) { $names.Add($Candidate) }
+    }
+
+    & $addName $PrimaryName
+    foreach ($entry in @($TlsSan)) {
+        foreach ($candidate in @($entry -split ',')) {
+            if ($candidate.Trim()) { & $addName $candidate }
+        }
+    }
+
+    if ($TlsMode -eq 'self-signed' -and -not $NoAutoNetworkSans) {
+        $getNetIpAddress = Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue
+        if ($getNetIpAddress) {
+            foreach ($item in @(Get-NetIPAddress -ErrorAction SilentlyContinue | Where-Object {
+                $_.AddressState -eq 'Preferred' -and
+                $_.InterfaceAlias -notmatch '^(Loopback|vEthernet|Docker|WSL|Default Switch|Teredo|isatap)' })) {
+                $parsed = $null
+                if (-not [Net.IPAddress]::TryParse($item.IPAddress, [ref]$parsed)) { continue }
+                if ([Net.IPAddress]::IsLoopback($parsed) -or $parsed.IsIPv6LinkLocal -or $parsed.IsIPv6Multicast) { continue }
+                # Ordinary SLAAC privacy addresses rotate far sooner than the
+                # certificate. Tailscale node IPv6 is stable; other site-stable
+                # IPv6 addresses can be supplied explicitly with -TlsSan.
+                if ($parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and
+                    $item.InterfaceAlias -notmatch '^Tailscale') { continue }
+                if ($parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+                    ($item.IPAddress -eq '0.0.0.0' -or $item.IPAddress.StartsWith('169.254.'))) { continue }
+                & $addName $item.IPAddress
+            }
+        }
+
+        $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+        if (-not $tailscale) { $tailscale = Get-Command tailscale -ErrorAction SilentlyContinue }
+        if ($tailscale) {
+            try {
+                $status = ((& $tailscale.Source status --json 2>$null) -join "`n") | ConvertFrom-Json
+                if ($status.Self.DNSName) { & $addName ([string]$status.Self.DNSName) }
+            } catch {
+                Write-Verbose "Tailscale MagicDNS discovery was unavailable: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return @($names)
+}
+
+function Get-TlsSanExtension([string[]]$Names) {
+    $entries = foreach ($name in $Names) {
+        $parsed = $null
+        if ([Net.IPAddress]::TryParse($name, [ref]$parsed)) { "IP:$name" } else { "DNS:$name" }
+    }
+    return [string]::Join(',', $entries)
+}
+
+function Format-TlsUrlHost([string]$Name) {
+    $parsed = $null
+    if ([Net.IPAddress]::TryParse($Name, [ref]$parsed) -and
+        $parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) { return "[$Name]" }
+    return $Name
+}
+
+function Write-ClientAccessInstructions([string[]]$Names) {
+    Write-Host "`nOSCAR client URLs covered by this certificate:"
+    foreach ($name in $Names) { Write-Host "  https://$(Format-TlsUrlHost $name):$Port/" }
+    Write-Host "LAN/Tailscale clients must trust the public certificate: $(Join-Path $ScriptRoot 'tls\server.crt')"
+    $fingerprint = Get-DockerOutput @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "$(Join-Path $ScriptRoot 'tls'):/tls:ro", (Get-OscarImage),
+        'x509', '-in', '/tls/server.crt', '-noout', '-fingerprint', '-sha256')
+    Write-Host "Verify before trusting: $fingerprint"
+    Write-Host 'Copy only server.crt to clients; never copy tls\server.key.'
+    Write-Host 'DNS names must resolve to this host on each client. Direct IP URLs require that IP in the list above.'
 }
 
 function Set-EnvValue([string]$Name, [string]$Value) {
@@ -805,7 +885,7 @@ function Prepare-DeploymentImages {
     if ($missingImages.Count -gt 0) { throw "Required container images are unavailable: $($missingImages -join ', ')" }
 }
 
-function Initialize-Tls([string]$Name) {
+function Initialize-Tls([string]$Name, [string[]]$Names) {
     $tlsDirectory = Join-Path $ScriptRoot 'tls'
     $certificate = Join-Path $tlsDirectory 'server.crt'
     $privateKey = Join-Path $tlsDirectory 'server.key'
@@ -823,10 +903,9 @@ function Initialize-Tls([string]$Name) {
             Copy-Item -LiteralPath $sourceKey -Destination $privateKey
         } else {
             $parsedIp = $null
-            $sanType = if ([Net.IPAddress]::TryParse($Name, [ref]$parsedIp)) { 'IP' } else { 'DNS' }
             $image = Get-OscarImage
             Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/out", $image,
-                'req', '-x509', '-newkey', 'rsa:3072', '-sha256', '-nodes', '-days', '365', '-subj', "/CN=$Name", '-addext', "subjectAltName=${sanType}:$Name", '-keyout', '/out/server.key', '-out', '/out/server.crt')
+                'req', '-x509', '-newkey', 'rsa:3072', '-sha256', '-nodes', '-days', '365', '-subj', "/CN=$Name", '-addext', "subjectAltName=$(Get-TlsSanExtension $Names)", '-keyout', '/out/server.key', '-out', '/out/server.crt')
         }
     }
 
@@ -840,15 +919,16 @@ function Initialize-Tls([string]$Name) {
         '0444', '/tls/server.crt', '/tls/server.key')
     $keyPairCheck = 'openssl x509 -in /tls/server.crt -pubkey -noout >/tmp/cert.pub && openssl pkey -in /tls/server.key -pubout >/tmp/key.pub && cmp -s /tmp/cert.pub /tmp/key.pub'
     [void](Get-DockerShellInputOutput $keyPairCheck @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${tlsDirectory}:/tls:ro", $image, '-seu'))
-    $parsedIp = $null
-    $nameCheck = if ([Net.IPAddress]::TryParse($Name, [ref]$parsedIp)) { '-checkip' } else { '-checkhost' }
-    # openssl x509 -checkhost/-checkip exits zero even when its text reports a
-    # mismatch. Invoke OpenSSL directly so Windows PowerShell 5.1 never has to
-    # preserve nested shell quotes, then require its one exact success line.
-    $nameOutput = Get-DockerOutput @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/tls:ro", $image,
-        'x509', '-in', '/tls/server.crt', '-noout', $nameCheck, $Name)
-    $expectedNameOutput = if ($nameCheck -ceq '-checkip') { "IP $Name does match certificate" } else { "Hostname $Name does match certificate" }
-    if ($nameOutput -cne $expectedNameOutput) { throw "TLS certificate does not match the configured hostname or IP address: $Name" }
+    foreach ($sanName in $Names) {
+        $parsedIp = $null
+        $nameCheck = if ([Net.IPAddress]::TryParse($sanName, [ref]$parsedIp)) { '-checkip' } else { '-checkhost' }
+        # openssl x509 -checkhost/-checkip exits zero even when its text reports
+        # a mismatch. Require its one exact success line for every requested SAN.
+        $nameOutput = Get-DockerOutput @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/tls:ro", $image,
+            'x509', '-in', '/tls/server.crt', '-noout', $nameCheck, $sanName)
+        $expectedNameOutput = if ($nameCheck -ceq '-checkip') { "IP $sanName does match certificate" } else { "Hostname $sanName does match certificate" }
+        if ($nameOutput -cne $expectedNameOutput) { throw "TLS certificate does not match the configured hostname or IP address: $sanName" }
+    }
 }
 
 function Remove-LegacyEmbeddedBackupDirectory {
@@ -1207,6 +1287,7 @@ OSCAR deployment administration
 
   .\oscar.bat init [-Hostname oscar.local] [-Port 443]
       [-TlsMode self-signed|import] [-CertificatePath FILE -PrivateKeyPath FILE]
+      [-TlsSan DNS_OR_IP[,DNS_OR_IP...]] [-NoAutoNetworkSans]
       [-AddHostsEntry] [-SkipHostsEntry] [-SkipStart]
       [-Prerequisites auto|existing|bundled]
   .\oscar.bat check|verify|start|stop|restart|status
@@ -1261,6 +1342,7 @@ try {
                 if (-not $Hostname) { $Hostname = 'oscar.local' }
             }
             if (-not (Test-ValidHostname $Hostname)) { throw "Invalid hostname or IP address: $Hostname" }
+            $resolvedTlsSans = @(Get-TlsSubjectAlternativeNames $Hostname)
             if ($Port -eq 80) { throw 'Port 80 is reserved for the HTTP-to-HTTPS redirect.' }
             New-Item -ItemType Directory -Force -Path (Join-Path $ScriptRoot 'secrets'), (Join-Path $ScriptRoot 'tls') | Out-Null
             Set-EnvValue 'OSCAR_VERSION' (Get-ReleaseVersion)
@@ -1282,7 +1364,7 @@ try {
             Enable-SetupDockerFileAccess
             Prepare-DeploymentImages
             Invoke-StorageCommand 'prepare-directories' $null
-            Initialize-Tls $Hostname
+            Initialize-Tls $Hostname $resolvedTlsSans
             Protect-DeploymentFiles
             if (-not $SkipHostsEntry) { Add-LocalHostsMapping $Hostname }
             Assert-Configured
@@ -1292,6 +1374,7 @@ try {
                 Complete-PendingFreshInit
             }
             Write-Host "`nOSCAR setup complete: https://${Hostname}:$Port/sensorhub/admin" -ForegroundColor Green
+            Write-ClientAccessInstructions $resolvedTlsSans
         }
         'start' {
             Assert-Administrator; Assert-Docker; Assert-Configured

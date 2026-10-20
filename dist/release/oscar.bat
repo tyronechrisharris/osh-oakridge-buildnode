@@ -41,6 +41,7 @@ echo.
 echo Enter a command and any options. Examples:
 echo   init
 echo   init -Hostname oscar.local -Port 443
+echo   init -Hostname oscar.local -TlsSan oscar-site.example.org
 echo   start
 echo   stop
 echo   restart

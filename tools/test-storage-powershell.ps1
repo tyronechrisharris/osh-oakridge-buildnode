@@ -66,6 +66,37 @@ try {
         }
     }
 
+    . $setupScript -Command help -TlsSan @('192.168.0.61,oscar-site.example-tailnet.ts.net', '192.168.0.61') -NoAutoNetworkSans | Out-Null
+    $resolvedTlsSans = @(Get-TlsSubjectAlternativeNames 'oscar.local')
+    Assert-True (($resolvedTlsSans -join '|') -ceq 'oscar.local|192.168.0.61|oscar-site.example-tailnet.ts.net') `
+        'Windows TLS SAN resolution did not deduplicate the configured LAN/Tailscale names.'
+    Assert-True ((Get-TlsSanExtension $resolvedTlsSans) -ceq 'DNS:oscar.local,IP:192.168.0.61,DNS:oscar-site.example-tailnet.ts.net') `
+        'Windows TLS SAN resolution did not classify DNS and IP certificate names correctly.'
+    $invalidTlsSanRejected = $false
+    try {
+        $TlsSan = @('invalid SAN')
+        [void](Get-TlsSubjectAlternativeNames 'oscar.local')
+    } catch { $invalidTlsSanRejected = $true }
+    Assert-True $invalidTlsSanRejected 'Windows TLS SAN resolution accepted an invalid name.'
+
+    $TlsSan = @()
+    $TlsMode = 'self-signed'
+    $NoAutoNetworkSans = $false
+    function Get-NetIPAddress {
+        @(
+            [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='Tailscale'; IPAddress='100.86.149.49' },
+            [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='Tailscale'; IPAddress='fd7a:115c:a1e0::f139:9532' },
+            [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='Ethernet'; IPAddress='192.168.0.61' },
+            [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='Ethernet'; IPAddress='fd5b:ad6:c937:50f1::1234' },
+            [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='vEthernet (WSL)'; IPAddress='172.20.0.1' }
+        )
+    }
+    function tailscale { '{"Self":{"DNSName":"node.example-tailnet.ts.net."}}' }
+    $autoTlsSans = @(Get-TlsSubjectAlternativeNames 'oscar.local')
+    Assert-True (($autoTlsSans -join '|') -ceq 'oscar.local|100.86.149.49|fd7a:115c:a1e0::f139:9532|192.168.0.61|node.example-tailnet.ts.net') `
+        'Windows automatic TLS SAN discovery included a container/temporary address or missed LAN/Tailscale identity.'
+    Remove-Item Function:\Get-NetIPAddress, Function:\tailscale -Force
+
     $physicalRelease = Join-Path $temporaryRoot 'release-physical'
     $aliasRelease = Join-Path $temporaryRoot 'release-junction'
     New-Item -ItemType Directory -Path $physicalRelease | Out-Null
@@ -291,9 +322,9 @@ try {
     Assert-True (-not $tlsSource.Contains('$nameCommand') -and
         $tlsSource.Contains('$nameOutput = Get-DockerOutput @(') -and
         $tlsSource.Contains("'--entrypoint', 'openssl'") -and
-        $tlsSource.Contains("'x509', '-in', '/tls/server.crt', '-noout', `$nameCheck, `$Name")) `
+        $tlsSource.Contains("'x509', '-in', '/tls/server.crt', '-noout', `$nameCheck, `$sanName")) `
         'Windows TLS name validation is not a direct, format-stable OpenSSL invocation.'
-    foreach ($expected in @('IP $Name does match certificate', 'Hostname $Name does match certificate')) {
+    foreach ($expected in @('IP $sanName does match certificate', 'Hostname $sanName does match certificate')) {
         Assert-True ($tlsSource.Contains($expected)) "Windows TLS name validation is missing its exact success result: $expected"
     }
     Assert-True ($tlsSource.Contains('if ($nameOutput -cne $expectedNameOutput)')) `

@@ -17,6 +17,10 @@ operations fail closed there.
 ```
 
 5. Enter the deployment hostname and an OSCAR administrator password of at least 14 characters.
+   New self-signed installations automatically include the host's active, non-container LAN IPv4
+   and Tailscale IPv4/IPv6 addresses in the certificate. If clients will use a stable site-DNS or Tailscale
+   MagicDNS name other than the primary hostname, add it with `--tls-san` on Ubuntu or `-TlsSan`
+   on Windows during initialization.
 6. Open the URL printed by setup, normally `https://oscar.local/sensorhub/admin`.
 
 Setup creates deployment-specific database credentials and a separate backup-encryption key,
@@ -168,7 +172,12 @@ also requires the separate one-time `-AdoptLegacyStorageRoots` (Windows) or
 `--adopt-legacy-storage-roots` (Ubuntu) switch. It records audited adoption metadata in each
 root; it must never be used to claim foreign data or silence a mismatched existing marker.
 
-The default deployment uses HTTPS port `443`. Setup maps `oscar.local` on the OSCAR host. Other connecting workstations must resolve the selected hostname through DNS or their own hosts entry, and workstations must trust the selected certificate. See [DEPLOYMENT.md](DEPLOYMENT.md) for certificate import, DNS, log filtering, security verification, and upgrades.
+The default deployment uses HTTPS port `443`. Setup maps `oscar.local` on the OSCAR host and prints
+all LAN/Tailscale URLs covered by a newly generated certificate. Other connecting workstations must
+either use one of the printed IP URLs or resolve a printed hostname through DNS/their own hosts
+entry. Every workstation must trust the public `tls/server.crt` certificate before login; never
+copy `tls/server.key` to a client. See [DEPLOYMENT.md](DEPLOYMENT.md) for certificate trust, DNS,
+Tailscale, log filtering, security verification, and upgrades.
 Entering the hostname without `https://` is supported on the default port; the gateway redirects port 80 to HTTPS.
 
 The release's `documentation` directory contains the current deployment guide, operational-view and

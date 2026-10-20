@@ -18,6 +18,8 @@ port_value=443
 tls_mode='self-signed'
 certificate_path=''
 private_key_path=''
+tls_sans=()
+auto_network_sans=true
 add_hosts=true
 non_interactive=false
 skip_start=false
@@ -34,6 +36,7 @@ OSCAR deployment administration
 
   sudo ./oscar.sh init [--hostname oscar.local] [--port 443]
       [--tls-mode self-signed|import] [--certificate FILE --private-key FILE]
+      [--tls-san DNS_OR_IP]... [--no-auto-network-sans]
       [--add-hosts-entry] [--skip-hosts-entry] [--skip-start]
       [--prerequisites auto|existing|bundled]
   sudo ./oscar.sh check|verify|start|stop|restart|status
@@ -67,6 +70,8 @@ while (($#)); do
         --tls-mode) tls_mode=${2:?missing TLS mode}; shift 2 ;;
         --certificate) certificate_path=${2:?missing certificate path}; shift 2 ;;
         --private-key) private_key_path=${2:?missing private-key path}; shift 2 ;;
+        --tls-san) tls_sans+=("${2:?missing TLS subject alternative name}"); shift 2 ;;
+        --no-auto-network-sans) auto_network_sans=false; shift ;;
         --add-hosts-entry) add_hosts=true; shift ;;
         --skip-hosts-entry) add_hosts=false; shift ;;
         --non-interactive) non_interactive=true; shift ;;
@@ -214,6 +219,85 @@ valid_hostname() {
         ((${#label} >= 1 && ${#label} <= 63)) || return 1
         [[ $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ || $label =~ ^[A-Za-z0-9]$ ]] || return 1
     done
+}
+
+append_unique_tls_san() {
+    local candidate=$1 existing
+    valid_hostname "$candidate" || fail "Invalid TLS subject alternative name: $candidate"
+    for existing in "${resolved_tls_sans[@]:-}"; do
+        [[ $existing == "$candidate" ]] && return
+    done
+    resolved_tls_sans+=("$candidate")
+}
+
+detect_network_tls_sans() {
+    local interface address dns_name
+    if command -v ip >/dev/null 2>&1; then
+        while read -r interface address; do
+            case "$interface" in
+                lo|docker*|br-*|veth*|virbr*|cni*|podman*) continue ;;
+            esac
+            address=${address%%/*}
+            address=${address%%%*}
+            # Ordinary SLAAC privacy addresses rotate far sooner than the
+            # certificate. Include IPv6 automatically only for Tailscale,
+            # whose node address is stable; site-stable IPv6 remains explicit.
+            if [[ $address == *:* && $interface != tailscale* ]]; then continue; fi
+            is_ip_address "$address" && append_unique_tls_san "$address"
+        done < <(ip -o address show up scope global 2>/dev/null | awk '{print $2, $4}')
+    fi
+
+    # Tailscale IPs are normally discovered from tailscale0 above. Include its
+    # stable MagicDNS name as well when the client is installed and connected.
+    if command -v tailscale >/dev/null 2>&1; then
+        dns_name=$(tailscale status --json 2>/dev/null |
+            sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true)
+        dns_name=${dns_name%.}
+        [[ -z $dns_name ]] || append_unique_tls_san "$dns_name"
+    fi
+}
+
+resolve_tls_sans() {
+    local primary_name=$1 explicit
+    local -a requested_sans=()
+    [[ -z ${tls_sans[*]-} ]] || requested_sans=("${tls_sans[@]}")
+    resolved_tls_sans=()
+    append_unique_tls_san "$primary_name"
+    if [[ -n ${requested_sans[*]-} ]]; then
+        for explicit in "${requested_sans[@]}"; do append_unique_tls_san "$explicit"; done
+    fi
+    if [[ $tls_mode == self-signed ]] && $auto_network_sans; then detect_network_tls_sans; fi
+}
+
+tls_san_extension() {
+    local value prefix output=''
+    for value in "${resolved_tls_sans[@]}"; do
+        prefix=DNS
+        is_ip_address "$value" && prefix=IP
+        [[ -z $output ]] || output+=,
+        output+="$prefix:$value"
+    done
+    printf '%s' "$output"
+}
+
+tls_url_host() {
+    local value=$1
+    if [[ $value == *:* ]]; then printf '[%s]' "$value"; else printf '%s' "$value"; fi
+}
+
+print_client_access_instructions() {
+    local value fingerprint
+    printf '\nOSCAR client URLs covered by this certificate:\n'
+    for value in "${resolved_tls_sans[@]}"; do
+        printf '  https://%s:%s/\n' "$(tls_url_host "$value")" "$port_value"
+    done
+    printf 'LAN/Tailscale clients must trust the public certificate: %s\n' "$script_dir/tls/server.crt"
+    fingerprint=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+        --workdir / --user 0:0 --entrypoint openssl --volume "$script_dir/tls:/tls:ro" "$(oscar_image)" \
+        x509 -in /tls/server.crt -noout -fingerprint -sha256)
+    printf 'Verify before trusting: %s\n' "$fingerprint"
+    printf 'Copy only server.crt to clients; never copy tls/server.key.\n'
+    printf 'DNS names must resolve to this host on each client. Direct IP URLs require that IP in the list above.\n'
 }
 
 set_env_value() {
@@ -668,7 +752,7 @@ prepare_deployment_images() {
 # Capability-free uid0 helpers use a neutral workdir rather than inheriting the
 # image-owned, mode-0700 OSCAR state workdir.
 initialize_tls() {
-    local name=$1 tls_dir="$script_dir/tls" cert="$script_dir/tls/server.crt" key="$script_dir/tls/server.key" image san_type
+    local name=$1 tls_dir="$script_dir/tls" cert="$script_dir/tls/server.crt" key="$script_dir/tls/server.key" image san_value name_check output
     if [[ (-e $cert && ! -e $key) || (! -e $cert && -e $key) ]]; then fail 'TLS setup is incomplete. Remove the partial certificate/key pair or provide both files.'; fi
     image=$(oscar_image)
 
@@ -681,12 +765,10 @@ initialize_tls() {
                 cp "$private_key_path" "$key"
                 ;;
             self-signed)
-                san_type=DNS
-                is_ip_address "$name" && san_type=IP
                 docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
                     --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint openssl --volume "${tls_dir}:/out" "$image" \
                     req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 -subj "/CN=$name" \
-                    -addext "subjectAltName=${san_type}:$name" -keyout /out/server.key -out /out/server.crt
+                    -addext "subjectAltName=$(tls_san_extension)" -keyout /out/server.key -out /out/server.crt
                 ;;
             *) fail "Unsupported TLS mode: $tls_mode" ;;
         esac
@@ -699,18 +781,19 @@ initialize_tls() {
         --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint sh --volume "${tls_dir}:/tls:ro" "$image" -c \
         'openssl x509 -in /tls/server.crt -pubkey -noout >/tmp/cert.pub && openssl pkey -in /tls/server.key -pubout >/tmp/key.pub && cmp -s /tmp/cert.pub /tmp/key.pub' \
         || fail 'The TLS certificate and private key are invalid or do not match.'
-    local name_check=-checkhost
-    is_ip_address "$name" && name_check=-checkip
-    # openssl x509 -checkhost/-checkip reports a mismatch in its text but still
-    # exits zero. Inspect the result text explicitly so a wrong certificate
-    # cannot pass setup merely because the OpenSSL command executed.
-    docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint sh --volume "${tls_dir}:/tls:ro" "$image" -eu -c '
-        output=$(openssl x509 -in /tls/server.crt -noout "$1" "$2")
-        printf "%s\n" "$output"
-        case $output in *" does match certificate") ;; *) exit 1 ;; esac
-    ' tls-name-check "$name_check" "$name" \
-        || fail "The TLS certificate is not valid for $name."
+    for san_value in "${resolved_tls_sans[@]}"; do
+        name_check=-checkhost
+        is_ip_address "$san_value" && name_check=-checkip
+        # openssl x509 -checkhost/-checkip reports a mismatch in its text but
+        # still exits zero. Inspect the result text explicitly.
+        docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint sh --volume "${tls_dir}:/tls:ro" "$image" -eu -c '
+            output=$(openssl x509 -in /tls/server.crt -noout "$1" "$2")
+            printf "%s\n" "$output"
+            case $output in *" does match certificate") ;; *) exit 1 ;; esac
+        ' tls-name-check "$name_check" "$san_value" \
+            || fail "The TLS certificate is not valid for $san_value."
+    done
 }
 
 remove_legacy_embedded_backup_directory() {
@@ -884,6 +967,7 @@ case "$command_name" in
             hostname_value=${hostname_value:-oscar.local}
         fi
         valid_hostname "$hostname_value" || fail "Invalid hostname or IP address: $hostname_value"
+        resolve_tls_sans "$hostname_value"
         [[ $port_value =~ ^[0-9]+$ ]] && ((port_value >= 1 && port_value <= 65535)) || fail 'Port must be between 1 and 65535.'
         ((port_value != 80)) || fail 'Port 80 is reserved for the HTTP-to-HTTPS redirect.'
         mkdir -p "$script_dir/secrets" "$script_dir/tls"
@@ -912,6 +996,7 @@ case "$command_name" in
             finalize_pending_fresh_init
         fi
         printf '\nOSCAR setup complete: https://%s:%s/sensorhub/admin\n' "$hostname_value" "$port_value"
+        print_client_access_instructions
         ;;
     start)
         require_admin; require_supported_storage_host; require_docker; configured || fail 'Run init before starting OSCAR.'

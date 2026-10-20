@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 - Require a fresh 3.9.2 database and standard configuration for the current test systems and new production deployments; preserve any required pre-3.9.2 production history through a separately validated migration
 - Ship cold archiving in copy-only mode (`deleteHotAfterArchive=false`); enable hot-row deletion only after mixed-tier parity, archive-integrity checks, a coordinated backup, and an isolated restore drill pass
 - Replace aging-video keyframe reduction with an additive exact-five JPEG retained-media format; keep the legacy occupancy `videoPaths` field and Viewer playback fallback for old/unconverted events
+- Make new self-signed deployments LAN/Tailscale-ready by adding active non-container LAN IPv4, stable Tailscale IPv4/IPv6, and discoverable MagicDNS identity to certificate SANs, accepting explicit additional DNS/IP SANs, validating every requested identity, and printing covered client URLs plus a verifiable public-certificate fingerprint
 
 ### Storage and data lifecycle
 - Add a crash-recoverable, per-lane direct daily-file journal that captures Rapiscan and RS350 input before parsing and Aspect register snapshots before observation publication
