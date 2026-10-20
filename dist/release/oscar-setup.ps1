@@ -295,6 +295,26 @@ function Test-ValidHostname([string]$Value) {
     return $Value -match '^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
 }
 
+function Get-OscarNetworkIpAddresses {
+    if (-not (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue)) { return @() }
+    return @(Get-NetIPAddress -ErrorAction SilentlyContinue)
+}
+
+function Get-OscarTailscaleDnsName {
+    $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+    if (-not $tailscale) { $tailscale = Get-Command tailscale -ErrorAction SilentlyContinue }
+    if (-not $tailscale) { return $null }
+
+    try {
+        $executable = if ($tailscale.Source) { $tailscale.Source } else { $tailscale.Name }
+        $status = ((& $executable status --json 2>$null) -join "`n") | ConvertFrom-Json
+        if ($status.Self.DNSName) { return ([string]$status.Self.DNSName) }
+    } catch {
+        Write-Verbose "Tailscale MagicDNS discovery was unavailable: $($_.Exception.Message)"
+    }
+    return $null
+}
+
 function Get-TlsSubjectAlternativeNames([string]$PrimaryName) {
     $names = New-Object System.Collections.Generic.List[string]
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -313,35 +333,24 @@ function Get-TlsSubjectAlternativeNames([string]$PrimaryName) {
     }
 
     if ($TlsMode -eq 'self-signed' -and -not $NoAutoNetworkSans) {
-        $getNetIpAddress = Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue
-        if ($getNetIpAddress) {
-            foreach ($item in @(Get-NetIPAddress -ErrorAction SilentlyContinue | Where-Object {
+        foreach ($item in @(Get-OscarNetworkIpAddresses | Where-Object {
                 $_.AddressState -eq 'Preferred' -and
                 $_.InterfaceAlias -notmatch '^(Loopback|vEthernet|Docker|WSL|Default Switch|Teredo|isatap)' })) {
-                $parsed = $null
-                if (-not [Net.IPAddress]::TryParse($item.IPAddress, [ref]$parsed)) { continue }
-                if ([Net.IPAddress]::IsLoopback($parsed) -or $parsed.IsIPv6LinkLocal -or $parsed.IsIPv6Multicast) { continue }
-                # Ordinary SLAAC privacy addresses rotate far sooner than the
-                # certificate. Tailscale node IPv6 is stable; other site-stable
-                # IPv6 addresses can be supplied explicitly with -TlsSan.
-                if ($parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and
-                    $item.InterfaceAlias -notmatch '^Tailscale') { continue }
-                if ($parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
-                    ($item.IPAddress -eq '0.0.0.0' -or $item.IPAddress.StartsWith('169.254.'))) { continue }
-                & $addName $item.IPAddress
-            }
+            $parsed = $null
+            if (-not [Net.IPAddress]::TryParse($item.IPAddress, [ref]$parsed)) { continue }
+            if ([Net.IPAddress]::IsLoopback($parsed) -or $parsed.IsIPv6LinkLocal -or $parsed.IsIPv6Multicast) { continue }
+            # Ordinary SLAAC privacy addresses rotate far sooner than the
+            # certificate. Tailscale node IPv6 is stable; other site-stable
+            # IPv6 addresses can be supplied explicitly with -TlsSan.
+            if ($parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and
+                $item.InterfaceAlias -notmatch '^Tailscale') { continue }
+            if ($parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+                ($item.IPAddress -eq '0.0.0.0' -or $item.IPAddress.StartsWith('169.254.'))) { continue }
+            & $addName $item.IPAddress
         }
 
-        $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-        if (-not $tailscale) { $tailscale = Get-Command tailscale -ErrorAction SilentlyContinue }
-        if ($tailscale) {
-            try {
-                $status = ((& $tailscale.Source status --json 2>$null) -join "`n") | ConvertFrom-Json
-                if ($status.Self.DNSName) { & $addName ([string]$status.Self.DNSName) }
-            } catch {
-                Write-Verbose "Tailscale MagicDNS discovery was unavailable: $($_.Exception.Message)"
-            }
-        }
+        $tailscaleDnsName = Get-OscarTailscaleDnsName
+        if ($tailscaleDnsName) { & $addName $tailscaleDnsName }
     }
 
     return @($names)

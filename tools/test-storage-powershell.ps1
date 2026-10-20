@@ -82,7 +82,7 @@ try {
     $TlsSan = @()
     $TlsMode = 'self-signed'
     $NoAutoNetworkSans = $false
-    function Get-NetIPAddress {
+    function Get-OscarNetworkIpAddresses {
         @(
             [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='Tailscale'; IPAddress='100.86.149.49' },
             [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='Tailscale'; IPAddress='fd7a:115c:a1e0::f139:9532' },
@@ -91,11 +91,11 @@ try {
             [pscustomobject]@{ AddressState='Preferred'; InterfaceAlias='vEthernet (WSL)'; IPAddress='172.20.0.1' }
         )
     }
-    function tailscale { '{"Self":{"DNSName":"node.example-tailnet.ts.net."}}' }
+    function Get-OscarTailscaleDnsName { 'node.example-tailnet.ts.net.' }
     $autoTlsSans = @(Get-TlsSubjectAlternativeNames 'oscar.local')
     Assert-True (($autoTlsSans -join '|') -ceq 'oscar.local|100.86.149.49|fd7a:115c:a1e0::f139:9532|192.168.0.61|node.example-tailnet.ts.net') `
         'Windows automatic TLS SAN discovery included a container/temporary address or missed LAN/Tailscale identity.'
-    Remove-Item Function:\Get-NetIPAddress, Function:\tailscale -Force
+    Remove-Item Function:\Get-OscarNetworkIpAddresses, Function:\Get-OscarTailscaleDnsName -Force
 
     $physicalRelease = Join-Path $temporaryRoot 'release-physical'
     $aliasRelease = Join-Path $temporaryRoot 'release-junction'
