@@ -281,13 +281,14 @@ try {
     }
     # UID0 cannot safely inherit the OSCAR image's mode-0700 /var/lib/oscar
     # workdir. Require every root helper in both Windows launchers to select a
-    # neutral cwd explicitly. All are capability-free except the read-only
+    # neutral cwd explicitly. The setup inventory includes the read-only TLS
+    # fingerprint helper; all helpers are capability-free except the read-only
     # backup verifier's single DAC_READ_SEARCH bridge.
     $rootHelperLines = @(
         @($setupSource, $storageSource) |
             ForEach-Object { $_ -split "`r?`n" } |
             Where-Object { $_.Contains("'--user', '0'") -or $_.Contains("'--user', '0:0'") })
-    Assert-True ($rootHelperLines.Count -eq 16) 'Windows root-helper inventory changed unexpectedly.'
+    Assert-True ($rootHelperLines.Count -eq 17) 'Windows root-helper inventory changed unexpectedly.'
     foreach ($rootHelperLine in $rootHelperLines) {
         Assert-True ($rootHelperLine.Contains("'--workdir', '/'") ) `
             'A Windows root helper inherited an image-owned working directory.'
