@@ -291,7 +291,11 @@ print_client_access_instructions() {
     for value in "${resolved_tls_sans[@]}"; do
         printf '  https://%s:%s/\n' "$(tls_url_host "$value")" "$port_value"
     done
-    printf 'LAN/Tailscale clients must trust the public certificate: %s\n' "$script_dir/tls/server.crt"
+    if [[ $tls_mode == self-signed ]]; then
+        printf 'LAN/Tailscale clients must trust the public certificate: %s\n' "$script_dir/tls/server.crt"
+    else
+        printf 'LAN/Tailscale clients must trust the imported certificate issuer chain presented by: %s\n' "$script_dir/tls/server.crt"
+    fi
     fingerprint=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --workdir / --user 0:0 --entrypoint openssl --volume "$script_dir/tls:/tls:ro" "$(oscar_image)" \
         x509 -in /tls/server.crt -noout -fingerprint -sha256)

@@ -365,7 +365,11 @@ function Format-TlsUrlHost([string]$Name) {
 function Write-ClientAccessInstructions([string[]]$Names) {
     Write-Host "`nOSCAR client URLs covered by this certificate:"
     foreach ($name in $Names) { Write-Host "  https://$(Format-TlsUrlHost $name):$Port/" }
-    Write-Host "LAN/Tailscale clients must trust the public certificate: $(Join-Path $ScriptRoot 'tls\server.crt')"
+    if ($TlsMode -eq 'self-signed') {
+        Write-Host "LAN/Tailscale clients must trust the public certificate: $(Join-Path $ScriptRoot 'tls\server.crt')"
+    } else {
+        Write-Host "LAN/Tailscale clients must trust the imported certificate issuer chain presented by: $(Join-Path $ScriptRoot 'tls\server.crt')"
+    }
     $fingerprint = Get-DockerOutput @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "$(Join-Path $ScriptRoot 'tls'):/tls:ro", (Get-OscarImage),
         'x509', '-in', '/tls/server.crt', '-noout', '-fingerprint', '-sha256')
     Write-Host "Verify before trusting: $fingerprint"

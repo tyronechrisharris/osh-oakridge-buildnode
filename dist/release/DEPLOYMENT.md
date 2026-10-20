@@ -118,7 +118,8 @@ For an isolated deployment, administrators may use a deployment-specific certifi
 
 ### LAN and Tailscale client trust
 
-The generated `tls/server.crt` is public and may be copied to operator workstations. Verify its
+The generated self-signed `tls/server.crt` is public and may be copied to operator workstations. An
+imported certificate already chaining to a workstation-trusted issuer needs no additional import. Verify the certificate's
 SHA-256 fingerprint against the value obtained directly from the OSCAR host before trusting it.
 Never copy `tls/server.key`. Installing the public certificate trusts only this deployment's
 self-signed identity; it does not make an unlisted hostname or IP valid.
