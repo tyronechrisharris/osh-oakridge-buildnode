@@ -177,7 +177,7 @@ all LAN/Tailscale URLs covered by a newly generated certificate. Other connectin
 either use one of the printed IP URLs or resolve a printed hostname through DNS/their own hosts
 entry. Every workstation must trust the public `tls/server.crt` certificate before login; never
 copy `tls/server.key` to a client. See [DEPLOYMENT.md](DEPLOYMENT.md) for certificate trust, DNS,
-Tailscale, log filtering, security verification, and upgrades.
+Tailscale, scoped host-firewall access, log filtering, security verification, and upgrades.
 Entering the hostname without `https://` is supported on the default port; the gateway redirects port 80 to HTTPS.
 
 The release's `documentation` directory contains the current deployment guide, operational-view and

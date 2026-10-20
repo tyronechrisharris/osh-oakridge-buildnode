@@ -302,6 +302,7 @@ print_client_access_instructions() {
     printf 'Verify before trusting: %s\n' "$fingerprint"
     printf 'Copy only server.crt to clients; never copy tls/server.key.\n'
     printf 'DNS names must resolve to this host on each client. Direct IP URLs require that IP in the list above.\n'
+    printf 'The gateway listens on host interfaces. Permit inbound TCP %s only from approved LAN/Tailscale clients; permit TCP 80 only when the hostname redirect is required.\n' "$port_value"
 }
 
 set_env_value() {

@@ -384,6 +384,7 @@ function Write-ClientAccessInstructions([string[]]$Names) {
     Write-Host "Verify before trusting: $fingerprint"
     Write-Host 'Copy only server.crt to clients; never copy tls\server.key.'
     Write-Host 'DNS names must resolve to this host on each client. Direct IP URLs require that IP in the list above.'
+    Write-Host "The gateway listens on host interfaces. Permit inbound TCP $Port only from approved LAN/Tailscale clients; permit TCP 80 only when the hostname redirect is required."
 }
 
 function Set-EnvValue([string]$Name, [string]$Value) {

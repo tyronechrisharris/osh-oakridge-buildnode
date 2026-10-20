@@ -138,6 +138,12 @@ but it does not scale and must map the same hostname that appears in the certifi
 such as `https://192.168.0.57/` requires that exact IP SAN; accepting a warning for a certificate
 issued only to `oscar.local` is not a supported substitute.
 
+The gateway publishes the configured HTTPS port on the host interfaces by default. Scope the host
+and upstream firewalls to permit that TCP port from authorized LAN subnets and, when used, the
+Tailscale interface/tailnet only; do not expose it through a WAN port-forward. TCP port 80 is used
+only for the hostname-to-HTTPS redirect and may remain blocked when clients use the printed HTTPS
+URLs directly. On Windows, approve Docker Desktop access only for the intended network profile.
+
 For Tailscale access, prefer the stable MagicDNS name and include it explicitly when it is not
 discoverable during setup. Direct Tailscale-IP access is supported when the printed certificate
 URL contains that IP. Tailscale connectivity does not distribute OSCAR's certificate trust: each
