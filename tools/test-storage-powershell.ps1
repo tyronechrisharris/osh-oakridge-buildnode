@@ -250,13 +250,15 @@ try {
         'Windows connected setup does not preserve the configured PostgreSQL build platform.'
     Assert-True (-not $setupSource.Contains('BUILDX_BAKE_ENTITLEMENTS_FS')) `
         'Windows setup disables Bake filesystem checks instead of using bounded build contexts.'
-    # The storage launcher has 17 bounded shell adapters after retiring both
+    # The storage launcher has 19 bounded shell adapters after retiring both
     # the cumulative WAL-archive tar helper and its prune-intent helper, then
-    # adding the authenticated CURRENT-pointer helper. Keep this exact count so
-    # every future native-shell call still receives an explicit safety review.
+    # adding the authenticated CURRENT-pointer helper plus the locked legacy
+    # cleanup and config-aware journal migration. Setup retains one adapter.
+    # Keep these exact counts so every future native-shell call still receives
+    # an explicit safety review.
     foreach ($astFixture in @(
-        @{ Path = $setupScript; ExpectedShellRuns = 2 },
-        @{ Path = $storageScript; ExpectedShellRuns = 17 })) {
+        @{ Path = $setupScript; ExpectedShellRuns = 1 },
+        @{ Path = $storageScript; ExpectedShellRuns = 19 })) {
         $tokens = $null
         $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($astFixture.Path, [ref]$tokens, [ref]$parseErrors)
@@ -282,9 +284,70 @@ try {
         Assert-True ($shellRuns.Count -eq $astFixture.ExpectedShellRuns) `
             "$($astFixture.Path) entrypoint-sh inventory changed: expected $($astFixture.ExpectedShellRuns), found $($shellRuns.Count)."
         foreach ($shellRun in $shellRuns) {
-            Assert-True ($shellRun.GetCommandName() -cin @('Get-DockerShellInputOutput', 'Invoke-DockerShellInput')) `
+            Assert-True ($shellRun.GetCommandName() -cin @('Get-DockerShellInputOutput', 'Get-ComposeShellInputOutput', 'Invoke-DockerShellInput')) `
                 "$($astFixture.Path) has an entrypoint-sh call outside the bounded stdin adapters: $($shellRun.GetCommandName())"
         }
+    }
+
+    # Exercise native Windows PowerShell array binding for the locked upgrade
+    # transition. The config-aware migration must precede restart, and an
+    # injected migration failure must never reach Compose up.
+    & {
+        $actions = New-Object System.Collections.Generic.List[string]
+        function Get-OscarImage { return 'oscar:test' }
+        function Get-DockerShellInputOutput([string]$InputText, [string[]]$Arguments) {
+            Assert-True ($InputText.Contains('umask 077') -and
+                ([string]::Join('|', $Arguments)).Contains('--entrypoint|sh')) `
+                'Windows upgrade legacy cleanup did not use its restricted shell contract.'
+            [void]$actions.Add('legacy-cleanup')
+            return @()
+        }
+        function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
+            $joined = [string]::Join('|', $Arguments)
+            Assert-True ($InputText.Contains('umask 077') -and
+                $InputText.Contains('--config /var/lib/oscar/config.json') -and
+                $joined.Contains('--entrypoint|sh|oscar|-seu')) `
+                'Windows upgrade migration did not preserve its config-aware restricted shell argv.'
+            [void]$actions.Add('migrate')
+            return @()
+        }
+        function Invoke-Compose([string[]]$Arguments) {
+            $joined = [string]::Join(' ', $Arguments)
+            switch -CaseSensitive ($joined) {
+                'stop gateway' { [void]$actions.Add('stop-gateway'); return }
+                'stop oscar' { [void]$actions.Add('stop-oscar'); return }
+                'config --quiet' { [void]$actions.Add('config'); return }
+                'up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240' {
+                    [void]$actions.Add('start'); return
+                }
+                default { throw "Unexpected Windows upgrade Compose action: $joined" }
+            }
+        }
+        Invoke-UpgradePersistentState | Out-Null
+        Assert-True (($actions -join '|') -ceq 'stop-gateway|stop-oscar|legacy-cleanup|migrate|config|start') `
+            'Windows locked upgrade transition ordering is incorrect.'
+    }
+    & {
+        $actions = New-Object System.Collections.Generic.List[string]
+        function Get-OscarImage { return 'oscar:test' }
+        function Get-DockerShellInputOutput([string]$InputText, [string[]]$Arguments) {
+            [void]$actions.Add('legacy-cleanup'); return @()
+        }
+        function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
+            [void]$actions.Add('migration-failed'); throw 'injected migration failure'
+        }
+        function Invoke-Compose([string[]]$Arguments) {
+            $joined = [string]::Join(' ', $Arguments)
+            if ($joined -ceq 'stop gateway') { [void]$actions.Add('stop-gateway'); return }
+            if ($joined -ceq 'stop oscar') { [void]$actions.Add('stop-oscar'); return }
+            if ($joined.StartsWith('up ')) { [void]$actions.Add('UNSAFE-START'); return }
+            throw "Unexpected Windows failure-path Compose action: $joined"
+        }
+        $failed = $false
+        try { Invoke-UpgradePersistentState | Out-Null } catch { $failed = $true }
+        Assert-True $failed 'Windows locked upgrade transition ignored migration failure.'
+        Assert-True (-not $actions.Contains('UNSAFE-START')) `
+            'Windows locked upgrade transition restarted after migration failure.'
     }
     Assert-True ($storageSource.Contains('$writeThroughFlag = [uint32]2147483648')) `
         'The Windows durability barrier does not construct FILE_FLAG_WRITE_THROUGH as an unsigned value.'
@@ -332,7 +395,7 @@ try {
             'Native PowerShell 5.1 did not preserve the least-privilege pg_verifybackup bridge or spaced read-only mount argv.'
     }
     $tlsStart = $setupSource.IndexOf('function Initialize-Tls', [StringComparison]::Ordinal)
-    $tlsEnd = $setupSource.IndexOf('function Remove-LegacyEmbeddedBackupDirectory', $tlsStart, [StringComparison]::Ordinal)
+    $tlsEnd = $setupSource.IndexOf('function Add-LocalHostsMapping', $tlsStart, [StringComparison]::Ordinal)
     Assert-True ($tlsStart -ge 0 -and $tlsEnd -gt $tlsStart) 'Could not isolate Windows TLS initialization.'
     $tlsSource = $setupSource.Substring($tlsStart, $tlsEnd - $tlsStart)
     Assert-True (-not $tlsSource.Contains('$nameCommand') -and

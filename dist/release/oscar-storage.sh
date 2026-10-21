@@ -1543,6 +1543,47 @@ prepare_storage_directories() {
     fi
 }
 
+upgrade_persistent_state() {
+    # Keep the deployment-scoped storage-administration lock for the complete
+    # offline transition. A backup/restore therefore cannot enter after OSCAR
+    # stops but before the lifecycle index is durable and the application has
+    # restarted on the new image.
+    heading 'Preparing persistent OSCAR state for this release'
+    compose stop gateway
+    compose stop oscar
+
+    # Releases before 3.9.2 over-mounted /var/lib/oscar/backups. Remove only an
+    # empty legacy mountpoint; nonempty content always requires an explicit
+    # operator decision and is never silently discarded.
+    docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+        --user 10001:10001 --entrypoint sh --volume oscar_oscar_state:/state "$(oscar_image)" -eu -c '
+        umask 077
+        if [ -e /state/backups ] || [ -L /state/backups ]; then
+            [ -d /state/backups ] && [ ! -L /state/backups ] || {
+                echo "Legacy embedded backup path is not a regular directory." >&2; exit 1;
+            }
+            rmdir -- /state/backups || {
+                echo "Legacy embedded /var/lib/oscar/backups is nonempty. Preserve or export its contents, explicitly empty that non-authoritative volume path, then retry upgrade." >&2
+                exit 1
+            }
+        fi
+    '
+
+    heading 'Migrating daily-file lifecycle index'
+    compose run --rm --no-deps --user 10001:10001 --entrypoint sh oscar -eu -c '
+        umask 077
+        exec java -cp '\''/opt/oscar/lib/*'\'' \
+            com.botts.impl.service.dailyfile.DailyFileJournalIndexMigration \
+            --config /var/lib/oscar/config.json
+    '
+
+    compose config --quiet
+    # All release-local bind sources change when an upgrade is extracted into
+    # a clean directory. Recreate every service without renewing named volumes
+    # so mounts and Compose provenance point at this exact release.
+    compose up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240
+}
+
 confirm_daily_journal_backup() (
     backup_id=$1; root=$2; image=$3; oscar_state_sha=$4
     resume_oscar=false; resume_gateway=false
@@ -2897,6 +2938,7 @@ OSCAR storage administration
   backup
   backup-verify <backup-id>
   restore --backup <backup-id> --confirm <backup-id>
+  upgrade-state                 (internal upgrade workflow)
   archive status
   archive verify
   archive hold list
@@ -2935,6 +2977,11 @@ case $storage_command in
         assert_archive_root_identity
         assert_deployment_volume_ownership
         ;;
+    upgrade-state)
+        validate_archive_directory
+        assert_archive_root_identity
+        assert_deployment_volume_ownership
+        ;;
 esac
 
 case $storage_command in
@@ -2943,6 +2990,7 @@ case $storage_command in
     backup-prune) fail 'backup-prune is retired in single-backup mode; each successful backup atomically replaces CURRENT and then retires the previous snapshot.' ;;
     restore) restore_backup "$@" ;;
     prepare-directories) prepare_storage_directories "$@" ;;
+    upgrade-state) upgrade_persistent_state ;;
     archive)
         archive_subcommand=${1:-status}; (($#)) && shift
         case $archive_subcommand in

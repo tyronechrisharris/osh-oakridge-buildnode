@@ -86,6 +86,16 @@ candidate mutation.
 the tiered database owns gamma/neutron lifecycle. It does not disable connection-status maintenance
 or manifest-gated daily-file compatibility cleanup.
 
+Variable PostgreSQL keyset observation pages are deliberately kept unnamed at statement scope
+(`prepareThreshold=0`). The same query shape is reused for different stream-ID sets and time
+windows; allowing PostgreSQL to promote it to a generic server plan can make a 100-stream
+connection-status cleanup scan the global observation-time index instead of the selective
+stream/time indexes. Per-page planning has a small bounded cost and prevents that sustained CPU/I/O
+regression, while ordinary ingest and stable queries retain server preparation and binary transfer.
+Retention filters use native closed-open temporal ranges without a Java value predicate, so the
+database can apply the requested batch limit; the H2 implementation independently preserves the
+same open/closed endpoint semantics at its inclusive physical cursor.
+
 An upgraded deployment keeps its persisted `/var/lib/oscar/config.json`; the release does not
 silently replace site configuration. Always inspect the running module settings rather than assume
 the file shipped in the ZIP became active.
@@ -189,6 +199,16 @@ rename, force, ownership, and PostgreSQL semantics.
 The complete 3.9.2 storage profile is not an automatic in-place conversion. `oscar upgrade` preserves
 the existing application configuration and database volume, and PostgreSQL data checksums are an
 initial-cluster property.
+
+One narrow compatibility migration is automatic: supported `oscar upgrade` stops the application
+tier and runs the restartable daily-file lifecycle-index migration before startup. The tool reads
+the retained `/var/lib/oscar/config.json`, uses the configured Daily File Journal root/directory/zone,
+and skips safely when that module is absent. It upgrades an earlier 3.9.2 preview journal without
+scanning its historical tree on a live module thread. It does not convert a pre-3.9.2 database or
+configuration into the complete tiered-storage profile. The same deployment-scoped lock excludes
+backup, restore, and archive administration until the new services pass health checks. On failure,
+final metadata stays uncommitted while restart-safe work markers may remain; the application stays
+stopped, so fix the reported condition and rerun `upgrade`.
 
 The 3.9.2 observation schema also installs a corrected natural-key unique index that treats null
 feature, phenomenon-time, and result-time fields as equal. This is important because a null result

@@ -187,6 +187,13 @@ Administrator Guide. Preserve its `.oscar-volume-adoption` receipt with `.env`, 
 upgrades through `oscar.bat` or `oscar.sh`, not a direct `docker compose up`: setup validates the
 exact external named volumes before Compose attaches them and force-recreates every service so no
 container retains a secret/config bind or Compose provenance from the prior extracted release.
+The supported `upgrade` command also stops the application tier and runs the restartable offline
+daily-file lifecycle-index migration from the new image. It reads the retained `config.json`, skips
+when no Daily File Journal module is configured, and creates no new work markers when the journal is
+already indexed. An empty configured journal may receive its metadata. A failure leaves OSCAR
+stopped; restart-safe markers created before the failure are retained so the same upgrade can resume.
+The shared storage lock prevents a backup or restore from racing the stop, migration, or restart.
+Correct the reported storage/permission problem and rerun rather than bypassing the migration.
 The OSCAR container remains `starting` until its HTTP service and all top-level auto-start modules
 are started and every nested lane RPM/camera has completed its startup attempt. Offline devices do
 not prevent access to the Status of Health page; supported setup and storage commands wait only for

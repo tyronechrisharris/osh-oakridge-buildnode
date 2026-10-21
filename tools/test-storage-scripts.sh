@@ -798,9 +798,9 @@ ps_upgrade_case=$(extract_case_body "$setup_powershell_script" "        'upgrade
     printf 'Bash ordinary start must remain non-recreating.\n' >&2
     exit 1
 }
-[[ $(grep -Fxc '        compose up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240' <<<"$bash_upgrade_case") == 1 &&
+[[ $(grep -Fxc '        bash "$script_dir/oscar-storage.sh" upgrade-state' <<<"$bash_upgrade_case") == 1 &&
    $bash_upgrade_case != *--renew-anon-volumes* && $bash_upgrade_case != *'compose down'* ]] || {
-    printf 'Bash upgrade must force-recreate all services without replacing persistent data.\n' >&2
+    printf 'Bash upgrade must delegate its locked persistent-state transition exactly once.\n' >&2
     exit 1
 }
 [[ $(grep -Fxc "            Invoke-Compose @('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')" <<<"$ps_start_case") == 1 &&
@@ -808,11 +808,96 @@ ps_upgrade_case=$(extract_case_body "$setup_powershell_script" "        'upgrade
     printf 'PowerShell ordinary start must remain non-recreating.\n' >&2
     exit 1
 }
-[[ $(grep -Fxc "            Invoke-Compose @('up', '--detach', '--force-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')" <<<"$ps_upgrade_case") == 1 &&
+[[ $(grep -Fxc "            Invoke-StorageCommand 'upgrade-state' \$null" <<<"$ps_upgrade_case") == 1 &&
    $ps_upgrade_case != *--renew-anon-volumes* && $ps_upgrade_case != *"Invoke-Compose @('down'"* ]] || {
-    printf 'PowerShell upgrade must force-recreate all services without replacing persistent data.\n' >&2
+    printf 'PowerShell upgrade must delegate its locked persistent-state transition exactly once.\n' >&2
     exit 1
 }
+bash_upgrade_state_body=$(awk '
+    /^upgrade_persistent_state\(\)/ { capture=1 }
+    /^confirm_daily_journal_backup\(\)/ { capture=0 }
+    capture { print }
+' "$shell_script")
+ps_upgrade_state_body=$(awk '
+    /^function Invoke-UpgradePersistentState/ { capture=1 }
+    /^function Write-Checksums/ { capture=0 }
+    capture { print }
+' "$powershell_script")
+[[ $(grep -Fxc '    compose up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240' <<<"$bash_upgrade_state_body") == 1 &&
+   $bash_upgrade_state_body == *'--config /var/lib/oscar/config.json'* &&
+   $bash_upgrade_state_body == *'umask 077'* &&
+   $bash_upgrade_state_body != *--renew-anon-volumes* && $bash_upgrade_state_body != *'compose down'* ]] || {
+    printf 'Bash locked upgrade workflow must use config-aware migration and recreate services without replacing data.\n' >&2
+    exit 1
+}
+[[ $(grep -Fxc "    Invoke-Compose @('up', '--detach', '--force-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')" <<<"$ps_upgrade_state_body") == 1 &&
+   $ps_upgrade_state_body == *'--config /var/lib/oscar/config.json'* &&
+   $ps_upgrade_state_body == *'umask 077'* &&
+   $ps_upgrade_state_body != *--renew-anon-volumes* && $ps_upgrade_state_body != *"Invoke-Compose @('down'"* ]] || {
+    printf 'PowerShell locked upgrade workflow must use config-aware migration and recreate services without replacing data.\n' >&2
+    exit 1
+}
+assert_contains '^upgrade_persistent_state\(\)' "$shell_script"
+assert_contains '^function Invoke-UpgradePersistentState' "$powershell_script"
+assert_contains 'DailyFileJournalIndexMigration' "$shell_script"
+assert_contains 'DailyFileJournalIndexMigration' "$powershell_script"
+
+# Execute the real Bash transition function across mocked Docker/Compose
+# boundaries. The ordered stop and config-aware migration must precede the
+# restart, and a migration failure must leave the application stopped.
+bash_upgrade_actions="$test_root/bash-upgrade-state.actions"
+OSCAR_STORAGE_TEST_MODE=1 bash -c '
+    storage_script=$1; actions=$2
+    set -- help; source "$storage_script" >/dev/null
+    oscar_image() { printf "%s" oscar:test; }
+    docker() { printf "legacy-cleanup\n" >>"$actions"; }
+    compose() {
+        case "$1 ${2:-}" in
+            "stop gateway") printf "stop-gateway\n" >>"$actions" ;;
+            "stop oscar") printf "stop-oscar\n" >>"$actions" ;;
+            "run --rm")
+                [[ "$*" == *"--entrypoint sh oscar -eu -c"* && "$*" == *"umask 077"* && "$*" == *"--config /var/lib/oscar/config.json"* ]]
+                printf "migrate\n" >>"$actions"
+                ;;
+            "config --quiet") printf "config\n" >>"$actions" ;;
+            "up --detach")
+                [[ "$*" == *"--force-recreate"* && "$*" != *"--renew-anon-volumes"* ]]
+                printf "start\n" >>"$actions"
+                ;;
+            *) return 91 ;;
+        esac
+    }
+    upgrade_persistent_state >/dev/null
+' _ "$shell_script" "$bash_upgrade_actions"
+printf 'stop-gateway\nstop-oscar\nlegacy-cleanup\nmigrate\nconfig\nstart\n' >"$test_root/bash-upgrade-state.expected"
+cmp -s "$test_root/bash-upgrade-state.expected" "$bash_upgrade_actions" || {
+    printf 'Bash locked upgrade transition ordering is incorrect.\n' >&2
+    exit 1
+}
+bash_upgrade_failure_actions="$test_root/bash-upgrade-state-failure.actions"
+if OSCAR_STORAGE_TEST_MODE=1 bash -c '
+    storage_script=$1; actions=$2
+    set -- help; source "$storage_script" >/dev/null
+    oscar_image() { printf "%s" oscar:test; }
+    docker() { printf "legacy-cleanup\n" >>"$actions"; }
+    compose() {
+        case "$1 ${2:-}" in
+            "stop gateway") printf "stop-gateway\n" >>"$actions" ;;
+            "stop oscar") printf "stop-oscar\n" >>"$actions" ;;
+            "run --rm") printf "migration-failed\n" >>"$actions"; return 42 ;;
+            "up --detach") printf "UNSAFE-START\n" >>"$actions" ;;
+            *) return 91 ;;
+        esac
+    }
+    upgrade_persistent_state >/dev/null
+' _ "$shell_script" "$bash_upgrade_failure_actions" >/dev/null 2>&1; then
+    printf 'Bash locked upgrade transition ignored migration failure.\n' >&2
+    exit 1
+fi
+if grep -Fq 'UNSAFE-START' "$bash_upgrade_failure_actions"; then
+    printf 'Bash locked upgrade transition restarted after migration failure.\n' >&2
+    exit 1
+fi
 
 # A connected init/upgrade always rebuilds the local OSCAR/PostGIS images, even
 # when their mutable pre-release tags are cached. Recheck the inventory after
@@ -2937,6 +3022,67 @@ grep -Fxq -- "$helper_wrapper_fixture/archive:/archive:rw" "$helper_wrapper_fixt
 }
 
 if command -v pwsh >/dev/null 2>&1; then
+    STORAGE_SCRIPT_PATH="$powershell_script" pwsh -NoLogo -NoProfile -Command '
+        $ErrorActionPreference = "Stop"
+        . $env:STORAGE_SCRIPT_PATH -Command help *> $null
+        & {
+            $actions = New-Object Collections.Generic.List[string]
+            function Get-OscarImage { return "oscar:test" }
+            function Get-DockerShellInputOutput([string]$InputText, [string[]]$Arguments) {
+                if ($InputText -notmatch "umask 077" -or (($Arguments -join " ") -notmatch "--entrypoint sh")) {
+                    throw "PowerShell legacy cleanup did not use the restricted shell contract"
+                }
+                [void]$actions.Add("legacy-cleanup"); return @()
+            }
+            function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
+                $joined = $Arguments -join " "
+                if ($InputText -notmatch "umask 077" -or $InputText -notmatch "--config /var/lib/oscar/config.json" -or $joined -notmatch "--entrypoint sh oscar -seu") {
+                    throw "PowerShell migration did not use the config-aware restricted shell contract"
+                }
+                [void]$actions.Add("migrate"); return @()
+            }
+            function Invoke-Compose([string[]]$Arguments) {
+                $joined = $Arguments -join " "
+                switch -Regex ($joined) {
+                    "^stop gateway$" { [void]$actions.Add("stop-gateway"); return }
+                    "^stop oscar$" { [void]$actions.Add("stop-oscar"); return }
+                    "^config --quiet$" { [void]$actions.Add("config"); return }
+                    "^up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240$" { [void]$actions.Add("start"); return }
+                    default { throw "Unexpected PowerShell upgrade Compose action: $joined" }
+                }
+            }
+            Invoke-UpgradePersistentState *> $null
+            if (($actions -join ",") -cne "stop-gateway,stop-oscar,legacy-cleanup,migrate,config,start") {
+                throw "PowerShell locked upgrade transition ordering is incorrect: $($actions -join ",")"
+            }
+        }
+        & {
+            $actions = New-Object Collections.Generic.List[string]
+            function Get-OscarImage { return "oscar:test" }
+            function Get-DockerShellInputOutput([string]$InputText, [string[]]$Arguments) {
+                [void]$actions.Add("legacy-cleanup"); return @()
+            }
+            function Get-ComposeShellInputOutput([string]$InputText, [string[]]$Arguments) {
+                [void]$actions.Add("migration-failed"); throw "injected migration failure"
+            }
+            function Invoke-Compose([string[]]$Arguments) {
+                $joined = $Arguments -join " "
+                if ($joined -eq "stop gateway") { [void]$actions.Add("stop-gateway"); return }
+                if ($joined -eq "stop oscar") { [void]$actions.Add("stop-oscar"); return }
+                if ($joined -match "^up ") { [void]$actions.Add("UNSAFE-START"); return }
+                throw "Unexpected PowerShell failure-path Compose action: $joined"
+            }
+            try {
+                Invoke-UpgradePersistentState *> $null
+                throw "PowerShell locked upgrade transition ignored migration failure"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell locked upgrade transition ignored migration failure") { throw }
+            }
+            if ($actions -contains "UNSAFE-START") {
+                throw "PowerShell locked upgrade transition restarted after migration failure"
+            }
+        }
+    '
     STORAGE_SCRIPT_TEST_ROOT="$test_root" STORAGE_SCRIPT_PATH="$powershell_script" \
         pwsh -NoLogo -NoProfile -Command '
             $ErrorActionPreference = "Stop"

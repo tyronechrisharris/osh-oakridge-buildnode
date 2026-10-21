@@ -299,7 +299,15 @@ bindings: deployment identity, exact backup mode, absolute external storage root
 binding. A legacy deployment may also receive a generated backup key plus explicit volume/root
 adoption metadata when the corresponding adoption options are supplied. After those guarded
 normalizations it updates `OSCAR_VERSION`, validates Compose, prepares the versioned images,
-force-recreates all service containers, waits for health checks, and retains the fixed `oscar_state`
+stops the application tier, and runs the new image's restartable offline daily-file lifecycle-index
+migration using the Daily File Journal root, journal directory, and calendar zone from the persisted
+`/var/lib/oscar/config.json`. If that module is absent the narrow migration is skipped. An already
+indexed journal creates no new work markers; an empty configured journal may receive its durable
+metadata. Completion metadata is committed last, so a crash or validation failure may leave only
+idempotent work markers plus an explicit restart marker. OSCAR remains stopped and the same
+`upgrade` command is safe to retry. The deployment-scoped storage lock excludes backup, restore,
+and archive-administration commands from the ordered stop through migration and the force-recreated,
+health-checked restart. The workflow retains the fixed `oscar_state`
 and `postgres_data` volumes plus the exact external archive and preserved legacy/backup roots. Recreating every
 container is required even when an image and service model are unchanged: release-local secret,
 certificate, and gateway-config bind sources and the Compose `working_dir`/`config_files` provenance

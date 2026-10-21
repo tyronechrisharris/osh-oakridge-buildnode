@@ -999,12 +999,6 @@ function Initialize-Tls([string]$Name, [string[]]$Names) {
     }
 }
 
-function Remove-LegacyEmbeddedBackupDirectory {
-    Stop-ApplicationTierOrdered
-    $script = 'if [ -e /state/backups ] || [ -L /state/backups ]; then [ -d /state/backups ] && [ ! -L /state/backups ] || { echo "Legacy embedded backup path is not a regular directory." >&2; exit 1; }; rmdir -- /state/backups || { echo "Legacy embedded /var/lib/oscar/backups is nonempty. Preserve or export its contents, explicitly empty that non-authoritative volume path, then retry upgrade." >&2; exit 1; }; fi'
-    [void](Get-DockerShellInputOutput $script @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', (Get-OscarImage), '-seu'))
-}
-
 function Add-LocalHostsMapping([string]$Name) {
     $parsedIp = $null
     if ([Net.IPAddress]::TryParse($Name, [ref]$parsedIp)) { return }
@@ -1511,14 +1505,10 @@ try {
             Write-Host "Preparing OSCAR $releaseVersion"
             Prepare-DeploymentImages
             Invoke-StorageCommand 'prepare-directories' $null
-            Remove-LegacyEmbeddedBackupDirectory
-            Invoke-Compose @('config', '--quiet')
-            # A clean-directory upgrade changes every release-local
-            # secret/config bind source even if the service model and image ID
-            # are unchanged. Recreate every container so its mounts and
-            # Compose provenance belong to this release. External roots and
-            # named data volumes remain attached and are never removed here.
-            Invoke-Compose @('up', '--detach', '--force-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')
+            # The storage workflow keeps its deployment-scoped lock across the
+            # ordered stop, config-aware journal migration, and force-recreated
+            # restart. Persistent named volumes are retained throughout.
+            Invoke-StorageCommand 'upgrade-state' $null
             Enable-StorageDatabaseFeatures
             Complete-PendingFreshInit
             Write-Host 'Upgrade deployment completed. Persistent OSCAR and PostgreSQL volumes were retained.' -ForegroundColor Green

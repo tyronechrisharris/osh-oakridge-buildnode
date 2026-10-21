@@ -862,27 +862,6 @@ initialize_tls() {
     done
 }
 
-remove_legacy_embedded_backup_directory() {
-    # Releases before 3.9.2 over-mounted /var/lib/oscar/backups. Once that bind
-    # is removed, any stale directory underneath it in oscar_state would become
-    # visible to the long-running application. Remove only an empty legacy
-    # mountpoint while OSCAR is stopped. Nonempty content requires an explicit
-    # operator migration decision and is never discarded by upgrade.
-    stop_application_tier_ordered >/dev/null
-    docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 10001:10001 --entrypoint sh --volume oscar_oscar_state:/state "$(oscar_image)" -eu -c '
-        if [ -e /state/backups ] || [ -L /state/backups ]; then
-            [ -d /state/backups ] && [ ! -L /state/backups ] || {
-                echo "Legacy embedded backup path is not a regular directory." >&2; exit 1;
-            }
-            rmdir -- /state/backups || {
-                echo "Legacy embedded /var/lib/oscar/backups is nonempty. Preserve or export its contents, explicitly empty that non-authoritative volume path, then retry upgrade." >&2
-                exit 1
-            }
-        fi
-    '
-}
-
 add_local_hosts_mapping() {
     local name=$1 hosts_file=/etc/hosts
     is_ip_address "$name" && return
@@ -1155,14 +1134,10 @@ case "$command_name" in
         prepare_storage_args=(prepare-directories)
         $adopt_legacy_storage_roots && prepare_storage_args+=(--adopt-existing)
         bash "$script_dir/oscar-storage.sh" "${prepare_storage_args[@]}"
-        remove_legacy_embedded_backup_directory
-        compose config --quiet
-        # A clean-directory upgrade changes every release-local secret/config
-        # bind source even when the service model and image ID are unchanged.
-        # Recreate all containers so none retains the previous release path in
-        # its mounts or Compose provenance. External data roots and named
-        # volumes remain attached; this command never removes them.
-        compose up --detach --force-recreate --no-build --pull never --wait --wait-timeout 240
+        # The storage command keeps its deployment-scoped lock across the
+        # ordered stop, config-aware journal migration, and force-recreated
+        # restart. Persistent named volumes are retained throughout.
+        bash "$script_dir/oscar-storage.sh" upgrade-state
         ensure_storage_database_features
         finalize_pending_fresh_init
         printf 'Upgrade deployment completed. Persistent OSCAR and PostgreSQL volumes were retained.\n'

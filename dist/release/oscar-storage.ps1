@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('backup', 'backup-verify', 'backup-prune', 'restore', 'prepare-directories', 'archive', 'help')]
+    [ValidateSet('backup', 'backup-verify', 'backup-prune', 'restore', 'prepare-directories', 'upgrade-state', 'archive', 'help')]
     [string]$Command = 'help',
     [string]$Action = 'status',
     [string]$HoldAction = 'list',
@@ -1542,6 +1542,47 @@ function Initialize-StorageDirectories([switch]$AdoptExisting) {
         }
     }
     Assert-StorageRootIdentities -IncludeBackup:$includeBackup
+}
+
+function Invoke-UpgradePersistentState {
+    # Keep the deployment-scoped storage-administration lock for the complete
+    # offline transition. Backup/restore cannot enter after OSCAR stops but
+    # before the index is durable and the application is running again.
+    Write-Host "`n== Preparing persistent OSCAR state for this release ==" -ForegroundColor Cyan
+    Invoke-Compose @('stop', 'gateway')
+    Invoke-Compose @('stop', 'oscar')
+
+    $legacyCleanup = @'
+umask 077
+if [ -e /state/backups ] || [ -L /state/backups ]; then
+    [ -d /state/backups ] && [ ! -L /state/backups ] || {
+        echo "Legacy embedded backup path is not a regular directory." >&2; exit 1;
+    }
+    rmdir -- /state/backups || {
+        echo "Legacy embedded /var/lib/oscar/backups is nonempty. Preserve or export its contents, explicitly empty that non-authoritative volume path, then retry upgrade." >&2
+        exit 1
+    }
+fi
+'@
+    [void](Get-DockerShellInputOutput $legacyCleanup @(
+        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges', '--user', '10001:10001',
+        '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state',
+        (Get-OscarImage), '-seu'))
+
+    Write-Host "`n== Migrating daily-file lifecycle index ==" -ForegroundColor Cyan
+    $migration = @'
+umask 077
+exec java -cp '/opt/oscar/lib/*' com.botts.impl.service.dailyfile.DailyFileJournalIndexMigration --config /var/lib/oscar/config.json
+'@
+    [void](Get-ComposeShellInputOutput $migration @(
+        'run', '--rm', '--no-deps', '--user', '10001:10001',
+        '--entrypoint', 'sh', 'oscar', '-seu'))
+
+    Invoke-Compose @('config', '--quiet')
+    # Clean-directory upgrades change every release-local bind source. Recreate
+    # all services without renewing named volumes while the lock is still held.
+    Invoke-Compose @('up', '--detach', '--force-recreate', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '240')
 }
 
 function Write-Checksums([string]$Root) {
@@ -3428,6 +3469,7 @@ OSCAR storage administration (Administrator PowerShell)
   oscar.bat backup
   oscar.bat backup-verify -BackupId ID
   oscar.bat restore -BackupId ID -Confirm ID
+  upgrade-state (internal upgrade workflow)
   oscar.bat archive status
   oscar.bat archive verify
   oscar.bat archive hold list
@@ -3465,6 +3507,10 @@ try {
         Assert-StorageRootsReady
         Assert-StorageRootIdentities
         Assert-DeploymentVolumeOwnership
+    } elseif ($Command -eq 'upgrade-state') {
+        Assert-StorageRootsReady
+        Assert-StorageRootIdentities
+        Assert-DeploymentVolumeOwnership
     }
     switch ($Command) {
         'backup' { New-Backup }
@@ -3472,6 +3518,7 @@ try {
         'backup-prune' { Remove-ExpiredBackups $Keep }
         'restore' { Restore-Backup $BackupId $Confirm }
         'prepare-directories' { Initialize-StorageDirectories -AdoptExisting:$AdoptExistingStorageRoots }
+        'upgrade-state' { Invoke-UpgradePersistentState }
         'archive' {
             switch ($Action) {
                 'status' { Show-ArchiveStatus }
