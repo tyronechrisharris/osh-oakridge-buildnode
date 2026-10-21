@@ -20,6 +20,11 @@ $releasePowerShellScripts = @($storageScript, $setupScript, $verifyScript, $offl
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('oscar-storage-ps5-' + [Guid]::NewGuid().ToString('N'))
 $createdDockerGroup = $false
 
+$expectedDisabledBackupGuidance = 'OSCAR backups are disabled. Re-run upgrade with -BackupMode single -BackupDir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+if (-not [IO.File]::ReadAllText($storageScript).Contains($expectedDisabledBackupGuidance)) {
+    throw 'PowerShell disabled-backup guidance does not use the supported upgrade parameter names.'
+}
+
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }

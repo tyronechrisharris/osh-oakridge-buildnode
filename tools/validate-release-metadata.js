@@ -60,6 +60,22 @@ function forbidPattern(relativePath, pattern, description) {
     }
 }
 
+function requireLocalizedMediaDefaults(relativePath) {
+    const section = read(relativePath).match(/^### 4\.3[^\n]*\n([\s\S]*?)(?=\n### |(?![\s\S]))/m)?.[1];
+    if (!section) {
+        throw new Error(`${relativePath}: missing localized video-retention section 4.3.`);
+    }
+    const numericDefaults = section.split(/\r?\n/)
+        .filter((line) => line.startsWith('|'))
+        .map((line) => line.split('|').slice(1, -1).map((cell) => cell.trim()))
+        .filter((cells) => cells.length >= 3 && /^\d+$/.test(cells[1]))
+        .map((cells) => Number(cells[1]));
+    const expected = [1, 5, 6, 24, 360, 2, 24, 24, 15, 200, 200, 5, 85, 24];
+    if (JSON.stringify(numericDefaults) !== JSON.stringify(expected)) {
+        throw new Error(`${relativePath}: localized video-retention defaults do not match the production profile.`);
+    }
+}
+
 requireMatch('build.gradle', /^\s*version\s*=\s*"([^"]+)"\s*$/m, version, 'version');
 requireMatch(
     '.github/workflows/release.yml',
@@ -73,6 +89,49 @@ requireMatch(
     version,
     'deployment version',
 );
+const standardConfig = JSON.parse(read('dist/config/standard/config.json'));
+const standardOscar = standardConfig.filter((item) =>
+    item?.objClass === 'com.botts.impl.service.oscar.OSCARServiceConfig');
+const standardDatabases = standardConfig.filter((item) =>
+    item?.objClass === 'org.sensorhub.impl.database.system.SystemDriverDatabaseConfig');
+const standardDailyJournals = standardConfig.filter((item) =>
+    item?.objClass === 'com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig');
+if (standardOscar.length !== 1 || standardDatabases.length !== 1 || standardDailyJournals.length !== 1) {
+    throw new Error('dist/config/standard/config.json: expected one OSCAR service, one system database, and one daily-file journal.');
+}
+const videoRetention = standardOscar[0].videoRetentionConfig;
+const archive = standardDatabases[0].dbConfig?.archive;
+const dailyJournal = standardDailyJournals[0];
+const expectedStorageDefaults = {
+    'videoRetentionConfig.timeToRetention': [videoRetention?.timeToRetention, 1],
+    'videoRetentionConfig.videoQueryPeriod': [videoRetention?.videoQueryPeriod, 5],
+    'videoRetentionConfig.maximumCatchUpHours': [videoRetention?.maximumCatchUpHours, 6],
+    'videoRetentionConfig.lateArrivalOverlapHours': [videoRetention?.lateArrivalOverlapHours, 24],
+    'videoRetentionConfig.lateArrivalScanPeriodMinutes': [videoRetention?.lateArrivalScanPeriodMinutes, 360],
+    'videoRetentionConfig.lateArrivalCatchUpHours': [videoRetention?.lateArrivalCatchUpHours, 2],
+    'videoRetentionConfig.reconciliationCatchUpHours': [videoRetention?.reconciliationCatchUpHours, 24],
+    'videoRetentionConfig.reconciliationPeriodHours': [videoRetention?.reconciliationPeriodHours, 24],
+    'videoRetentionConfig.occupancyStreamRefreshMinutes': [videoRetention?.occupancyStreamRefreshMinutes, 15],
+    'videoRetentionConfig.enableFrameRetention': [videoRetention?.enableFrameRetention, true],
+    'videoRetentionConfig.frameRetentionCount': [videoRetention?.frameRetentionCount, 5],
+    'videoRetentionConfig.jpegQuality': [videoRetention?.jpegQuality, 85],
+    'videoRetentionConfig.sourceRollbackGraceHours': [videoRetention?.sourceRollbackGraceHours, 24],
+    'videoRetentionConfig.maintenanceWorkLimit': [videoRetention?.maintenanceWorkLimit, 200],
+    'videoRetentionConfig.metadataReclamationWorkLimit': [videoRetention?.metadataReclamationWorkLimit, 200],
+    'archive.enabled': [archive?.enabled, true],
+    'archive.intervalMinutes': [archive?.intervalMinutes, 60],
+    'archive.hotRetentionDays': [archive?.hotRetentionDays, 2],
+    'archive.rollbackGraceDays': [archive?.rollbackGraceDays, 1],
+    'archive.deleteHotAfterArchive': [archive?.deleteHotAfterArchive, true],
+    'archive.requireParityReceipt': [archive?.requireParityReceipt, true],
+    'dailyJournal.sealedJournalRetentionDays': [dailyJournal?.sealedJournalRetentionDays, 30],
+    'dailyJournal.requireBackupBeforeSealedJournalDeletion': [dailyJournal?.requireBackupBeforeSealedJournalDeletion, false],
+};
+for (const [field, [actual, expected]] of Object.entries(expectedStorageDefaults)) {
+    if (actual !== expected) {
+        throw new Error(`dist/config/standard/config.json: expected ${field}=${expected}, found ${actual}.`);
+    }
+}
 requireMatch('dist/release/.env.example', /^OSCAR_VERSION=(.+)$/m, version, 'OSCAR_VERSION');
 requireMatch(
     'dist/release/compose.yaml',
@@ -238,6 +297,7 @@ for (const manual of localizedManuals) {
         'manual title version',
     );
     requireOnlyOscarVersion(relativePath);
+    requireLocalizedMediaDefaults(relativePath);
 }
 
 requireMatch(

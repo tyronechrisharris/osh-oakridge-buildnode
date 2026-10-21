@@ -78,12 +78,35 @@ const service = config.find(item => item.objClass === 'com.botts.impl.service.os
 const database = config.find(item => item.dbConfig?.objClass ===
     'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig')?.dbConfig;
 const archive = database?.archive;
+const dailyJournal = config.find(item =>
+    item.objClass === 'com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig');
 const outputs = ['gammaCounts', 'gammaThreshold', 'neutronCounts', 'setupGamma', 'setupNeutron'];
-if (service?.videoRetentionConfig?.timeToRetention !== 0 ||
+const expectedVideoRetention = {
+    timeToRetention: 1,
+    videoQueryPeriod: 5,
+    maximumCatchUpHours: 6,
+    lateArrivalOverlapHours: 24,
+    lateArrivalScanPeriodMinutes: 360,
+    lateArrivalCatchUpHours: 2,
+    reconciliationCatchUpHours: 24,
+    reconciliationPeriodHours: 24,
+    occupancyStreamRefreshMinutes: 15,
+    maintenanceWorkLimit: 200,
+    metadataReclamationWorkLimit: 200,
+    enableFrameRetention: true,
+    frameRetentionCount: 5,
+    jpegQuality: 85,
+    sourceRollbackGraceHours: 24,
+};
+if (Object.entries(expectedVideoRetention).some(([field, expected]) =>
+        service?.videoRetentionConfig?.[field] !== expected) ||
     archive?.hotRetentionDays !== 2 || archive?.rollbackGraceDays !== 1 ||
     archive?.deleteHotAfterArchive !== true ||
+    archive?.requireParityReceipt !== true ||
+    dailyJournal?.sealedJournalRetentionDays !== 30 ||
+    dailyJournal?.requireBackupBeforeSealedJournalDeletion !== false ||
     JSON.stringify(archive?.outputNames) !== JSON.stringify(outputs)) {
-    throw new Error('standard lifecycle defaults no longer encode first-cycle five-JPEG retention, 48-hour cold eligibility, verified 24-hour overlap, and the five-output allowlist');
+    throw new Error('standard lifecycle defaults no longer encode the production media cadence/grace, 48-hour cold eligibility, verified 24-hour overlap, 30-day exact-replay journal retention, and five-output allowlist');
 }
 NODE
 
@@ -176,6 +199,7 @@ fi
 assert_contains '--backup-mode disabled\|single' "$setup_shell_script"
 assert_contains '--backup-dir ABSOLUTE_PATH' "$setup_shell_script"
 assert_contains 'backup\|backup-verify\|backup-prune\|restore\)' "$shell_script"
+assert_contains 'Re-run upgrade with -BackupMode single -BackupDir <absolute-secondary-drive-path>' "$powershell_script"
 write_backup_mode_environment 'OSCAR_BACKUP_MODE=disabled'
 if disabled_backup_error=$(bash -c '
     storage_script=$1
@@ -228,6 +252,23 @@ expected_current_hmac=$(head -n 3 "$current_fixture/CURRENT" |
     exit 1
 }
 cp "$current_fixture/CURRENT" "$current_fixture/CURRENT.valid"
+printf 'UNTERMINATED' >>"$current_fixture/CURRENT"
+chmod 0600 "$current_fixture/CURRENT"
+if bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture; backup_key_file=$fixture/key.txt
+    calculate_current_pointer_hmac() {
+        local pointer=$1 key
+        key=$(cat "$backup_key_file")
+        head -n 3 "$pointer" | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A
+    }
+    validate_current_backup_pointer oscar:test
+' _ "$shell_script" "$current_fixture" >/dev/null 2>&1; then
+    printf 'Bash CURRENT pointer accepted an unterminated trailing record.\n' >&2
+    exit 1
+fi
+cp "$current_fixture/CURRENT.valid" "$current_fixture/CURRENT"
 sed 's/1234abcd/deadbeef/' "$current_fixture/CURRENT.valid" >"$current_fixture/CURRENT"
 chmod 0600 "$current_fixture/CURRENT"
 if bash -c '
@@ -246,67 +287,152 @@ if bash -c '
 fi
 mv "$current_fixture/CURRENT.valid" "$current_fixture/CURRENT"
 
-# A schema-v2 directory published before the first CURRENT commit is verified
-# but not accepted. Repeated failures at that point must not accumulate full
-# snapshots. Legacy schema-v1 backups predate CURRENT and must be preserved;
-# an interrupted legacy deletion tombstone is restored when no pointer exists.
+# Without CURRENT, a unique fully accepted schema-v2 recovery point is adopted
+# rather than deleted. Legacy, failed, unaccepted, partial, and old uncommitted
+# tombstones remain available for operator review. Once CURRENT exists, cleanup
+# still authenticates both finalized candidates and deletion tombstones.
 uncommitted_fixture="$test_root/uncommitted-first-backup"
 legacy_final_id=20261018T120000Z-11111111
 legacy_tombstone_id=20261018T130000Z-22222222
-v2_first_id=20261020T120000Z-33333333
-v2_second_id=20261020T130000Z-44444444
-v2_tombstone_id=20261020T140000Z-55555555
+accepted_id=20261020T120000Z-33333333
+failed_final_id=20261020T130000Z-44444444
+forged_marker_id=20261020T140000Z-55555555
 v2_partial_delete_id=20261020T150000Z-66666666
+partial_id=20261020T160000Z-77777777
+accepted_tombstone_id=20261020T170000Z-88888888
+forged_tombstone_id=20261020T180000Z-99999999
 mkdir -p \
     "$uncommitted_fixture/$legacy_final_id" \
     "$uncommitted_fixture/.deleting-$legacy_tombstone_id" \
-    "$uncommitted_fixture/$v2_first_id" \
-    "$uncommitted_fixture/$v2_second_id" \
-    "$uncommitted_fixture/.deleting-$v2_tombstone_id" \
+    "$uncommitted_fixture/$accepted_id" \
+    "$uncommitted_fixture/$failed_final_id" \
+    "$uncommitted_fixture/$forged_marker_id" \
+    "$uncommitted_fixture/$partial_id.partial" \
     "$uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id"
-for backup_path in \
-    "$uncommitted_fixture/$legacy_final_id" \
-    "$uncommitted_fixture/.deleting-$legacy_tombstone_id"; do
-    printf '{\n  "version": 1,\n  "marker": "legacy"\n}\n' >"$backup_path/epoch.json"
-    chmod 0700 "$backup_path"
-done
-for backup_path in \
-    "$uncommitted_fixture/$v2_first_id" \
-    "$uncommitted_fixture/$v2_second_id" \
-    "$uncommitted_fixture/.deleting-$v2_tombstone_id"; do
-    printf '{\n  "version": 2,\n  "marker": "uncommitted"\n}\n' >"$backup_path/epoch.json"
-    chmod 0700 "$backup_path"
-done
+find "$uncommitted_fixture" -type d -exec chmod 0700 {} +
+printf '2026-10-20T12:00:00Z\n' >"$uncommitted_fixture/$forged_marker_id/VERIFIED"
+chmod 0600 "$uncommitted_fixture/$forged_marker_id/VERIFIED"
 printf 'the authenticated payload was partly removed before a simulated power loss\n' \
     >"$uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id/remaining-member"
-chmod 0700 "$uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id"
-bash -c '
-    storage_script=$1; fixture=$2
+recovery_output=$(bash -c '
+    storage_script=$1; fixture=$2; accepted_id=$3; legacy_final_id=$4; legacy_tombstone_id=$5
+    failed_final_id=$6; forged_marker_id=$7; accepted_tombstone_id=$8; forged_tombstone_id=$9
     set -- help; source "$storage_script" >/dev/null
     backup_dir=$fixture
     fsync_path() { :; }
-    verify_backup() {
-        local backup_id=$1 supplied_root=${3:-} root
-        root=${supplied_root:-$backup_dir/$backup_id}
-        [[ -d $root && ! -L $root && -f $root/epoch.json ]] ||
-            fail "test verifier received an unsafe snapshot root"
-        [[ -z $supplied_root || $supplied_root == "$backup_dir/.deleting-$backup_id" ]] ||
-            fail "test verifier received an unexpected override root"
-        [[ $(backup_schema_version "$root") == 1 || $(backup_schema_version "$root") == 2 ]] ||
-            fail "test verifier received an invalid schema"
+    calculate_current_pointer_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
+    accepted_schema_v2_backup_for_cleanup() {
+        case $1 in
+            "$accepted_id"|"$accepted_tombstone_id") return 0 ;;
+            "$legacy_final_id"|"$legacy_tombstone_id") return 11 ;;
+            "$failed_final_id") return 10 ;;
+            "$forged_marker_id"|"$forged_tombstone_id") return 12 ;;
+            *) return 10 ;;
+        esac
     }
     recover_single_backup_state oscar:test
+    mkdir "$backup_dir/.deleting-$accepted_tombstone_id" "$backup_dir/.deleting-$forged_tombstone_id"
+    chmod 0700 "$backup_dir/.deleting-$accepted_tombstone_id" "$backup_dir/.deleting-$forged_tombstone_id"
     recover_single_backup_state oscar:test
-' _ "$shell_script" "$uncommitted_fixture"
+' _ "$shell_script" "$uncommitted_fixture" "$accepted_id" "$legacy_final_id" "$legacy_tombstone_id" \
+    "$failed_final_id" "$forged_marker_id" "$accepted_tombstone_id" "$forged_tombstone_id" 2>&1)
 [[ -d $uncommitted_fixture/$legacy_final_id &&
    -d $uncommitted_fixture/$legacy_tombstone_id &&
    ! -e $uncommitted_fixture/.deleting-$legacy_tombstone_id &&
-   ! -e $uncommitted_fixture/$v2_first_id &&
-   ! -e $uncommitted_fixture/$v2_second_id &&
-   ! -e $uncommitted_fixture/.deleting-$v2_tombstone_id &&
-   ! -e $uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id &&
-   ! -e $uncommitted_fixture/CURRENT ]] || {
-    printf 'Bash first-backup recovery did not preserve v1 and retire only uncommitted schema-v2 snapshots.\n' >&2
+   -d $uncommitted_fixture/$accepted_id &&
+   -d $uncommitted_fixture/$failed_final_id &&
+   -d $uncommitted_fixture/$forged_marker_id &&
+   -d $uncommitted_fixture/$partial_id.partial &&
+   -d $uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id &&
+   ! -e $uncommitted_fixture/.deleting-$accepted_tombstone_id &&
+   -d $uncommitted_fixture/.deleting-$forged_tombstone_id &&
+   $(sed -n '3p' "$uncommitted_fixture/CURRENT") == "backup_id=$accepted_id" ]] || {
+    printf 'Bash recovery cleanup did not adopt the sole accepted snapshot and preserve every unauthorized candidate.\n' >&2
+    exit 1
+}
+for expected_warning in \
+    'preserving legacy schema-version-1 recovery point' \
+    'preserving incomplete or unauthenticated backup candidate' \
+    'preserving authenticated but unaccepted schema-version-2 backup candidate' \
+    'preserving incomplete backup staging candidate' \
+    'preserving legacy uncommitted schema-version-2 deletion tombstone'; do
+    grep -Fq "$expected_warning" <<<"$recovery_output" || {
+        printf 'Bash cleanup did not emit expected preservation warning: %s\n' "$expected_warning" >&2
+        exit 1
+    }
+done
+
+# A corrupt acceptance receipt on CURRENT is a hard stop before any candidate
+# or tombstone can be mutated.
+corrupt_current_fixture="$test_root/corrupt-current-receipt"
+corrupt_current_id=20261020T190000Z-aaaaaaaa
+corrupt_candidate_id=20261020T200000Z-bbbbbbbb
+mkdir -p "$corrupt_current_fixture/$corrupt_current_id" "$corrupt_current_fixture/$corrupt_candidate_id"
+chmod 0700 "$corrupt_current_fixture" "$corrupt_current_fixture/$corrupt_current_id" "$corrupt_current_fixture/$corrupt_candidate_id"
+: >"$corrupt_current_fixture/CURRENT"
+if bash -c '
+    storage_script=$1; fixture=$2; current_id=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture
+    validate_current_backup_pointer() { printf "%s" "$current_id"; }
+    accepted_schema_v2_backup_for_cleanup() { [[ $1 != "$current_id" ]]; }
+    recover_single_backup_state oscar:test
+' _ "$shell_script" "$corrupt_current_fixture" "$corrupt_current_id" >/dev/null 2>&1; then
+    printf 'Bash cleanup accepted CURRENT with a corrupt acceptance receipt.\n' >&2
+    exit 1
+fi
+[[ -d $corrupt_current_fixture/$corrupt_current_id && -d $corrupt_current_fixture/$corrupt_candidate_id ]] || {
+    printf 'Bash cleanup mutated candidates after CURRENT acceptance verification failed.\n' >&2
+    exit 1
+}
+ambiguous_current_fixture="$test_root/ambiguous-current-recovery"
+ambiguous_a=20261020T210000Z-cccccccc
+ambiguous_b=20261020T220000Z-dddddddd
+ambiguous_legacy=20261020T230000Z-eeeeeeee
+mkdir -p "$ambiguous_current_fixture/$ambiguous_a" "$ambiguous_current_fixture/$ambiguous_b" \
+    "$ambiguous_current_fixture/.deleting-$ambiguous_legacy"
+chmod 0700 "$ambiguous_current_fixture" "$ambiguous_current_fixture/$ambiguous_a" \
+    "$ambiguous_current_fixture/$ambiguous_b" "$ambiguous_current_fixture/.deleting-$ambiguous_legacy"
+if bash -c '
+    storage_script=$1; fixture=$2; legacy=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture
+    accepted_schema_v2_backup_for_cleanup() { [[ $1 == "$legacy" ]] && return 11; return 0; }
+    recover_single_backup_state oscar:test
+' _ "$shell_script" "$ambiguous_current_fixture" "$ambiguous_legacy" >/dev/null 2>&1; then
+    printf 'Bash cleanup chose between multiple accepted candidates without CURRENT.\n' >&2
+    exit 1
+fi
+[[ -d $ambiguous_current_fixture/$ambiguous_a && -d $ambiguous_current_fixture/$ambiguous_b &&
+   -d $ambiguous_current_fixture/.deleting-$ambiguous_legacy &&
+   ! -e $ambiguous_current_fixture/$ambiguous_legacy && ! -e $ambiguous_current_fixture/CURRENT ]] || {
+    printf 'Bash ambiguous no-CURRENT cleanup did not preserve every accepted candidate.\n' >&2
+    exit 1
+}
+
+# A failed producer must invalidate the entire recovery scan. Process
+# substitution used to hide this status and could make two accepted candidates
+# look like one, causing an unauthorized CURRENT reconstruction.
+scan_failure_fixture="$test_root/failed-backup-enumeration"
+scan_failure_a=20261021T010000Z-11111111
+scan_failure_b=20261021T020000Z-22222222
+mkdir -p "$scan_failure_fixture/$scan_failure_a" "$scan_failure_fixture/$scan_failure_b"
+chmod 0700 "$scan_failure_fixture" "$scan_failure_fixture/$scan_failure_a" "$scan_failure_fixture/$scan_failure_b"
+if bash -c '
+    storage_script=$1; fixture=$2; first=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture
+    find() { printf "%s\0" "$fixture/$first"; return 42; }
+    accepted_schema_v2_backup_for_cleanup() { return 0; }
+    write_current_backup_pointer() { : >"$backup_dir/CURRENT"; }
+    cleanup_uncommitted_schema_v2_snapshots oscar:test
+' _ "$shell_script" "$scan_failure_fixture" "$scan_failure_a" >/dev/null 2>&1; then
+    printf 'Bash no-CURRENT recovery ignored a failed directory enumeration.\n' >&2
+    exit 1
+fi
+[[ -d $scan_failure_fixture/$scan_failure_a && -d $scan_failure_fixture/$scan_failure_b &&
+   ! -e $scan_failure_fixture/CURRENT ]] || {
+    printf 'Bash failed directory enumeration mutated or adopted a recovery candidate.\n' >&2
     exit 1
 }
 assert_contains 'cleanup_uncommitted_schema_v2_snapshots "\$image"' "$shell_script"
@@ -1810,6 +1936,18 @@ printf '%s\n' \
     "backup_id=$acceptance_id" \
     "oscar_state_sha256=$acceptance_sha" \
     "hmac_sha256=$acceptance_tag" >"$acceptance_root/JOURNAL_CONFIRMED"
+cp "$acceptance_root/JOURNAL_CONFIRMED" "$acceptance_root/JOURNAL_CONFIRMED.valid"
+printf 'UNTERMINATED' >>"$acceptance_root/JOURNAL_CONFIRMED"
+if bash -c '
+    storage_script=$1; root=$2; backup_id=$3; state_sha=$4
+    set -- help; source "$storage_script" >/dev/null
+    calculate_journal_confirmation_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
+    validate_journal_confirmation_receipt "$root" "$backup_id" "$state_sha" oscar:test
+' _ "$shell_script" "$acceptance_root" "$acceptance_id" "$acceptance_sha" >/dev/null 2>&1; then
+    printf 'Bash journal confirmation accepted an unterminated trailing record.\n' >&2
+    exit 1
+fi
+mv "$acceptance_root/JOURNAL_CONFIRMED.valid" "$acceptance_root/JOURNAL_CONFIRMED"
 bash -c '
     storage_script=$1; fixture_root=$2; fixture_key=$3; backup_id=$4
     set -- help; source "$storage_script" >/dev/null
@@ -1825,6 +1963,87 @@ bash -c '
     printf 'Bash authenticated core with a valid journal audit sidecar did not produce VERIFIED.\n' >&2
     exit 1
 }
+
+# Crash-left acceptance temporaries are authenticated metadata staging, not
+# immutable payloads. A safe exact temporary must not make the core verifier
+# reject the snapshot, and cleanup may remove it only after verification.
+acceptance_temporary="$acceptance_root/.VERIFIED.A1b2C3"
+printf 'interrupted VERIFIED publication\n' >"$acceptance_temporary"
+chmod 0600 "$acceptance_temporary"
+bash -c '
+    storage_script=$1; fixture_root=$2; fixture_key=$3; backup_id=$4; temporary=$5
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root; backup_key_file=$fixture_key
+    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
+    oscar_image() { printf "%s" oscar:test; }; postgres_image() { printf "%s" postgres:test; }
+    require_local_image() { :; }; verify_checksum_hmac() { :; }; docker() { :; }; compose() { :; }
+    validate_release_config_archive() { :; }; validate_backup_archive_members() { :; }; validate_image_inventory() { :; }
+    calculate_journal_confirmation_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
+    fsync_path() { :; }
+    verify_backup "$backup_id" read-only
+    [[ -f $temporary ]]
+    cleanup_snapshot_sidecar_temps "$fixture_root/$backup_id"
+    [[ ! -e $temporary && ! -L $temporary ]]
+' _ "$shell_script" "$test_root/acceptance/backups" "$test_root/acceptance/backup-key.txt" \
+    "$acceptance_id" "$acceptance_temporary"
+
+unsafe_acceptance_temporary="$acceptance_root/.JOURNAL_CONFIRMED.Z9y8X7"
+mkdir "$unsafe_acceptance_temporary"
+if bash -c '
+    storage_script=$1; root=$2
+    set -- help; source "$storage_script" >/dev/null
+    validate_backup_manifest_inventory "$root"
+' _ "$shell_script" "$acceptance_root" >/dev/null 2>&1; then
+    printf 'Bash backup verification ignored an acceptance temporary directory.\n' >&2
+    exit 1
+fi
+rmdir "$unsafe_acceptance_temporary"
+
+# The manifest inventory itself must also observe a failed recursive producer;
+# a partial result that happens to equal SHA256SUMS is not a complete scan.
+manifest_scan_fixture="$test_root/failed-manifest-enumeration"
+mkdir -p "$manifest_scan_fixture"
+printf 'payload\n' >"$manifest_scan_fixture/payload"
+printf '%s  ./payload\n' "$(sha256_path "$manifest_scan_fixture/payload")" >"$manifest_scan_fixture/SHA256SUMS"
+if bash -c '
+    storage_script=$1; root=$2
+    set -- help; source "$storage_script" >/dev/null
+    find() { printf "%s\0" "$root/payload"; return 42; }
+    validate_backup_manifest_inventory "$root"
+' _ "$shell_script" "$manifest_scan_fixture" >/dev/null 2>&1; then
+    printf 'Bash backup manifest verification ignored a failed filesystem enumeration.\n' >&2
+    exit 1
+fi
+# Cleanup authorization is stricter than core verification: a plausible
+# VERIFIED marker cannot substitute for the authenticated journal receipt.
+bash -c '
+    storage_script=$1; fixture_root=$2; backup_id=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture_root
+    verify_backup() { :; }
+    backup_schema_version() { printf "%s" 2; }
+    oscar_image() { printf "%s" oscar:test; }
+    validate_journal_confirmation_receipt() {
+        grep -Fqx "hmac_sha256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" "$1/JOURNAL_CONFIRMED"
+    }
+    accepted_schema_v2_backup_for_cleanup "$backup_id"
+    cp "$fixture_root/$backup_id/VERIFIED" "$fixture_root/$backup_id/VERIFIED.valid"
+    printf "\n" >>"$fixture_root/$backup_id/VERIFIED"
+    if accepted_schema_v2_backup_for_cleanup "$backup_id"; then
+        fail "noncanonical VERIFIED bytes authorized cleanup"
+    fi
+    mv "$fixture_root/$backup_id/VERIFIED.valid" "$fixture_root/$backup_id/VERIFIED"
+    printf "%s\n" "forged receipt" >"$fixture_root/$backup_id/JOURNAL_CONFIRMED"
+    if accepted_schema_v2_backup_for_cleanup "$backup_id"; then
+        fail "forged VERIFIED marker authorized cleanup without a valid receipt"
+    fi
+' _ "$shell_script" "$test_root/acceptance/backups" "$acceptance_id"
+printf '%s\n' \
+    'format=oscar-journal-backup-confirmation' \
+    'version=2' \
+    "backup_id=$acceptance_id" \
+    "oscar_state_sha256=$acceptance_sha" \
+    "hmac_sha256=$acceptance_tag" >"$acceptance_root/JOURNAL_CONFIRMED"
 rm -f -- "$acceptance_root/VERIFIED"
 bash -c '
     storage_script=$1; fixture_root=$2; fixture_key=$3; backup_id=$4
@@ -2046,12 +2265,55 @@ grep -Eq -- "--volume $journal_isolation_root/\\.journal-confirm-$acceptance_id\
 grep -Fq -- 'tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz' "$journal_extractor_capture" &&
 grep -Fq -- 'find /snapshot -type d -exec chmod 0700' "$journal_extractor_capture" &&
 grep -Fq -- 'find /snapshot -type f -exec chmod 0600' "$journal_extractor_capture" &&
-grep -Fq -- "-R 10001:10001 $snapshot_path" "$journal_chown_capture" &&
+grep -Fq -- "0:10001 $snapshot_path" "$journal_chown_capture" &&
+grep -Fq -- 'find "$snapshot" -mindepth 1 -exec chown -h 10001:10001' "$shell_script" &&
 grep -Fq -- '--network none --read-only --cap-drop ALL --security-opt no-new-privileges' "$journal_isolation_capture" &&
 grep -Fq -- '--tmpfs /tmp:rw,noexec,nosuid,nodev --user 10001:10001 --entrypoint java' "$journal_isolation_capture" &&
 grep -Fq -- '--volume oscar_oscar_state:/var/lib/oscar' "$journal_isolation_capture" &&
 grep -Fq -- "--volume $snapshot_path:/verified-snapshot:ro" "$journal_isolation_capture" || {
     printf 'Bash journal confirmation is not confined to the state volume and offline hardened container.\n' >&2
+    exit 1
+}
+
+# The extracted journal tree may be application-owned, but its scratch root
+# remains administrator-owned with a narrowly recognizable 0710/10001 shape so
+# the next locked command can recover it after a host power loss.
+journal_scratch_recovery_root="$test_root/journal-scratch-recovery-bash"
+journal_scratch="$journal_scratch_recovery_root/.journal-confirm-$acceptance_id.A1b2C3"
+mkdir -p "$journal_scratch"
+chmod 0700 "$journal_scratch_recovery_root" "$journal_scratch"
+bash -c '
+    storage_script=$1; fixture=$2; expected_scratch=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture
+    file_owner_id() { printf "%s" "${EUID:-$(id -u)}"; }
+    file_group_id() { [[ $1 == "$expected_scratch" ]] && printf "%s" 10001; }
+    file_mode() { [[ $1 == "$expected_scratch" ]] && printf "%s" 710; }
+    fsync_path() { :; }
+    cleanup_abandoned_single_backup_staging
+' _ "$shell_script" "$journal_scratch_recovery_root" "$journal_scratch"
+[[ ! -e $journal_scratch ]] || {
+    printf 'Bash recovery did not remove an exact crash-left journal scratch directory.\n' >&2
+    exit 1
+}
+
+unsafe_restore_scratch="$journal_scratch_recovery_root/.restore-payload-$acceptance_id.A1b2C3"
+mkdir -p "$unsafe_restore_scratch"
+if bash -c '
+    storage_script=$1; fixture=$2; expected_scratch=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture
+    file_owner_id() { printf "%s" "${EUID:-$(id -u)}"; }
+    file_group_id() { [[ $1 == "$expected_scratch" ]] && printf "%s" 10001; }
+    file_mode() { [[ $1 == "$expected_scratch" ]] && printf "%s" 710; }
+    fsync_path() { :; }
+    cleanup_abandoned_single_backup_staging
+' _ "$shell_script" "$journal_scratch_recovery_root" "$unsafe_restore_scratch" >/dev/null 2>&1; then
+    printf 'Bash recovery accepted the journal-only scratch ACL for a restore payload.\n' >&2
+    exit 1
+fi
+[[ -d $unsafe_restore_scratch ]] || {
+    printf 'Bash recovery removed an unsafe restore scratch directory.\n' >&2
     exit 1
 }
 
@@ -2429,12 +2691,13 @@ assert_contains '\$objects = @\(Invoke-PsqlLines' "$powershell_script"
 assert_contains 'foreach \(\$line in \$objects\)' "$powershell_script"
 
 # The old retention engine is gone. Cleanup of an established single snapshot
-# is reachable only after authenticated CURRENT verification and revalidates
-# both the pointer and current recovery point. The separate no-CURRENT path
-# above can retire only authenticated, uncommitted schema-v2 candidates.
+# is reachable only after authenticated CURRENT verification and requires the
+# current recovery point itself to carry valid schema-v2 acceptance sidecars.
+# Every candidate and tombstone is independently classified before deletion.
 cleanup_body=$(awk '/^cleanup_noncurrent_backup_snapshots\(\)/,/^cleanup_abandoned_single_backup_staging\(\)/' "$shell_script")
 [[ $(grep -Fc 'validate_current_backup_pointer' <<<"$cleanup_body") -ge 1 &&
-   $(grep -Fc 'verify_backup "$current_id" read-only' <<<"$cleanup_body") == 1 &&
+   $(grep -Fc 'accepted_schema_v2_backup_for_cleanup "$current_id"' <<<"$cleanup_body") == 1 &&
+   $(grep -Fc 'accepted_schema_v2_backup_for_cleanup "$backup_id" "$path"' <<<"$cleanup_body") -ge 1 &&
    $(grep -Fc 'CURRENT backup cannot be a deletion candidate' <<<"$cleanup_body") == 1 ]] || {
     printf 'Bash single-snapshot cleanup is not guarded by authenticated CURRENT verification.\n' >&2
     exit 1
@@ -2972,6 +3235,45 @@ if command -v pwsh >/dev/null 2>&1; then
             function Confirm-BackupArchiveMembers([string]$Root, [string]$Image) {}
             function Confirm-ImageInventory([string]$Root, [switch]$CompareCurrent) {}
             function Get-ComposeOutput([string[]]$Arguments) { return @() }
+
+            $acceptanceBackupDirectory = $BackupDirectory
+            $pointerFixture = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "current-pointer-powershell"
+            $pointerId = "20261020T120000Z-1234abcd"
+            [IO.Directory]::CreateDirectory((Join-Path $pointerFixture $pointerId)) | Out-Null
+            $pointerPath = Join-Path $pointerFixture "CURRENT"
+            $pointerTag = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            $pointerRaw = "format=oscar-current-backup`nversion=1`nbackup_id=$pointerId`nhmac_sha256=$pointerTag`n"
+            $nonCanonicalMetadataEncodings = @(
+                (New-Object Text.UTF8Encoding($true))
+                (New-Object Text.UnicodeEncoding($false, $true))
+            )
+            [IO.File]::WriteAllText($pointerPath, $pointerRaw, $Utf8NoBom)
+            $currentPointerHmacImplementation = ${function:Get-CurrentPointerHmac}
+            function Get-CurrentPointerHmac([string]$PointerPath, [string]$Image) { return $pointerTag }
+            $BackupDirectory = $pointerFixture
+            if ((Read-CurrentBackupId) -cne $pointerId) { throw "PowerShell rejected the canonical CURRENT pointer" }
+            [IO.File]::WriteAllText($pointerPath, $pointerRaw.TrimEnd([char[]]"`r`n"), $Utf8NoBom)
+            try {
+                [void](Read-CurrentBackupId)
+                throw "PowerShell CURRENT pointer accepted a missing final LF"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell CURRENT pointer accepted a missing final LF") { throw }
+                if ($_.Exception.Message -notlike "*not canonically LF-terminated*") { throw }
+            }
+            foreach ($encoding in $nonCanonicalMetadataEncodings) {
+                [IO.File]::WriteAllText($pointerPath, $pointerRaw, $encoding)
+                try {
+                    [void](Read-CurrentBackupId)
+                    throw "PowerShell CURRENT pointer accepted noncanonical BOM or UTF-16 bytes"
+                } catch {
+                    if ($_.Exception.Message -eq "PowerShell CURRENT pointer accepted noncanonical BOM or UTF-16 bytes") { throw }
+                    if ($_.Exception.Message -notlike "*not canonically LF-terminated*") { throw }
+                }
+            }
+            [IO.File]::WriteAllText($pointerPath, $pointerRaw, $Utf8NoBom)
+            Set-Item -Path Function:Get-CurrentPointerHmac -Value $currentPointerHmacImplementation
+            $BackupDirectory = $acceptanceBackupDirectory
+
             $generationInventoryRoot = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "generation-inventory-powershell"
             [IO.Directory]::CreateDirectory($generationInventoryRoot) | Out-Null
             $generationInventory = Join-Path $generationInventoryRoot "archive-generation-ids.txt"
@@ -3068,7 +3370,27 @@ if command -v pwsh >/dev/null 2>&1; then
             $verified = Join-Path (Join-Path $BackupDirectory $acceptanceId) "VERIFIED"
             Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue
             $journalReceipt = Join-Path (Join-Path $BackupDirectory $acceptanceId) "JOURNAL_CONFIRMED"
+            $acceptanceStateSha = (Get-FileHash -LiteralPath (Join-Path (Join-Path $BackupDirectory $acceptanceId) "oscar-state.tar.gz") -Algorithm SHA256).Hash.ToLowerInvariant()
             $validJournalReceipt = [IO.File]::ReadAllText($journalReceipt)
+            [IO.File]::WriteAllText($journalReceipt, $validJournalReceipt.TrimEnd([char[]]"`r`n"), $Utf8NoBom)
+            try {
+                Confirm-JournalConfirmationReceipt (Join-Path $BackupDirectory $acceptanceId) $acceptanceId $acceptanceStateSha "oscar:test"
+                throw "PowerShell journal confirmation accepted a missing final LF"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell journal confirmation accepted a missing final LF") { throw }
+                if ($_.Exception.Message -notlike "*not canonically LF-terminated*") { throw }
+            }
+            foreach ($encoding in $nonCanonicalMetadataEncodings) {
+                [IO.File]::WriteAllText($journalReceipt, $validJournalReceipt, $encoding)
+                try {
+                    Confirm-JournalConfirmationReceipt (Join-Path $BackupDirectory $acceptanceId) $acceptanceId $acceptanceStateSha "oscar:test"
+                    throw "PowerShell journal confirmation accepted noncanonical BOM or UTF-16 bytes"
+                } catch {
+                    if ($_.Exception.Message -eq "PowerShell journal confirmation accepted noncanonical BOM or UTF-16 bytes") { throw }
+                    if ($_.Exception.Message -notlike "*not canonically LF-terminated*") { throw }
+                }
+            }
+            [IO.File]::WriteAllText($journalReceipt, $validJournalReceipt, $Utf8NoBom)
             [IO.File]::WriteAllText($journalReceipt, "corrupt receipt`n", $Utf8NoBom)
             Confirm-Backup $acceptanceId -WarningAction SilentlyContinue
             if (-not (Test-Path -LiteralPath $verified -PathType Leaf)) {
@@ -3081,11 +3403,61 @@ if command -v pwsh >/dev/null 2>&1; then
                 ((Get-Item -LiteralPath $verified).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "PowerShell authenticated journal receipt did not produce VERIFIED"
             }
+            Confirm-BackupAcceptanceSidecars (Join-Path $BackupDirectory $acceptanceId) $acceptanceId $acceptanceStateSha "oscar:test"
+            $validVerifiedMarker = [IO.File]::ReadAllText($verified)
+            [IO.File]::WriteAllText($verified, $validVerifiedMarker + "`n", $Utf8NoBom)
+            try {
+                Confirm-BackupAcceptanceSidecars (Join-Path $BackupDirectory $acceptanceId) $acceptanceId $acceptanceStateSha "oscar:test"
+                throw "PowerShell VERIFIED marker accepted more than one final LF"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell VERIFIED marker accepted more than one final LF") { throw }
+                if ($_.Exception.Message -notlike "*VERIFIED marker is malformed*") { throw }
+            }
+            foreach ($encoding in $nonCanonicalMetadataEncodings) {
+                [IO.File]::WriteAllText($verified, $validVerifiedMarker, $encoding)
+                try {
+                    Confirm-BackupAcceptanceSidecars (Join-Path $BackupDirectory $acceptanceId) $acceptanceId $acceptanceStateSha "oscar:test"
+                    throw "PowerShell VERIFIED marker accepted noncanonical BOM or UTF-16 bytes"
+                } catch {
+                    if ($_.Exception.Message -eq "PowerShell VERIFIED marker accepted noncanonical BOM or UTF-16 bytes") { throw }
+                    if ($_.Exception.Message -notlike "*VERIFIED marker is malformed*") { throw }
+                }
+            }
+            [IO.File]::WriteAllText($verified, $validVerifiedMarker, $Utf8NoBom)
+            [IO.File]::WriteAllText($journalReceipt, "forged receipt`n", $Utf8NoBom)
+            try {
+                Confirm-BackupAcceptanceSidecars (Join-Path $BackupDirectory $acceptanceId) $acceptanceId $acceptanceStateSha "oscar:test"
+                throw "PowerShell accepted a forged VERIFIED marker without a valid journal receipt"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell accepted a forged VERIFIED marker without a valid journal receipt") { throw }
+            }
+            [IO.File]::WriteAllText($journalReceipt, $validJournalReceipt, $Utf8NoBom)
             Remove-Item -LiteralPath $verified -Force
             function Write-VerifiedMarker([string]$Root) { throw "read-only wrote VERIFIED" }
             function Set-VerifiedBackupEpochReceipt([string]$Root,[string]$Id,[string]$EpochId,[string]$PostgresLsn) { throw "read-only wrote catalog" }
+            function Assert-BackupCleanupAcl([string]$Path, [string]$Description) {}
+            $acceptanceRoot = Join-Path $BackupDirectory $acceptanceId
+            $acceptanceTemporary = Join-Path $acceptanceRoot ".VERIFIED.0123456789abcdef0123456789abcdef"
+            [IO.File]::WriteAllText($acceptanceTemporary, "interrupted acceptance publication", $Utf8NoBom)
             Confirm-Backup $acceptanceId -ReadOnly
-            if (Test-Path -LiteralPath $verified) { throw "PowerShell read-only verification mutated acceptance state" }
+            if ((Test-Path -LiteralPath $verified) -or -not (Test-Path -LiteralPath $acceptanceTemporary -PathType Leaf)) {
+                throw "PowerShell read-only verification mutated acceptance state"
+            }
+            Remove-BackupAcceptanceTemporaries $acceptanceRoot $acceptanceId
+            if (Test-Path -LiteralPath $acceptanceTemporary) {
+                throw "PowerShell did not recover a safe crash-left acceptance temporary"
+            }
+            $unsafeAcceptanceTemporary = Join-Path $acceptanceRoot ".JOURNAL_CONFIRMED.0123456789abcdef0123456789abcdef"
+            [IO.Directory]::CreateDirectory($unsafeAcceptanceTemporary) | Out-Null
+            try {
+                Confirm-Backup $acceptanceId -ReadOnly
+                throw "PowerShell core verification ignored an unsafe acceptance temporary"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell core verification ignored an unsafe acceptance temporary") { throw }
+                if ($_.Exception.Message -notlike "*Backup acceptance temporary is unsafe*") { throw }
+            } finally {
+                Remove-Item -LiteralPath $unsafeAcceptanceTemporary -Recurse -Force
+            }
 
             $foreignGuard = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "FOREIGN-GUARD-RAN-PS"
             $unsafeForeignVerified = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "UNSAFE-FOREIGN-VERIFIED-PS"
@@ -3411,34 +3783,37 @@ if command -v pwsh >/dev/null 2>&1; then
             }
 
             $script:AuthenticatedRecoveryCandidates = New-Object System.Collections.Generic.List[string]
+            $script:CorruptCurrentAcceptance = $false
             function Confirm-Backup(
                 [string]$Id,
                 [switch]$ReadOnly,
                 [string]$RootOverride,
                 [switch]$RequireAcceptance
             ) {
-                if (-not $ReadOnly -or $RequireAcceptance) {
-                    throw "No-CURRENT recovery did not request read-only candidate authentication"
+                if (-not $ReadOnly -or -not $RequireAcceptance -or $RootOverride) {
+                    throw "CURRENT recovery did not request strict read-only acceptance verification"
                 }
-                $root = [IO.Path]::GetFullPath($RootOverride)
-                $expectedFinal = [IO.Path]::GetFullPath((Join-Path $BackupDirectory $Id))
-                $expectedDeleting = [IO.Path]::GetFullPath((Join-Path $BackupDirectory ".deleting-$Id"))
-                if ($root -cne $expectedFinal -and $root -cne $expectedDeleting) {
-                    throw "No-CURRENT recovery authenticated an unconfined candidate root: $root"
-                }
-                $script:AuthenticatedRecoveryCandidates.Add("$Id|$([IO.Path]::GetFileName($root))")
+                if ($script:CorruptCurrentAcceptance) { throw "corrupt CURRENT journal-confirmation receipt" }
             }
-            function Read-ValidatedBackupEpoch([string]$Root, [string]$Id) {
-                $schemaPath = Join-Path $Root "schema-version.txt"
-                if (-not (Test-Path -LiteralPath $schemaPath -PathType Leaf)) {
-                    throw "Fixture candidate was classified before authentication: $Root"
+            function Get-BackupCleanupDisposition([string]$Id, [string]$Root) {
+                $classificationPath = Join-Path $Root "cleanup-state.txt"
+                if (-not (Test-Path -LiteralPath $classificationPath -PathType Leaf)) {
+                    return [pscustomobject]@{ State = "Preserve"; Reason = "incomplete or unauthenticated core" }
                 }
-                return [pscustomobject]@{ SchemaVersion = [int][IO.File]::ReadAllText($schemaPath) }
+                $state = [IO.File]::ReadAllText($classificationPath)
+                $script:AuthenticatedRecoveryCandidates.Add("$Id|$([IO.Path]::GetFileName($Root))|$state")
+                if ($state -ceq "Accepted") {
+                    return [pscustomobject]@{ State = "Accepted"; Reason = "authenticated accepted schema-version-2 recovery point" }
+                }
+                if ($state -ceq "Legacy") {
+                    return [pscustomobject]@{ State = "Legacy"; Reason = "legacy schema-version-1 recovery point" }
+                }
+                return [pscustomobject]@{ State = "Preserve"; Reason = $state }
             }
-            function New-RecoveryCandidate([string]$Name, [int]$SchemaVersion) {
+            function New-RecoveryCandidate([string]$Name, [string]$CleanupState) {
                 $root = Join-Path $BackupDirectory $Name
                 [IO.Directory]::CreateDirectory($root) | Out-Null
-                [IO.File]::WriteAllText((Join-Path $root "schema-version.txt"), [string]$SchemaVersion)
+                [IO.File]::WriteAllText((Join-Path $root "cleanup-state.txt"), $CleanupState)
             }
             $script:RecoveryMoveDestinations = New-Object System.Collections.Generic.List[string]
             function Move-DurableNoReplace([string]$Source, [string]$Destination) {
@@ -3475,80 +3850,113 @@ if command -v pwsh >/dev/null 2>&1; then
             [IO.File]::Delete($danglingPointer)
             Remove-Item -LiteralPath (Join-Path $BackupDirectory $danglingCurrentCandidate) -Recurse -Force
 
+            $script:CurrentRecoveryId = $null
+            function Read-CurrentBackupId([switch]$AllowMissing) { return $script:CurrentRecoveryId }
+            function Write-CurrentBackupPointer([string]$Id, [string]$Image) {
+                $script:CurrentRecoveryId = $Id
+                [IO.File]::WriteAllText((Join-Path $BackupDirectory "CURRENT"), "fixture")
+            }
+            function Get-OscarImage { return "oscar:test" }
+
             $v2FinalA = "20261020T120000Z-11111111"
             $v2FinalB = "20261020T130000Z-22222222"
             $v2Tombstone = "20261020T140000Z-33333333"
             $v1Final = "20261020T150000Z-44444444"
             $v1Tombstone = "20261020T160000Z-55555555"
             $v2UncommittedTombstone = "20261020T170000Z-66666666"
-            New-RecoveryCandidate $v2FinalA 2
-            New-RecoveryCandidate $v2FinalB 2
-            New-RecoveryCandidate ".deleting-$v2Tombstone" 2
-            New-RecoveryCandidate $v1Final 1
-            New-RecoveryCandidate ".deleting-$v1Tombstone" 1
+            New-RecoveryCandidate $v2FinalA "Accepted"
+            $adoptedAcceptanceTemporary = Join-Path (Join-Path $BackupDirectory $v2FinalA) ".VERIFIED.0123456789abcdef0123456789abcdef"
+            [IO.File]::WriteAllText($adoptedAcceptanceTemporary, "interrupted acceptance publication")
+            New-RecoveryCandidate $v2FinalB "failed finalized schema-version-2 core"
+            New-RecoveryCandidate ".deleting-$v2Tombstone" "forged VERIFIED marker without valid receipt"
+            New-RecoveryCandidate $v1Final "Legacy"
+            New-RecoveryCandidate ".deleting-$v1Tombstone" "Legacy"
             $partialUncommittedTombstone = Join-Path $BackupDirectory ".deleting-uncommitted-v2-$v2UncommittedTombstone"
             [IO.Directory]::CreateDirectory($partialUncommittedTombstone) | Out-Null
             [IO.File]::WriteAllText((Join-Path $partialUncommittedTombstone "partially-removed-payload"), "fragment")
 
-            Invoke-SingleBackupRecoveryCleanup
-            foreach ($retired in @(
-                    $v2FinalA, $v2FinalB, ".deleting-$v2Tombstone",
-                    ".deleting-uncommitted-v2-$v2Tombstone",
-                    ".deleting-uncommitted-v2-$v2UncommittedTombstone")) {
-                if (Test-Path -LiteralPath (Join-Path $BackupDirectory $retired)) {
-                    throw "PowerShell retained an authenticated schema-version-2 failed-first-backup candidate: $retired"
-                }
+            $partialId = "20261020T180000Z-77777777"
+            New-RecoveryCandidate "$partialId.partial" "incomplete partial"
+            $firstWarnings = @(Invoke-SingleBackupRecoveryCleanup 3>&1 | ForEach-Object { [string]$_ })
+            if ($script:CurrentRecoveryId -cne $v2FinalA -or
+                -not (Test-Path -LiteralPath (Join-Path $BackupDirectory $v2FinalA) -PathType Container) -or
+                (Test-Path -LiteralPath $adoptedAcceptanceTemporary)) {
+                throw "PowerShell did not adopt the sole accepted schema-version-2 candidate as CURRENT"
             }
-            foreach ($preserved in @($v1Final, $v1Tombstone)) {
+            foreach ($preserved in @(
+                    $v2FinalB, ".deleting-$v2Tombstone", ".deleting-uncommitted-v2-$v2UncommittedTombstone",
+                    "$partialId.partial", $v1Final, $v1Tombstone)) {
                 if (-not (Test-Path -LiteralPath (Join-Path $BackupDirectory $preserved) -PathType Container)) {
-                    throw "PowerShell did not preserve or restore schema-version-1 backup: $preserved"
+                    throw "PowerShell removed a failed, forged, partial, uncommitted, or legacy recovery candidate: $preserved"
                 }
             }
             if (Test-Path -LiteralPath (Join-Path $BackupDirectory ".deleting-$v1Tombstone")) {
                 throw "PowerShell left a restored schema-version-1 backup in tombstone form"
             }
-            $expectedFirstAuthentication = @(
-                "$v2FinalA|$v2FinalA",
-                "$v2FinalB|$v2FinalB",
-                "$v2Tombstone|.deleting-$v2Tombstone",
-                "$v1Final|$v1Final",
-                "$v1Tombstone|.deleting-$v1Tombstone"
-            ) | Sort-Object
-            $actualFirstAuthentication = @($script:AuthenticatedRecoveryCandidates) | Sort-Object
-            if (($actualFirstAuthentication -join "`n") -cne ($expectedFirstAuthentication -join "`n")) {
-                throw "PowerShell did not authenticate every no-CURRENT recovery candidate exactly once"
-            }
-            foreach ($v2Final in @($v2FinalA, $v2FinalB)) {
-                if ($script:RecoveryMoveDestinations -notcontains ".deleting-uncommitted-v2-$v2Final" -or
-                    $script:RecoveryMoveDestinations -contains ".deleting-$v2Final") {
-                    throw "PowerShell did not use the distinct uncommitted-v2 tombstone for a failed-first-backup final"
+            foreach ($warningText in @(
+                    "Preserving backup candidate for operator review",
+                    "Preserving backup deletion tombstone for operator review",
+                    "Preserving legacy schema-version-1 recovery point",
+                    "Preserving incomplete backup staging candidate",
+                    "Preserving legacy uncommitted schema-version-2 deletion tombstone")) {
+                if (-not (($firstWarnings -join "`n").Contains($warningText))) {
+                    throw "PowerShell cleanup did not emit preservation warning: $warningText"
                 }
-            }
-            if ($script:RecoveryMoveDestinations -notcontains ".deleting-uncommitted-v2-$v2Tombstone") {
-                throw "PowerShell did not migrate an authenticated generic schema-version-2 tombstone before removal"
-            }
-            if (@($script:AuthenticatedRecoveryCandidates |
-                    Where-Object { $_.StartsWith("$v2UncommittedTombstone|", [StringComparison]::Ordinal) }).Count -ne 0) {
-                throw "PowerShell re-authenticated a partially removed uncommitted-v2 tombstone"
             }
 
-            Invoke-SingleBackupRecoveryCleanup
-            if (@(Get-ChildItem -LiteralPath $BackupDirectory -Directory -Force |
-                    Where-Object { $_.Name -cmatch "^\\.deleting-" -or $_.Name -in @($v2FinalA, $v2FinalB) }).Count -ne 0) {
-                throw "PowerShell repeated no-CURRENT cleanup left retired schema-version-2 recovery debris"
+            $acceptedTombstone = "20261020T190000Z-88888888"
+            New-RecoveryCandidate ".deleting-$acceptedTombstone" "Accepted"
+            Invoke-SingleBackupRecoveryCleanup 3>$null
+            if (Test-Path -LiteralPath (Join-Path $BackupDirectory ".deleting-$acceptedTombstone")) {
+                throw "PowerShell retained a fully authenticated accepted deletion tombstone"
             }
-            if ($script:AuthenticatedRecoveryCandidates.Count -ne 7 -or
-                @($script:AuthenticatedRecoveryCandidates | Where-Object { $_ -ceq "$v1Final|$v1Final" }).Count -ne 2 -or
-                @($script:AuthenticatedRecoveryCandidates | Where-Object { $_ -ceq "$v1Tombstone|$v1Tombstone" }).Count -ne 1) {
-                throw "PowerShell repeated no-CURRENT cleanup did not re-authenticate only preserved schema-version-1 backups"
-            }
-            foreach ($preserved in @($v1Final, $v1Tombstone)) {
+            foreach ($preserved in @($v2FinalB, ".deleting-$v2Tombstone", $v1Final, $v1Tombstone, "$partialId.partial")) {
                 if (-not (Test-Path -LiteralPath (Join-Path $BackupDirectory $preserved) -PathType Container)) {
-                    throw "PowerShell repeated no-CURRENT cleanup removed a schema-version-1 backup: $preserved"
+                    throw "PowerShell post-CURRENT cleanup removed an unauthorized recovery candidate: $preserved"
                 }
             }
-            if (Test-Path -LiteralPath (Join-Path $BackupDirectory "CURRENT")) {
-                throw "PowerShell no-CURRENT recovery unexpectedly created or changed CURRENT"
+
+            $corruptReceiptCandidate = "20261020T200000Z-99999999"
+            New-RecoveryCandidate $corruptReceiptCandidate "Accepted"
+            $script:CorruptCurrentAcceptance = $true
+            try {
+                Invoke-SingleBackupRecoveryCleanup 3>$null
+                throw "PowerShell cleanup accepted CURRENT with a corrupt journal-confirmation receipt"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell cleanup accepted CURRENT with a corrupt journal-confirmation receipt") { throw }
+                if ($_.Exception.Message -notlike "*corrupt CURRENT journal-confirmation receipt*") { throw }
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $BackupDirectory $corruptReceiptCandidate) -PathType Container)) {
+                throw "PowerShell mutated a candidate after CURRENT acceptance verification failed"
+            }
+
+            $BackupDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "single-recovery-ambiguous-powershell"
+            [IO.Directory]::CreateDirectory($BackupDirectory) | Out-Null
+            $script:CurrentRecoveryId = $null
+            $script:CorruptCurrentAcceptance = $false
+            $ambiguousA = "20261020T210000Z-aaaaaaaa"
+            $ambiguousB = "20261020T220000Z-bbbbbbbb"
+            New-RecoveryCandidate $ambiguousA "Accepted"
+            New-RecoveryCandidate $ambiguousB "Accepted"
+            $ambiguousPointerTemp = Join-Path $BackupDirectory ".CURRENT.tmp.0123456789abcdef0123456789abcdef"
+            [IO.File]::WriteAllText($ambiguousPointerTemp, "interrupted pointer evidence")
+            $ambiguousScratch = Join-Path $BackupDirectory ".journal-confirm-$ambiguousA-0123456789abcdef0123456789abcdef"
+            [IO.Directory]::CreateDirectory($ambiguousScratch) | Out-Null
+            try {
+                Invoke-SingleBackupRecoveryCleanup 3>$null
+                throw "PowerShell cleanup chose between multiple accepted candidates without CURRENT"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell cleanup chose between multiple accepted candidates without CURRENT") { throw }
+                if ($_.Exception.Message -notlike "*Cannot reconstruct CURRENT unambiguously*") { throw }
+            }
+            foreach ($preserved in @($ambiguousA, $ambiguousB)) {
+                if (-not (Test-Path -LiteralPath (Join-Path $BackupDirectory $preserved) -PathType Container)) {
+                    throw "PowerShell ambiguous no-CURRENT cleanup removed accepted candidate: $preserved"
+                }
+            }
+            if (-not (Test-Path -LiteralPath $ambiguousPointerTemp -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $ambiguousScratch -PathType Container)) {
+                throw "PowerShell ambiguous no-CURRENT cleanup removed crash evidence before failing closed"
             }
         ' >/dev/null
 

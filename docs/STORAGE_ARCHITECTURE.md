@@ -33,9 +33,9 @@ deployment and storage commands fail closed there.
 | --- | --- | --- | --- |
 | Recent observations and OSH metadata | PostgreSQL `postgres_data` volume | Tiered OSH database | Only allowlisted high-volume detector streams become cold-tier eligible after 48 hours; all other observations and business records remain in PostgreSQL |
 | Cold detector observations | `${OSCAR_ARCHIVE_DIR}` bind mount | Tiered OSH database and archive catalog | Immutable Parquet generation plus manifest and schema snapshot |
-| Daily-file source journal | `files/.dailyfile-journal` in `oscar_state` | Daily File Journal service | Per-lane framed segments and publication ledger |
+| Daily-file source journal | `files/.dailyfile-journal` in `oscar_state` | Daily File Journal service | Per-lane framed segments and publication ledger; private sealed segments expire after 30 days only after immutable-publication validation and exact frozen replay, with an optional additional backup gate |
 | Published daily files | `files/dailyfiles` in `oscar_state` | Daily File Journal service | Immutable legacy CSV plus versioned SHA-256 manifest |
-| Current alarm video | `files/videos` in `oscar_state` | Bucket and OSCAR services | Five-JPEG conversion begins on the first eligible lifecycle cycle; source MP4 remains for 24 hours after verified publication |
+| Current alarm video | `files/videos` in `oscar_state` | Bucket and OSCAR services | Five-JPEG conversion becomes eligible after one day; source MP4 remains for 24 hours after verified publication |
 | Retained alarm media | `files/videos/retained-media/v1` in `oscar_state` | Retained-media backend | Exactly five JPEGs, manifest, and job ledger |
 | Reports, adjudication artifacts, sitemap | Bucket directories in `oscar_state` | Bucket and OSCAR services | Not deleted by cold-observation or storage-pressure maintenance |
 | Legacy PostgreSQL WAL root | Preserved `${OSCAR_WAL_ARCHIVE_DIR}` host path, when present | Administrator legacy data | Not mounted or read by current restore; retained unchanged only to avoid destructive upgrade behavior, not a current PITR chain |
@@ -144,13 +144,15 @@ replaces the four-line HMAC-authenticated `CURRENT` pointer. The previous curren
 authoritative until that commit. Schema-v1 media retain an explicit compatibility verifier/restore
 path and are never silently treated as v2.
 The one-snapshot invariant is steady state: replacement temporarily needs space for old and new,
-and the next locked command reconciles non-current or staging debris after a crash by trusting the
-authenticated pointer. If the first schema-v2 attempt failed before any pointer existed, cleanup
-authenticates each published candidate and retires only schema-v2 work; legacy schema-v1 recovery
-points and interrupted legacy deletion tombstones are preserved. Authenticated schema-v2 cleanup
-uses a durable `.deleting-uncommitted-v2-<backup-id>` tombstone so crash recovery can resume removal
-without mistaking a partial directory for an unauthenticated candidate; unsafe `CURRENT` entries
-fail closed before cleanup.
+and the next locked command reconciles non-current debris only after authenticating both `CURRENT`
+and the accepted schema-v2 contents selected for deletion. A finalized name or deletion-tombstone
+name is not authorization by itself. Legacy schema-v1, failed, partial, unauthenticated, unaccepted,
+and partially removed candidates are preserved with warnings. If no pointer exists, one uniquely
+accepted schema-v2 recovery point is adopted by reconstructing authenticated `CURRENT`; multiple
+accepted candidates are preserved and require operator review. Interrupted legacy deletion
+tombstones are restored, while old uncommitted-v2 or incomplete deletion tombstones are preserved
+because their remaining contents cannot prove deletion authorization. Unsafe or acceptance-invalid
+`CURRENT` entries fail closed before cleanup.
 
 Catalog schema v5 adds durable retention-hold resolution provenance and makes holds part of the
 logical mutation boundary. A removal holds the shared store/per-observation locks, takes a shared
@@ -252,8 +254,8 @@ The full journal contract is maintained in the modules repository at
 
 ### Five-frame retained media
 
-With the standard zero-day retention age, each eligible camera clip is processed on the first
-retained-media lifecycle cycle after publication. It is decoded and
+With the standard one-day retention age, each eligible camera clip is processed on a bounded
+retained-media lifecycle cycle after it becomes old enough. It is decoded and
 sampled at `FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`. The five selections must be
 distinct decoded frame ordinals. Each output is an opaque baseline sRGB JPEG; default quality is
 85. Frames are written, forced, decoded and verified independently, then a typed manifest is

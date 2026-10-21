@@ -24,7 +24,7 @@ operations fail closed there.
 6. Open the URL printed by setup, normally `https://oscar.local/sensorhub/admin`.
 
 Setup creates deployment-specific database credentials, defaults `OSCAR_BACKUP_MODE` to `disabled`,
-and persists absolute archive/backup paths under the sibling `oscar-storage` directory. The legacy-WAL
+and persists the absolute archive path (and the backup path only when `single` mode is selected) under the sibling `oscar-storage` directory. The legacy-WAL
 binding is retained only so an upgrade cannot lose track of already existing compatibility data.
 It prepares only the storage required by the selected mode and writes administrator-protected `.oscar-storage-root` identities bound to the
 deployment UUID and root kind, configures TLS, and starts OSCAR automatically. Keeping storage outside the
@@ -142,17 +142,19 @@ unsafe tar members, atomically marks the recovery point `VERIFIED`, and then rec
 only the exact published daily-file segments present in that accepted snapshot. It creates schema
 v2 with required WAL streamed into `postgres/pg_wal` and no cumulative `wal-archive.tar.gz`.
 After full acceptance it atomically replaces the HMAC-authenticated `CURRENT` pointer; only then can
-the previous non-current verified snapshot be removed. A confirmation failure leaves the previous
-`CURRENT` authoritative. The explicit
+the previous non-current fully accepted schema-v2 snapshot be removed. A confirmation failure
+leaves the previous `CURRENT` authoritative. The explicit
 `backup-verify` command can run with PostgreSQL stopped: it uses a one-shot utility container and
 treats the live catalog receipt as optional. Restore additionally requires matching 3.9.2 backup,
 current-release, and backed-up release-config identities plus every exact local Compose image.
 Plan backup capacity for the old snapshot plus one complete replacement: one snapshot is the
 steady-state logical result, not the peak space required while `CURRENT` is changing. If a crash
 leaves a non-current published snapshot or private staging debris, the next locked storage command
-reconciles it from authenticated `CURRENT` before continuing. If no `CURRENT` has ever committed,
-it authenticates and retires only uncommitted schema-v2 candidates and preserves/restores legacy
-schema-v1 recovery points.
+requires a fully authenticated and accepted schema-v2 `CURRENT`, then removes only non-current
+candidates that independently pass the same checks. Schema-v1, failed, partial, unauthenticated,
+unaccepted, and incomplete deletion candidates are preserved with warnings. If no `CURRENT` has
+ever committed, one uniquely accepted schema-v2 candidate is adopted by reconstructing
+authenticated `CURRENT`; multiple accepted candidates are preserved for operator review.
 Use `backup-verify` before an audit, copy, or restore. Schema-v1 backups remain explicitly
 verifiable/restorable and require their historical WAL tar for authentication, but restore ignores
 that external payload because streamed `postgres/pg_wal` is sufficient; v1 is never silently treated as v2.

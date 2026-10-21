@@ -217,7 +217,7 @@ function Get-ValidatedBackupMode {
 
 function Assert-BackupModeEnabled {
     if ((Get-ValidatedBackupMode) -cne 'single') {
-        Fail 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+        Fail 'OSCAR backups are disabled. Re-run upgrade with -BackupMode single -BackupDir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
     }
 }
 
@@ -359,6 +359,24 @@ function Protect-AdministratorFile([string]$Path) {
         [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($principal, $full, $allow))
     }
     Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Test-ExactUtf8NoBomFile([string]$Path, [string]$ExpectedContent) {
+    $expectedBytes = $Utf8NoBom.GetBytes($ExpectedContent)
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -ne $expectedBytes.Length) { return $false }
+        for ($index = 0; $index -lt $expectedBytes.Length; $index++) {
+            if ($stream.ReadByte() -ne $expectedBytes[$index]) { return $false }
+        }
+        return $stream.ReadByte() -eq -1
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function Get-DockerUsersSid {
@@ -1667,6 +1685,10 @@ function Confirm-JournalConfirmationReceipt(
         Fail 'Authenticated journal confirmation receipt does not match this recovery point.'
     }
     $expected = $lines[4].Substring('hmac_sha256='.Length)
+    $expectedRaw = "format=oscar-journal-backup-confirmation`nversion=2`nbackup_id=$Id`noscar_state_sha256=$OscarStateSha256`nhmac_sha256=$expected`n"
+    if (-not (Test-ExactUtf8NoBomFile $receipt $expectedRaw)) {
+        Fail 'Authenticated journal confirmation receipt is not canonically LF-terminated.'
+    }
     if ((Get-JournalConfirmationHmac $receipt $Image) -cne $expected) {
         Fail 'Journal-confirmation receipt authentication failed.'
     }
@@ -1711,7 +1733,6 @@ function Read-CurrentBackupId([switch]$AllowMissing) {
         Fail 'CURRENT backup pointer is not a regular file.'
     }
     Assert-AdministratorFile $pointerItem.FullName 'CURRENT backup pointer'
-    $raw = [IO.File]::ReadAllText($pointer)
     $lines = @([IO.File]::ReadAllLines($pointer))
     if ($lines.Count -ne 4 -or $lines[0] -cne 'format=oscar-current-backup' -or $lines[1] -cne 'version=1' -or
         $lines[2] -cnotmatch '^backup_id=([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$' -or
@@ -1720,7 +1741,9 @@ function Read-CurrentBackupId([switch]$AllowMissing) {
     }
     $id = $lines[2].Substring('backup_id='.Length)
     $expectedRaw = "format=oscar-current-backup`nversion=1`nbackup_id=$id`nhmac_sha256=$($lines[3].Substring('hmac_sha256='.Length))`n"
-    if ($raw -cne $expectedRaw) { Fail 'CURRENT backup pointer is not canonically LF-terminated.' }
+    if (-not (Test-ExactUtf8NoBomFile $pointer $expectedRaw)) {
+        Fail 'CURRENT backup pointer is not canonically LF-terminated.'
+    }
     $expected = $lines[3].Substring('hmac_sha256='.Length)
     if ((Get-CurrentPointerHmac $pointer (Get-OscarImage)) -cne $expected) {
         Fail 'CURRENT backup pointer authentication failed.'
@@ -2065,9 +2088,20 @@ function Confirm-BackupManifestInventory([string]$Root, [string[]]$ManifestPaths
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             Fail "Backup contains a reparse point: $($item.FullName)"
         }
+        $relative = $item.FullName.Substring($Root.Length).TrimStart('\', '/').Replace('\', '/')
+        if ($relative.StartsWith('.VERIFIED.', [StringComparison]::Ordinal) -or
+            $relative.StartsWith('.JOURNAL_CONFIRMED.', [StringComparison]::Ordinal)) {
+            if ($relative -cnotmatch '^\.(VERIFIED|JOURNAL_CONFIRMED)\.[0-9a-f]{32}$') {
+                Fail "Malformed backup acceptance temporary was preserved: $($item.FullName)"
+            }
+            if ($item.PSIsContainer -or $item -isnot [IO.FileInfo]) {
+                Fail "Backup acceptance temporary is unsafe: $($item.FullName)"
+            }
+            Assert-BackupCleanupAcl $item.FullName 'backup acceptance temporary'
+            continue
+        }
         if ($item.PSIsContainer) { continue }
         if ($item -isnot [IO.FileInfo]) { Fail "Backup contains a non-regular entry: $($item.FullName)" }
-        $relative = $item.FullName.Substring($Root.Length).TrimStart('\', '/').Replace('\', '/')
         if ($relative -in @('VERIFIED','JOURNAL_CONFIRMED','SHA256SUMS','SHA256SUMS.hmac')) { continue }
         if (-not (Test-RelativeObjectPath $relative)) { Fail "Unsafe backup filesystem path: $relative" }
         $actual.Add($relative)
@@ -2115,6 +2149,22 @@ function Read-ValidatedBackupEpoch([string]$Root, [string]$Id) {
     if ([string]$epoch.oscarVersion -cne $RequiredReleaseVersion) { Fail "Backup epoch must identify OSCAR $RequiredReleaseVersion." }
     if ([string]$epoch.postgresLsn -notmatch '^[0-9A-F]+/[0-9A-F]+$') { Fail 'Backup epoch PostgreSQL LSN is invalid.' }
     return [pscustomobject]@{ Epoch = $epoch; Raw = $epochRaw; SchemaVersion = $schemaVersion }
+}
+
+function Confirm-BackupAcceptanceSidecars(
+    [string]$Root,
+    [string]$Id,
+    [string]$OscarStateSha256,
+    [string]$Image
+) {
+    $marker = Join-Path $Root 'VERIFIED'
+    Assert-AdministratorFile $marker 'VERIFIED marker'
+    $markerRaw = [IO.File]::ReadAllText($marker)
+    if ($markerRaw -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\n\z' -or
+        -not (Test-ExactUtf8NoBomFile $marker $markerRaw)) {
+        Fail 'VERIFIED marker is malformed.'
+    }
+    Confirm-JournalConfirmationReceipt $Root $Id $OscarStateSha256 $Image
 }
 
 function Confirm-Backup(
@@ -2180,19 +2230,15 @@ function Confirm-Backup(
     Confirm-BackupArchiveMembers $root $image $schemaVersion
     Confirm-ImageInventory $root
     $epoch = $epochInfo.Epoch
-    $journalReceipt = Join-Path $root 'JOURNAL_CONFIRMED'
-    if (Test-Path -LiteralPath $journalReceipt) {
-        if ($RequireAcceptance) {
-            Confirm-JournalConfirmationReceipt $root $Id $oscarStateSha256 $image
-        } else {
+    if ($RequireAcceptance) {
+        if ($schemaVersion -ne 2) { Fail 'Single-backup acceptance requires schema version 2.' }
+        Confirm-BackupAcceptanceSidecars $root $Id $oscarStateSha256 $image
+    } else {
+        $journalReceipt = Join-Path $root 'JOURNAL_CONFIRMED'
+        if (Test-Path -LiteralPath $journalReceipt) {
             try { Confirm-JournalConfirmationReceipt $root $Id $oscarStateSha256 $image }
             catch { Write-Warning "Post-verification journal-confirmation audit sidecar is invalid; the authenticated recovery core remains usable: $($_.Exception.Message)" }
         }
-    } elseif ($RequireAcceptance -and $schemaVersion -eq 2) {
-        Fail 'Accepted schema-version-2 backup is missing JOURNAL_CONFIRMED.'
-    }
-    if ($RequireAcceptance) {
-        Assert-AdministratorFile (Join-Path $root 'VERIFIED') 'VERIFIED marker'
     }
     if (-not $ReadOnly) {
         $postgresRunning = $false
@@ -2217,6 +2263,33 @@ function Confirm-Backup(
         Protect-DockerStorageDirectory $root 'ReadOnly'
         Write-Host "Backup verified: $root" -ForegroundColor Green
     }
+}
+
+function Get-BackupCleanupDisposition([string]$Id, [string]$Root) {
+    try {
+        $null = Confirm-Backup $Id -ReadOnly -RootOverride $Root -WarningAction SilentlyContinue
+    } catch {
+        return [pscustomobject]@{ State = 'Preserve'; Reason = "incomplete or unauthenticated core: $($_.Exception.Message)" }
+    }
+    $epochInfo = Read-ValidatedBackupEpoch $Root $Id
+    if ([int]$epochInfo.SchemaVersion -eq 1) {
+        return [pscustomobject]@{ State = 'Legacy'; Reason = 'legacy schema-version-1 recovery point' }
+    }
+    if ([int]$epochInfo.SchemaVersion -ne 2) {
+        return [pscustomobject]@{ State = 'Preserve'; Reason = 'unsupported authenticated backup schema' }
+    }
+
+    $stateLines = @([IO.File]::ReadAllLines((Join-Path $Root 'SHA256SUMS')) |
+        Where-Object { $_ -cmatch '^[0-9a-f]{64}  \./oscar-state\.tar\.gz$' })
+    if ($stateLines.Count -ne 1) {
+        return [pscustomobject]@{ State = 'Preserve'; Reason = 'authenticated OSCAR-state checksum is missing' }
+    }
+    try {
+        Confirm-BackupAcceptanceSidecars $Root $Id $stateLines[0].Substring(0, 64) (Get-OscarImage)
+    } catch {
+        return [pscustomobject]@{ State = 'Preserve'; Reason = "schema-version-2 acceptance is invalid: $($_.Exception.Message)" }
+    }
+    return [pscustomobject]@{ State = 'Accepted'; Reason = 'authenticated accepted schema-version-2 recovery point' }
 }
 
 function Assert-BackupCleanupAcl([string]$Path, [string]$Description) {
@@ -2303,8 +2376,8 @@ function Invoke-SingleBackupRecoveryCleanup {
     $currentId = Read-CurrentBackupId -AllowMissing
     if ($currentId) {
         $currentRoot = Join-Path $BackupDirectory $currentId
-        Remove-BackupAcceptanceTemporaries $currentRoot $currentId
         Confirm-Backup $currentId -ReadOnly -RequireAcceptance
+        Remove-BackupAcceptanceTemporaries $currentRoot $currentId
     }
 
     $pointerTemps = New-Object System.Collections.Generic.List[object]
@@ -2316,8 +2389,8 @@ function Invoke-SingleBackupRecoveryCleanup {
     $snapshotCandidates = New-Object System.Collections.Generic.List[object]
     $deletingSnapshotsToRemove = New-Object System.Collections.Generic.List[object]
     $deletingSnapshotsToRestore = New-Object System.Collections.Generic.List[object]
-    $deletingSnapshotsToMigrateUncommittedV2 = New-Object System.Collections.Generic.List[object]
     $snapshotCandidatesToRemove = New-Object System.Collections.Generic.List[object]
+    $acceptedWithoutCurrent = New-Object System.Collections.Generic.List[object]
     $deletingPartialIds = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
     $deletingSnapshotIds = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
     $deletingUncommittedV2Ids = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
@@ -2379,9 +2452,11 @@ function Invoke-SingleBackupRecoveryCleanup {
             Fail "Both live and deleting partial directories exist for backup $($partial.Id)."
         }
         Assert-SafeBackupCleanupDirectory $partial.Item.FullName $partial.Item.Name 'backup partial'
+        Write-Warning "Preserving incomplete backup staging candidate for operator review: $($partial.Item.FullName)"
     }
     foreach ($partial in $deletingPartialDirectories) {
         Assert-SafeBackupCleanupDirectory $partial.Item.FullName $partial.Item.Name 'deleting backup partial'
+        Write-Warning "Preserving interrupted partial-backup deletion tombstone for operator review: $($partial.Item.FullName)"
     }
     foreach ($scratch in $scratchDirectories) {
         Assert-SafeBackupCleanupDirectory $scratch.FullName $scratch.Name 'backup recovery scratch directory'
@@ -2400,54 +2475,52 @@ function Invoke-SingleBackupRecoveryCleanup {
     foreach ($deleting in $deletingUncommittedV2Snapshots) {
         if ($deleting.Id -ceq $currentId) { Fail 'Refusing to delete an uncommitted tombstone whose ID matches CURRENT.' }
         Assert-SafeBackupCleanupDirectory $deleting.Item.FullName $deleting.Item.Name 'deleting uncommitted schema-version-2 snapshot'
+        Write-Warning "Preserving legacy uncommitted schema-version-2 deletion tombstone for operator review: $($deleting.Item.FullName)"
     }
     foreach ($deleting in $deletingSnapshots) {
         Assert-SafeBackupCleanupDirectory $deleting.Item.FullName $deleting.Item.Name 'deleting backup snapshot'
+        $disposition = Get-BackupCleanupDisposition $deleting.Id $deleting.Item.FullName
         if ($currentId) {
             if ($deleting.Id -ceq $currentId) { Fail 'Refusing to delete the authenticated CURRENT backup tombstone.' }
-            $deletingSnapshotsToRemove.Add($deleting)
+            if ($disposition.State -ceq 'Accepted') {
+                $deletingSnapshotsToRemove.Add($deleting)
+            } else {
+                Write-Warning "Preserving backup deletion tombstone for operator review ($($disposition.Reason)): $($deleting.Item.FullName)"
+            }
             continue
         }
-        Remove-BackupAcceptanceTemporaries $deleting.Item.FullName $deleting.Item.Name
-        Confirm-Backup $deleting.Id -ReadOnly -RootOverride $deleting.Item.FullName
-        $epochInfo = Read-ValidatedBackupEpoch $deleting.Item.FullName $deleting.Id
-        if ([int]$epochInfo.SchemaVersion -eq 1) {
+        if ($disposition.State -ceq 'Legacy') {
             $deletingSnapshotsToRestore.Add($deleting)
-        } elseif ([int]$epochInfo.SchemaVersion -eq 2) {
-            $deletingSnapshotsToMigrateUncommittedV2.Add($deleting)
+        } elseif ($disposition.State -ceq 'Accepted') {
+            $acceptedWithoutCurrent.Add([pscustomobject]@{ Item = $deleting.Item; Id = $deleting.Id; IsTombstone = $true })
         } else {
-            Fail "Authenticated backup has an unsupported schema version: $($deleting.Item.FullName)"
+            Write-Warning "Preserving backup deletion tombstone for operator review ($($disposition.Reason)): $($deleting.Item.FullName)"
         }
     }
     foreach ($candidate in $snapshotCandidates) {
         Assert-SafeBackupCleanupDirectory $candidate.FullName $candidate.Name 'non-current backup snapshot'
-        Remove-BackupAcceptanceTemporaries $candidate.FullName $candidate.Name
-        Confirm-Backup $candidate.Name -ReadOnly -RootOverride $candidate.FullName
-        if ($currentId) {
-            $snapshotCandidatesToRemove.Add($candidate)
-            continue
+        $disposition = Get-BackupCleanupDisposition $candidate.Name $candidate.FullName
+        if ($disposition.State -ceq 'Accepted') {
+            if ($currentId) {
+                $snapshotCandidatesToRemove.Add($candidate)
+            } else {
+                $acceptedWithoutCurrent.Add([pscustomobject]@{ Item = $candidate; Id = $candidate.Name; IsTombstone = $false })
+            }
+        } elseif ($disposition.State -ceq 'Legacy') {
+            Write-Warning "Preserving legacy schema-version-1 recovery point: $($candidate.FullName)"
+        } else {
+            Write-Warning "Preserving backup candidate for operator review ($($disposition.Reason)): $($candidate.FullName)"
         }
-        $epochInfo = Read-ValidatedBackupEpoch $candidate.FullName $candidate.Name
-        if ([int]$epochInfo.SchemaVersion -eq 2) {
-            $snapshotCandidatesToRemove.Add($candidate)
-        } elseif ([int]$epochInfo.SchemaVersion -ne 1) {
-            Fail "Authenticated backup has an unsupported schema version: $($candidate.FullName)"
-        }
+    }
+
+    if (-not $currentId -and $acceptedWithoutCurrent.Count -gt 1) {
+        Write-Warning 'Preserving multiple authenticated accepted schema-version-2 recovery points because CURRENT is missing.'
+        Fail 'Cannot reconstruct CURRENT unambiguously; operator review is required.'
     }
 
     foreach ($pointerTemp in $pointerTemps) {
         Remove-Item -LiteralPath $pointerTemp.FullName -Force
         Sync-DurableMetadata $BackupDirectory
-    }
-    foreach ($partial in $partialDirectories) {
-        $tombstoneName = ".deleting-partial-$($partial.Id)"
-        $tombstone = Join-Path $BackupDirectory $tombstoneName
-        Move-DurableNoReplace $partial.Item.FullName $tombstone
-        Sync-DurableMetadata $BackupDirectory
-        Remove-SafeBackupCleanupDirectory $tombstone $tombstoneName 'deleting backup partial'
-    }
-    foreach ($partial in $deletingPartialDirectories) {
-        Remove-SafeBackupCleanupDirectory $partial.Item.FullName $partial.Item.Name 'deleting backup partial'
     }
     foreach ($scratch in $scratchDirectories) {
         Remove-SafeBackupCleanupDirectory $scratch.FullName $scratch.Name 'backup recovery scratch directory'
@@ -2460,21 +2533,19 @@ function Invoke-SingleBackupRecoveryCleanup {
         Sync-DurableMetadata $BackupDirectory
         Write-Host "Restored authenticated legacy schema-version-1 backup: $($deleting.Id)"
     }
-    foreach ($deleting in $deletingUncommittedV2Snapshots) {
-        $observedCurrentId = Read-CurrentBackupId -AllowMissing
-        if (($currentId -and $observedCurrentId -cne $currentId) -or
-            (-not $currentId -and $null -ne $observedCurrentId)) {
-            Fail 'CURRENT changed during serialized snapshot cleanup.'
+    if (-not $currentId) {
+        if ($acceptedWithoutCurrent.Count -eq 1) {
+            $accepted = $acceptedWithoutCurrent[0]
+            Remove-BackupAcceptanceTemporaries $accepted.Item.FullName $accepted.Item.Name
+            if ($accepted.IsTombstone) {
+                $destination = Join-Path $BackupDirectory $accepted.Id
+                if (Test-Path -LiteralPath $destination) { Fail "Refusing to overwrite a live backup while restoring accepted recovery point: $destination" }
+                Move-DurableNoReplace $accepted.Item.FullName $destination
+                Sync-DurableMetadata $BackupDirectory
+            }
+            Write-CurrentBackupPointer $accepted.Id (Get-OscarImage)
+            Write-Host "Recovered authenticated CURRENT pointer for accepted schema-version-2 backup: $($accepted.Id)"
         }
-        Remove-SafeBackupCleanupDirectory $deleting.Item.FullName $deleting.Item.Name 'deleting uncommitted schema-version-2 snapshot'
-    }
-    foreach ($deleting in $deletingSnapshotsToMigrateUncommittedV2) {
-        if ($null -ne (Read-CurrentBackupId -AllowMissing)) { Fail 'CURRENT appeared during serialized snapshot cleanup.' }
-        $tombstoneName = ".deleting-uncommitted-v2-$($deleting.Id)"
-        $tombstone = Join-Path $BackupDirectory $tombstoneName
-        Move-DurableNoReplace $deleting.Item.FullName $tombstone
-        Sync-DurableMetadata $BackupDirectory
-        Remove-SafeBackupCleanupDirectory $tombstone $tombstoneName 'deleting uncommitted schema-version-2 snapshot'
     }
     foreach ($deleting in $deletingSnapshotsToRemove) {
         $observedCurrentId = Read-CurrentBackupId -AllowMissing
@@ -2490,17 +2561,12 @@ function Invoke-SingleBackupRecoveryCleanup {
             (-not $currentId -and $null -ne $observedCurrentId)) {
             Fail 'CURRENT changed during serialized snapshot cleanup.'
         }
-        $tombstoneName = if ($currentId) {
-            ".deleting-$($candidate.Name)"
-        } else {
-            ".deleting-uncommitted-v2-$($candidate.Name)"
-        }
+        $tombstoneName = ".deleting-$($candidate.Name)"
         $tombstone = Join-Path $BackupDirectory $tombstoneName
         Move-DurableNoReplace $candidate.FullName $tombstone
         Sync-DurableMetadata $BackupDirectory
-        $description = if ($currentId) { 'deleting backup snapshot' } else { 'deleting uncommitted schema-version-2 snapshot' }
-        Remove-SafeBackupCleanupDirectory $tombstone $tombstoneName $description
-        Write-Host "Removed authenticated non-current backup: $($candidate.Name)"
+        Remove-SafeBackupCleanupDirectory $tombstone $tombstoneName 'deleting backup snapshot'
+        Write-Host "Removed authenticated accepted schema-version-2 non-current backup: $($candidate.Name)"
     }
 }
 
@@ -2759,12 +2825,16 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
     if (-not (Test-BackupId $Id) -or $Confirmation -cne $Id) { Fail "Restore is destructive. Supply -BackupId ID -Confirm ID with the same valid backup ID." }
     Assert-DeploymentVolumeOwnership
     $root = Join-Path $BackupDirectory $Id
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) { Fail "Backup does not exist: $root" }
     $currentId = Read-CurrentBackupId -AllowMissing
     if ($currentId -and $currentId -cne $Id) {
         Fail "Restore target $Id is not the authenticated CURRENT backup ($currentId)."
     }
     Invoke-SingleBackupRecoveryCleanup
+    $currentId = Read-CurrentBackupId -AllowMissing
+    if ($currentId -and $currentId -cne $Id) {
+        Fail "Restore target $Id is not the authenticated CURRENT backup ($currentId)."
+    }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { Fail "Backup does not exist: $root" }
     Assert-RestoreCompatibility $root
     Confirm-Backup $Id -ReadOnly
     $restoreEpochInfo = Read-ValidatedBackupEpoch $root $Id

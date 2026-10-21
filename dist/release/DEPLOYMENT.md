@@ -390,8 +390,8 @@ created schema-v2 snapshot automatically and authenticates its checksum inventor
 backup key. It rejects unsafe tar members and any v2 `wal-archive.tar.gz`, atomically marks the recovery point `VERIFIED`, and,
 while OSCAR remains stopped, confirms only exact published daily-file/segment sets captured by the
 accepted authenticated snapshot. After confirmation, an atomic HMAC-authenticated `CURRENT`
-replacement commits the one logical snapshot; only then can the previous non-current verified
-snapshot be cleaned. Confirmation failure leaves the old pointer authoritative. PostgreSQL remains
+replacement commits the one logical snapshot; only then can the previous non-current fully accepted
+schema-v2 snapshot be cleaned. Confirmation failure leaves the old pointer authoritative. PostgreSQL remains
 online for `pg_basebackup --wal-method=stream`; there is no cumulative WAL snapshot.
 `backup-verify` runs `pg_verifybackup` in a dependency-free utility container, so the
 live database and its catalog receipt are not recovery dependencies. Use `backup-verify` to recheck
@@ -402,8 +402,11 @@ One logical snapshot is the steady state, not the peak capacity requirement. A r
 the old snapshot while the complete new candidate is built, verified, accepted, and committed
 through `CURRENT`, so size the backup root for both. The next locked storage command uses the
 authenticated pointer to reconcile any non-current snapshot or private staging debris left by a
-crash. If the first schema-v2 attempt failed before any `CURRENT` existed, it authenticates and
-retires only uncommitted schema-v2 candidates while preserving/restoring schema-v1 recovery points.
+crash. Cleanup removes only candidates that independently pass complete schema-v2 core and
+acceptance verification; schema-v1, failed, partial, unauthenticated, unaccepted, and incomplete
+deletion candidates are preserved with warnings. If no `CURRENT` exists, one uniquely accepted
+schema-v2 candidate is adopted by reconstructing authenticated `CURRENT`; multiple accepted
+candidates are preserved and stop for operator review.
 All storage-administration commands share one nonblocking, crash-released deployment lock; a
 concurrent invocation fails rather than racing backup/archive state. The lock is keyed by
 `OSCAR_DEPLOYMENT_ID` in `/run/lock/oscar-storage` on Ubuntu or

@@ -302,11 +302,17 @@ fsync_path() {
     sync -f "$1" 2>/dev/null || sync 2>/dev/null || fail "Could not durably flush storage metadata: $1"
 }
 
-durably_flush_tree() {
-    local root=$1 path
-    while IFS= read -r path; do fsync_path "$path"; done < <(find "$root" -type f -print)
-    while IFS= read -r path; do fsync_path "$path"; done < <(find "$root" -depth -type d -print)
-}
+durably_flush_tree() (
+    local root=$1 path scratch files directories
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-durable-tree.XXXXXX")
+    trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-durable-tree.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
+    files=$scratch/files
+    directories=$scratch/directories
+    find "$root" -type f -print0 >"$files" || fail "Could not enumerate files for durable flush: $root"
+    find "$root" -depth -type d -print0 >"$directories" || fail "Could not enumerate directories for durable flush: $root"
+    while IFS= read -r -d '' path; do fsync_path "$path"; done <"$files"
+    while IFS= read -r -d '' path; do fsync_path "$path"; done <"$directories"
+)
 
 storage_identity_value() {
     local marker=$1 name=$2
@@ -739,14 +745,16 @@ write_journal_confirmation_receipt() (
 validate_journal_confirmation_receipt() {
     local root=$1 backup_id=$2 oscar_state_sha=$3 image=$4 receipt="$1/JOURNAL_CONFIRMED" expected actual
     [[ -f $receipt && ! -L $receipt ]] || fail 'Authenticated journal confirmation receipt is missing or unsafe.'
-    [[ $(wc -l <"$receipt" | tr -d '[:space:]') == 5 &&
-       $(grep -Fxc 'format=oscar-journal-backup-confirmation' "$receipt") == 1 &&
-       $(grep -Fxc 'version=2' "$receipt") == 1 &&
-       $(grep -Fxc "backup_id=$backup_id" "$receipt") == 1 &&
-       $(grep -Fxc "oscar_state_sha256=$oscar_state_sha" "$receipt") == 1 &&
-       $(grep -Ec '^hmac_sha256=[A-Za-z0-9+/]{43}=$' "$receipt") == 1 ]] ||
+    [[ $(sed -n '1p' "$receipt") == format=oscar-journal-backup-confirmation &&
+       $(sed -n '2p' "$receipt") == version=2 &&
+       $(sed -n '3p' "$receipt") == "backup_id=$backup_id" &&
+       $(sed -n '4p' "$receipt") == "oscar_state_sha256=$oscar_state_sha" &&
+       $(sed -n '5p' "$receipt") =~ ^hmac_sha256=[A-Za-z0-9+/]{43}=$ ]] ||
         fail 'Authenticated journal confirmation receipt does not match this recovery point.'
-    expected=$(sed -n 's/^hmac_sha256=//p' "$receipt")
+    expected=${BASH_REMATCH[0]#hmac_sha256=}
+    cmp -s -- "$receipt" <(printf 'format=oscar-journal-backup-confirmation\nversion=2\nbackup_id=%s\noscar_state_sha256=%s\nhmac_sha256=%s\n' \
+        "$backup_id" "$oscar_state_sha" "$expected") ||
+        fail 'Authenticated journal confirmation receipt is not in canonical LF-terminated form.'
     actual=$(calculate_journal_confirmation_hmac "$receipt" "$image")
     [[ $actual == "$expected" ]] || fail 'Journal-confirmation receipt authentication failed.'
 }
@@ -894,8 +902,7 @@ validate_current_backup_pointer() {
     mode=$(file_mode "$pointer") || fail 'Cannot inspect CURRENT pointer permissions.'
     [[ $owner == ${EUID:-$(id -u)} && $mode == 600 ]] ||
         fail 'The CURRENT backup pointer must be administrator-owned with mode 0600.'
-    [[ $(wc -l <"$pointer" | tr -d '[:space:]') == 4 &&
-       $(sed -n '1p' "$pointer") == format=oscar-current-backup &&
+    [[ $(sed -n '1p' "$pointer") == format=oscar-current-backup &&
        $(sed -n '2p' "$pointer") == version=1 &&
        $(sed -n '3p' "$pointer") =~ ^backup_id=[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ &&
        $(sed -n '4p' "$pointer") =~ ^hmac_sha256=[A-Za-z0-9+/]{43}=$ ]] ||
@@ -903,6 +910,8 @@ validate_current_backup_pointer() {
     backup_id=$(storage_identity_value "$pointer" backup_id)
     valid_backup_id "$backup_id" || fail 'The CURRENT backup pointer contains an invalid backup ID.'
     expected=$(storage_identity_value "$pointer" hmac_sha256)
+    cmp -s -- "$pointer" <(printf 'format=oscar-current-backup\nversion=1\nbackup_id=%s\nhmac_sha256=%s\n' \
+        "$backup_id" "$expected") || fail 'The CURRENT backup pointer is not in canonical LF-terminated form.'
     actual=$(calculate_current_pointer_hmac "$pointer" "$image")
     [[ $actual == "$expected" ]] || fail 'The CURRENT backup pointer authentication failed.'
     printf '%s' "$backup_id"
@@ -929,9 +938,77 @@ write_current_backup_pointer() {
         fail 'The committed CURRENT pointer did not identify the new recovery point.'
 }
 
-cleanup_snapshot_sidecar_temps() {
-    local root=$1 path name owner mode
+# Return 0 only for a fully authenticated, accepted schema-v2 recovery point.
+# Callers use the nonzero status to preserve and explain candidates rather than
+# treating an authenticated immutable core as retention authorization:
+#   10 = incomplete or unauthenticated core
+#   11 = authenticated legacy schema-v1 recovery point
+#   12 = authenticated schema-v2 core without valid acceptance sidecars
+accepted_schema_v2_backup_for_cleanup() (
+    local backup_id=$1 supplied_root=${2:-} root schema_version marker marker_value owner mode oscar_state_sha oscar_state_count
+    valid_backup_id "$backup_id" || return 10
+    if [[ -n $supplied_root ]]; then
+        root=$supplied_root
+        (verify_backup "$backup_id" read-only "$root") >/dev/null 2>&1 || return 10
+    else
+        root="$backup_dir/$backup_id"
+        (verify_backup "$backup_id" read-only) >/dev/null 2>&1 || return 10
+    fi
+    schema_version=$(backup_schema_version "$root")
+    [[ $schema_version == 2 ]] || return 11
+
+    marker="$root/VERIFIED"
+    [[ -f $marker && ! -L $marker ]] || return 12
+    owner=$(file_owner_id "$marker") || return 12
+    mode=$(file_mode "$marker") || return 12
+    marker_value=$(sed -n '1p' "$marker") || return 12
+    [[ $owner == ${EUID:-$(id -u)} && $mode == 600 &&
+       $marker_value =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 12
+    cmp -s -- "$marker" <(printf '%s\n' "$marker_value") || return 12
+    oscar_state_count=$(awk '$2 == "./oscar-state.tar.gz" { count++ } END { print count + 0 }' "$root/SHA256SUMS")
+    [[ $oscar_state_count == 1 ]] || return 12
+    oscar_state_sha=$(awk '$2 == "./oscar-state.tar.gz" { print $1; exit }' "$root/SHA256SUMS")
+    [[ $oscar_state_sha =~ ^[0-9a-f]{64}$ ]] || return 12
+    (validate_journal_confirmation_receipt \
+        "$root" "$backup_id" "$oscar_state_sha" "$(oscar_image)") >/dev/null 2>&1 || return 12
+)
+
+warn_preserved_backup_cleanup_candidate() {
+    local path=$1 status=$2
+    case $status in
+        10) printf 'WARNING: preserving incomplete or unauthenticated backup candidate for operator review: %s\n' "$path" >&2 ;;
+        11) printf 'WARNING: preserving legacy schema-version-1 recovery point: %s\n' "$path" >&2 ;;
+        12) printf 'WARNING: preserving authenticated but unaccepted schema-version-2 backup candidate for operator review: %s\n' "$path" >&2 ;;
+        *) printf 'WARNING: preserving backup candidate with unknown cleanup eligibility for operator review: %s\n' "$path" >&2 ;;
+    esac
+}
+
+# Materialize a complete directory scan before callers classify or remove any
+# entry. A producer behind process substitution can fail invisibly, which is
+# unacceptable when an incomplete scan could make recovery appear unambiguous.
+capture_checked_directory_entries() {
+    local root=$1 output=$2 scope=${3:-direct}
+    case $scope in
+        direct)
+            find "$root" -mindepth 1 -maxdepth 1 -print0 >"$output" ||
+                fail "Could not enumerate backup directory safely: $root"
+            ;;
+        recursive)
+            find "$root" -mindepth 1 -print0 >"$output" ||
+                fail "Could not enumerate backup tree safely: $root"
+            ;;
+        *) fail "Unknown backup enumeration scope: $scope" ;;
+    esac
+}
+
+cleanup_snapshot_sidecar_temps() (
+    local root=$1 path name owner mode scratch entries temporary
+    local -a temporaries=()
     assert_private_backup_snapshot_directory "$root"
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-backup-sidecars.XXXXXX")
+    trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-backup-sidecars.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
+    entries=$scratch/entries
+    capture_checked_directory_entries "$root" "$entries"
     while IFS= read -r -d '' path; do
         name=${path##*/}
         case $name in
@@ -944,19 +1021,27 @@ cleanup_snapshot_sidecar_temps() {
                 mode=$(file_mode "$path") || fail "Cannot inspect backup acceptance temporary permissions: $path"
                 [[ $owner == ${EUID:-$(id -u)} && $mode == 600 ]] ||
                     fail "Backup acceptance temporary must be administrator-owned with mode 0600: $path"
-                rm -f -- "$path"
-                fsync_path "$root"
+                temporaries+=("$path")
                 ;;
         esac
-    done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
-}
+    done <"$entries"
+    for temporary in "${temporaries[@]}"; do
+        rm -f -- "$temporary"
+        fsync_path "$root"
+    done
+)
 
-cleanup_noncurrent_backup_snapshots() {
-    local current_id=$1 image=$2 path name deleting owner mode backup_id
+cleanup_noncurrent_backup_snapshots() (
+    local current_id=$1 image=$2 path name deleting owner mode backup_id cleanup_status scratch entries
     [[ $(validate_current_backup_pointer "$image") == "$current_id" ]] ||
         fail 'Refusing snapshot cleanup without an authenticated CURRENT pointer.'
+    accepted_schema_v2_backup_for_cleanup "$current_id" ||
+        fail 'Refusing snapshot cleanup because CURRENT is not a fully authenticated, accepted schema-version-2 recovery point.'
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-backup-cleanup.XXXXXX")
+    trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-backup-cleanup.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
+    entries=$scratch/entries
+    capture_checked_directory_entries "$backup_dir" "$entries"
     cleanup_snapshot_sidecar_temps "$backup_dir/$current_id"
-    verify_backup "$current_id" read-only
     while IFS= read -r -d '' path; do
         [[ -n $path ]] || continue
         name=${path##*/}
@@ -970,50 +1055,63 @@ cleanup_noncurrent_backup_snapshots() {
             mode=$(file_mode "$path") || fail "Cannot inspect uncommitted-v2 deletion tombstone permissions: $path"
             [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
                 fail "Uncommitted-v2 deletion tombstone must be administrator-owned with mode 0700: $path"
-            rm -rf -- "$path"
-            fsync_path "$backup_dir"
+            printf 'WARNING: preserving legacy uncommitted schema-version-2 deletion tombstone for operator review: %s\n' "$path" >&2
             continue
         fi
         if [[ $name == .deleting-uncommitted-v2-* ]]; then
             fail "Malformed uncommitted-v2 deletion tombstone was preserved: $path"
         fi
         if [[ $name =~ ^\.deleting-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$ ]]; then
-            [[ ${BASH_REMATCH[1]} != "$current_id" ]] || fail 'CURRENT backup cannot be a deletion candidate.'
+            backup_id=${BASH_REMATCH[1]}
+            [[ $backup_id != "$current_id" ]] || fail 'CURRENT backup cannot be a deletion candidate.'
             [[ -d $path && ! -L $path ]] || fail "Backup deletion tombstone is unsafe: $path"
             owner=$(file_owner_id "$path") || fail "Cannot inspect backup deletion tombstone owner: $path"
             mode=$(file_mode "$path") || fail "Cannot inspect backup deletion tombstone permissions: $path"
             [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
                 fail "Backup deletion tombstone must be administrator-owned with mode 0700: $path"
-            rm -rf -- "$path"
-            fsync_path "$backup_dir"
+            if accepted_schema_v2_backup_for_cleanup "$backup_id" "$path"; then
+                rm -rf -- "$path"
+                fsync_path "$backup_dir"
+            else
+                cleanup_status=$?
+                warn_preserved_backup_cleanup_candidate "$path" "$cleanup_status"
+            fi
             continue
         fi
         if [[ $name == .deleting-* && $name != .deleting-partial-* ]]; then
             fail "Malformed backup deletion tombstone was preserved: $path"
+        fi
+        if [[ $name =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.partial$ ]]; then
+            continue
         fi
         if [[ $name =~ ^[0-9]{8}T ]] && ! valid_backup_id "$name"; then
             fail "Malformed backup snapshot candidate was preserved: $path"
         fi
         valid_backup_id "$name" || continue
         [[ $name != "$current_id" ]] || continue
-        # Publication occurs only after the immutable core passes its complete
-        # verifier. A crash before CURRENT can therefore leave an authenticated
-        # final directory without a VERIFIED/JOURNAL_CONFIRMED sidecar. Verify
-        # that core again, then retire it so interrupted attempts cannot grow
-        # the supposedly single-snapshot store without bound.
-        cleanup_snapshot_sidecar_temps "$path"
-        verify_backup "$name" read-only
+        if accepted_schema_v2_backup_for_cleanup "$name"; then
+            :
+        else
+            cleanup_status=$?
+            warn_preserved_backup_cleanup_candidate "$path" "$cleanup_status"
+            continue
+        fi
         deleting="$backup_dir/.deleting-$name"
         [[ ! -e $deleting && ! -L $deleting ]] || fail "Backup deletion staging path already exists: $deleting"
         mv -- "$path" "$deleting"
         fsync_path "$backup_dir"
         rm -rf -- "$deleting"
         fsync_path "$backup_dir"
-    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
-}
+    done <"$entries"
+)
 
-cleanup_uncommitted_schema_v2_snapshots() {
-    local image=$1 path name backup_id final deleting owner mode schema_version
+cleanup_uncommitted_schema_v2_snapshots() (
+    local image=$1 path name backup_id final deleting owner mode cleanup_status accepted_count scratch entries index
+    local -a accepted_ids=() accepted_paths=() legacy_ids=() legacy_paths=()
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-backup-recovery.XXXXXX")
+    trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-backup-recovery.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
+    entries=$scratch/entries
+    capture_checked_directory_entries "$backup_dir" "$entries"
     while IFS= read -r -d '' path; do
         [[ -n $path ]] || continue
         name=${path##*/}
@@ -1027,13 +1125,7 @@ cleanup_uncommitted_schema_v2_snapshots() {
             mode=$(file_mode "$path") || fail "Cannot inspect uncommitted-v2 deletion tombstone permissions: $path"
             [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
                 fail "Uncommitted-v2 deletion tombstone must be administrator-owned with mode 0700: $path"
-            # This distinct name is written only after complete authentication
-            # and schema-v2 classification. Its payload may be incomplete after
-            # a power loss during recursive removal, so resume from the durable
-            # name and protected directory rather than trying to reauthenticate
-            # already deleted members.
-            rm -rf -- "$path"
-            fsync_path "$backup_dir"
+            printf 'WARNING: preserving legacy uncommitted schema-version-2 deletion tombstone for operator review: %s\n' "$path" >&2
             continue
         fi
         if [[ $name == .deleting-uncommitted-v2-* ]]; then
@@ -1049,28 +1141,27 @@ cleanup_uncommitted_schema_v2_snapshots() {
             mode=$(file_mode "$path") || fail "Cannot inspect backup deletion tombstone permissions: $path"
             [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
                 fail "Backup deletion tombstone must be administrator-owned with mode 0700: $path"
-            cleanup_snapshot_sidecar_temps "$path"
-            verify_backup "$backup_id" read-only "$path"
-            schema_version=$(backup_schema_version "$path")
-            if [[ $schema_version == 1 ]]; then
-                # A pre-3.9.2 prune could have crashed after renaming a legacy
-                # backup. With no authenticated CURRENT, restore that recovery
-                # point rather than guessing that deletion was still intended.
-                mv -- "$path" "$final"
-                fsync_path "$backup_dir"
+            if accepted_schema_v2_backup_for_cleanup "$backup_id" "$path"; then
+                accepted_ids+=("$backup_id")
+                accepted_paths+=("$path")
             else
-                deleting="$backup_dir/.deleting-uncommitted-v2-$backup_id"
-                [[ ! -e $deleting && ! -L $deleting ]] ||
-                    fail "Uncommitted-v2 deletion staging path already exists: $deleting"
-                mv -- "$path" "$deleting"
-                fsync_path "$backup_dir"
-                rm -rf -- "$deleting"
-                fsync_path "$backup_dir"
+                cleanup_status=$?
+                if ((cleanup_status == 11)); then
+                    # Defer the recovery rename until the complete scan proves
+                    # there is no ambiguous set of accepted schema-v2 points.
+                    legacy_ids+=("$backup_id")
+                    legacy_paths+=("$path")
+                else
+                    warn_preserved_backup_cleanup_candidate "$path" "$cleanup_status"
+                fi
             fi
             continue
         fi
         if [[ $name == .deleting-* && $name != .deleting-partial-* ]]; then
             fail "Malformed backup deletion tombstone was preserved: $path"
+        fi
+        if [[ $name =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.partial$ ]]; then
+            continue
         fi
         if [[ $name =~ ^[0-9]{8}T ]] && ! valid_backup_id "$name"; then
             fail "Malformed backup snapshot candidate was preserved: $path"
@@ -1082,23 +1173,53 @@ cleanup_uncommitted_schema_v2_snapshots() {
         [[ ! -e $backup_dir/.deleting-uncommitted-v2-$name &&
            ! -L $backup_dir/.deleting-uncommitted-v2-$name ]] ||
             fail "Both live and uncommitted-v2 deletion snapshots exist without CURRENT: $name"
-        cleanup_snapshot_sidecar_temps "$path"
-        verify_backup "$name" read-only
-        schema_version=$(backup_schema_version "$path")
-        # Schema-v1 directories predate CURRENT and remain explicit recovery
-        # points. A schema-v2 directory without CURRENT is a fully verified but
-        # uncommitted first-backup attempt and must not accumulate on retries.
-        [[ $schema_version == 2 ]] || continue
-        deleting="$backup_dir/.deleting-uncommitted-v2-$name"
-        mv -- "$path" "$deleting"
-        fsync_path "$backup_dir"
-        rm -rf -- "$deleting"
-        fsync_path "$backup_dir"
-    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
-}
+        if accepted_schema_v2_backup_for_cleanup "$name"; then
+            accepted_ids+=("$name")
+            accepted_paths+=("$path")
+        else
+            cleanup_status=$?
+            warn_preserved_backup_cleanup_candidate "$path" "$cleanup_status"
+            continue
+        fi
+    done <"$entries"
 
-cleanup_abandoned_single_backup_staging() {
-    local path name backup_id deleting owner mode
+    accepted_count=${#accepted_ids[@]}
+    if ((accepted_count > 1)); then
+        printf 'WARNING: preserving multiple authenticated accepted schema-version-2 recovery points because CURRENT is missing.\n' >&2
+        fail 'Cannot reconstruct CURRENT unambiguously; operator review is required.'
+    fi
+    for ((index = 0; index < ${#legacy_ids[@]}; index++)); do
+        backup_id=${legacy_ids[index]}
+        path=${legacy_paths[index]}
+        final="$backup_dir/$backup_id"
+        [[ ! -e $final && ! -L $final ]] ||
+            fail "Refusing to overwrite a live backup while restoring legacy recovery point: $final"
+        mv -- "$path" "$final"
+        fsync_path "$backup_dir"
+        printf 'WARNING: restored and preserved legacy schema-version-1 recovery point: %s\n' "$final" >&2
+    done
+    if ((accepted_count == 1)); then
+        backup_id=${accepted_ids[0]}
+        path=${accepted_paths[0]}
+        final="$backup_dir/$backup_id"
+        if [[ $path != "$final" ]]; then
+            [[ ! -e $final && ! -L $final ]] ||
+                fail "Refusing to overwrite a live backup while restoring accepted recovery point: $final"
+            mv -- "$path" "$final"
+            fsync_path "$backup_dir"
+        fi
+        cleanup_snapshot_sidecar_temps "$final"
+        write_current_backup_pointer "$backup_id" "$image"
+        printf 'Recovered authenticated CURRENT pointer for accepted schema-version-2 backup: %s\n' "$backup_id"
+    fi
+)
+
+cleanup_abandoned_single_backup_staging() (
+    local path name backup_id owner group mode scratch entries
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-backup-staging.XXXXXX")
+    trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-backup-staging.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
+    entries=$scratch/entries
+    capture_checked_directory_entries "$backup_dir" "$entries"
     while IFS= read -r -d '' path; do
         name=${path##*/}
         case $name in
@@ -1107,9 +1228,11 @@ cleanup_abandoned_single_backup_staging() {
                     fail "Malformed backup recovery scratch entry was preserved: $path"
                 [[ -d $path && ! -L $path ]] || fail "Backup recovery scratch entry is unsafe: $path"
                 owner=$(file_owner_id "$path") || fail "Cannot inspect backup recovery scratch owner: $path"
+                group=$(file_group_id "$path") || fail "Cannot inspect backup recovery scratch group: $path"
                 mode=$(file_mode "$path") || fail "Cannot inspect backup recovery scratch permissions: $path"
-                [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
-                    fail "Backup recovery scratch must be administrator-owned with mode 0700: $path"
+                [[ $owner == ${EUID:-$(id -u)} &&
+                   ($mode == 700 || ($name == .journal-confirm-* && $mode == 710 && $group == 10001)) ]] ||
+                    fail "Backup recovery scratch has an unrecognized owner, group, or mode: $path"
                 rm -rf -- "$path"
                 fsync_path "$backup_dir"
                 ;;
@@ -1132,13 +1255,7 @@ cleanup_abandoned_single_backup_staging() {
                 mode=$(file_mode "$path") || fail "Cannot inspect abandoned backup staging permissions: $path"
                 [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
                     fail "Abandoned backup staging entry must be administrator-owned with mode 0700: $path"
-                deleting="$backup_dir/.deleting-partial-$backup_id"
-                [[ ! -e $deleting && ! -L $deleting ]] ||
-                    fail "Abandoned backup deletion staging path already exists: $deleting"
-                mv -- "$path" "$deleting"
-                fsync_path "$backup_dir"
-                rm -rf -- "$deleting"
-                fsync_path "$backup_dir"
+                printf 'WARNING: preserving incomplete backup staging candidate for operator review: %s\n' "$path" >&2
                 ;;
             .deleting-partial-*)
                 backup_id=${name#.deleting-partial-}
@@ -1148,13 +1265,12 @@ cleanup_abandoned_single_backup_staging() {
                 mode=$(file_mode "$path") || fail "Cannot inspect abandoned backup deletion staging permissions: $path"
                 [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
                     fail "Abandoned backup deletion staging entry must be administrator-owned with mode 0700: $path"
-                rm -rf -- "$path"
-                fsync_path "$backup_dir"
+                printf 'WARNING: preserving interrupted partial-backup deletion tombstone for operator review: %s\n' "$path" >&2
                 ;;
             .CURRENT.tmp*) fail "Malformed CURRENT staging entry was preserved: $path" ;;
         esac
-    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -print0)
-}
+    done <"$entries"
+)
 
 recover_single_backup_state() {
     local pointer="$backup_dir/CURRENT" image=$1 current_id
@@ -1192,11 +1308,12 @@ backup_object_path() {
 }
 
 validate_backup_manifest_inventory() (
-    local root=$1 scratch manifest_paths actual_paths line relative entry
+    local root=$1 scratch manifest_paths actual_paths filesystem_entries line relative entry owner mode
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/oscar-backup-inventory.XXXXXX")
     trap 'case $scratch in "${TMPDIR:-/tmp}"/oscar-backup-inventory.*) rm -rf -- "$scratch" ;; esac' EXIT HUP INT TERM
     manifest_paths=$scratch/manifest
     actual_paths=$scratch/actual
+    filesystem_entries=$scratch/filesystem
     : >"$manifest_paths"
     : >"$actual_paths"
     while IFS= read -r line || [[ -n $line ]]; do
@@ -1206,16 +1323,27 @@ validate_backup_manifest_inventory() (
         printf '%s\n' "$relative" >>"$manifest_paths"
     done <"$root/SHA256SUMS"
     [[ -z $(sort "$manifest_paths" | uniq -d) ]] || fail 'Authenticated checksum manifest contains duplicate paths.'
+    capture_checked_directory_entries "$root" "$filesystem_entries" recursive
     while IFS= read -r -d '' entry; do
         if [[ -L $entry || (! -f $entry && ! -d $entry) ]]; then
             fail "Backup contains a symbolic link or non-regular entry: ${entry#"$root"/}"
         fi
-        [[ -f $entry ]] || continue
         relative=${entry#"$root"/}
+        if [[ $relative == .VERIFIED.* || $relative == .JOURNAL_CONFIRMED.* ]]; then
+            [[ $relative =~ ^\.(VERIFIED|JOURNAL_CONFIRMED)\.[A-Za-z0-9]{6}$ ]] ||
+                fail "Malformed backup acceptance temporary was preserved: $relative"
+            [[ -f $entry ]] || fail "Backup acceptance temporary is unsafe: $relative"
+            owner=$(file_owner_id "$entry") || fail "Cannot inspect backup acceptance temporary owner: $relative"
+            mode=$(file_mode "$entry") || fail "Cannot inspect backup acceptance temporary permissions: $relative"
+            [[ $owner == ${EUID:-$(id -u)} && $mode == 600 ]] ||
+                fail "Backup acceptance temporary must be administrator-owned with mode 0600: $relative"
+            continue
+        fi
+        [[ -f $entry ]] || continue
         case $relative in VERIFIED|JOURNAL_CONFIRMED|SHA256SUMS|SHA256SUMS.hmac) continue ;; esac
         valid_relative_path "$relative" || fail "Unsafe backup filesystem path: $relative"
         printf '%s\n' "$relative" >>"$actual_paths"
-    done < <(find "$root" -mindepth 1 -print0)
+    done <"$filesystem_entries"
     sort -u "$manifest_paths" -o "$manifest_paths"
     sort -u "$actual_paths" -o "$actual_paths"
     cmp -s "$manifest_paths" "$actual_paths" ||
@@ -1462,9 +1590,13 @@ confirm_daily_journal_backup() (
         find /snapshot -type d -exec chmod 0700 {} +
         find /snapshot -type f -exec chmod 0600 {} +
     '
-    # Keep CAP_CHOWN out of the extractor. The already-elevated host CLI makes
-    # the validated snapshot readable only by the non-root confirmation JVM.
-    chown -R 10001:10001 "$snapshot"
+    # Keep CAP_CHOWN out of the extractor. Preserve the scratch root as an
+    # administrator-owned recovery object while granting only the application
+    # group traversal; a crash at any following instruction remains safely
+    # recognizable by the next locked storage command.
+    chown 0:10001 "$snapshot"
+    chmod 0710 "$snapshot"
+    find "$snapshot" -mindepth 1 -exec chown -h 10001:10001 {} +
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --tmpfs /tmp:rw,noexec,nosuid,nodev --user 10001:10001 --entrypoint java \
         --volume oscar_oscar_state:/var/lib/oscar --volume "$snapshot:/verified-snapshot:ro" "$image" \
@@ -2024,7 +2156,7 @@ restore_backup() (
     require_admin; require_configured; require_backup_key
     require_single_backup_mode
     local backup_id='' confirmation='' source_timeline restore_epoch_id restore_postgres_lsn restore_temp restore_stage
-    local restored_promoted_timeline='' image current_id='' schema_version oscar_state_sha marker owner mode
+    local restored_promoted_timeline='' image current_id='' schema_version
     while (($#)); do
         case $1 in
             --backup) backup_id=${2:?missing backup id}; shift 2 ;;
@@ -2043,6 +2175,11 @@ restore_backup() (
             fail 'Restore may use only the authenticated recovery point named by CURRENT.'
     fi
     recover_single_backup_state "$image"
+    if [[ -e $backup_dir/CURRENT || -L $backup_dir/CURRENT ]]; then
+        current_id=$(validate_current_backup_pointer "$image")
+        [[ $current_id == "$backup_id" ]] ||
+            fail 'Restore may use only the authenticated recovery point named by CURRENT.'
+    fi
     local root="$backup_dir/$backup_id"
     [[ -d $root ]] || fail "Backup does not exist: $root"
     require_restore_compatibility "$root"
@@ -2051,19 +2188,8 @@ restore_backup() (
     if [[ $schema_version == 2 ]]; then
         [[ $current_id == "$backup_id" ]] ||
             fail 'Schema-version-2 restore requires its authenticated CURRENT pointer.'
-        marker="$root/VERIFIED"
-        [[ -f $marker && ! -L $marker ]] ||
-            fail 'Accepted schema-version-2 backup is missing a safe VERIFIED marker.'
-        owner=$(file_owner_id "$marker") || fail 'Cannot inspect the VERIFIED marker owner.'
-        mode=$(file_mode "$marker") || fail 'Cannot inspect the VERIFIED marker permissions.'
-        [[ $owner == ${EUID:-$(id -u)} && $mode == 600 &&
-           $(wc -l <"$marker" | tr -d '[:space:]') == 1 &&
-           $(sed -n '1p' "$marker") =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
-            fail 'The schema-version-2 VERIFIED marker is malformed or unsafe.'
-        oscar_state_sha=$(awk '$2 == "./oscar-state.tar.gz" { print $1; exit }' "$root/SHA256SUMS")
-        [[ $oscar_state_sha =~ ^[0-9a-f]{64}$ ]] ||
-            fail 'Authenticated OSCAR-state checksum is missing from the recovery point.'
-        validate_journal_confirmation_receipt "$root" "$backup_id" "$oscar_state_sha" "$image"
+        accepted_schema_v2_backup_for_cleanup "$backup_id" ||
+            fail 'Schema-version-2 restore requires fully authenticated acceptance sidecars.'
     else
         # Schema v1 predates CURRENT/JOURNAL_CONFIRMED. Its immutable core must
         # still pass the complete v1 verifier before acceptance and restore.

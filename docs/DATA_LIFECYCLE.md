@@ -13,14 +13,14 @@ hosts. macOS deployment and storage operations fail closed; it is not a supporte
 | --- | --- | --- | --- |
 | Selected high-volume detector observations | Copy to an `ACTIVE` Parquet generation when older than 48 hours | Valid Parquet/schema/manifest objects, active catalog generation, exact-row parity receipt, 24-hour overlap, no applicable hold | Yes for exact eligible rows in the shipping profile, normally about 72 hours after observation plus scheduling |
 | Other PostgreSQL observations and transactional records | Remain hot | Existing application policy | Not by the cold-tier scheduler |
-| Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV, v1 manifest, and `PUBLISHED` ledger before compatibility-observation cleanup; retry hourly if midnight publication is still in progress | Journal files are not pressure-cleanup candidates |
-| Alarm source MP4 | Attempt exactly five JPEGs on the first eligible lifecycle cycle | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
+| Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV, v1 manifest, `PUBLISHED` ledger, 30 days after the later of day close or actual publication, and exact sealed-journal replay parity; sites may additionally require verified backup confirmation | Yes for eligible private sealed segments; published daily files are not pressure-cleanup candidates |
+| Alarm source MP4 | Attempt exactly five JPEGs after one day | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
 | Retained five-JPEG media set | Remains available | Complete set, no hold, rollback grace elapsed, minimum pressure age met, filesystem at pressure threshold | Yes, only under configured storage pressure |
 | Uncatalogued legacy video | Legacy behavior only | Not eligible for new pressure cleanup | No |
 | Daily files, reports, adjudication, sitemap | Remain in application state | Site policy and explicit administration | No by storage-pressure cleanup |
 | Cold archive generation | Primary cold tier; `ACTIVE` during verified overlap, then `SEALED` after exact hot-row deletion | Explicit dry-run plan selecting only `SEALED` generations, review, unexpired one-time token, no hold, object hash recheck | No; an administrator must run `archive purge` |
 | Docker logs | JSON log rotation | Docker rotation settings | Yes, size-based rotation |
-| Coordinated recovery snapshot | Disabled by default; manual `single` mode commits one schema-v2 snapshot through authenticated `CURRENT` | Full HMAC/checksum/tar/`pg_verifybackup` verification and journal confirmation before pointer replacement | The prior non-current verified snapshot is cleaned only after the new pointer commits; `backup-prune` is retired |
+| Coordinated recovery snapshot | Disabled by default; manual `single` mode commits one schema-v2 snapshot through authenticated `CURRENT` | Full HMAC/checksum/tar/`pg_verifybackup` verification and journal confirmation before pointer replacement | A prior non-current snapshot is cleaned only after the new pointer commits and the candidate independently passes full schema-v2 acceptance; all other candidates are preserved; `backup-prune` is retired |
 
 Defaults are starting points, not universal retention policy. The site owner must set periods that
 meet regulatory, evidentiary, privacy, legal-hold, and capacity requirements.
@@ -257,22 +257,24 @@ cannot suppress this retry.
 Setting `delegateObservationLifecycleToDatabase=true` delegates high-volume detector retention to
 the tiered database; it does not disable daily-file or connection-status maintenance.
 
-### Sealed-segment backup gate
+### Sealed-segment deletion gate
 
 A published CSV is not by itself permission to remove the private sealed journal that produced it.
-During creation of a coordinated backup, the application stays stopped through authenticated
-checksum, archive-member, and PostgreSQL verification. OSCAR atomically writes the `VERIFIED`
-acceptance marker, then extracts the accepted application snapshot into a private disposable
-directory and records a backup confirmation only when the
-snapshot contains the exact published CSV/manifest and exact sealed `.seg` inventory for that
-lane/day, and the current immutable publication and segments still match. The receipt is bound to
-the backup ID and authenticated `oscar-state.tar.gz` SHA-256. Missing, extra, changed, open, linked,
-or otherwise unsafe segment state fails or skips confirmation; it never expands deletion
-eligibility. Only a matching confirmation plus elapsed `sealedJournalRetentionDays` permits a later
-periodic sweep to remove that sealed day. A confirmation-stage interruption can leave a valid
-`VERIFIED` backup and a strict subset of receipts; that is safe because unconfirmed days remain
-protected, and the previous authenticated `CURRENT` is not replaced. Manual backup re-verification
-does not create receipts or change `CURRENT`.
+The standard `requireBackupBeforeSealedJournalDeletion=false` policy keeps managed backup optional
+without allowing the private duplicate source to grow forever. After
+`sealedJournalRetentionDays` (30 by default) from the later of day close or actual publication,
+OSCAR validates the immutable CSV, manifest, and `PUBLISHED` ledger, freezes the candidate day, and
+replays every sealed segment. The rendered byte count and SHA-256 must exactly match the published
+CSV. A late, missing, corrupt, linked, open, or otherwise unsafe segment blocks deletion. Lifecycle
+discovery and processing are durably queued and bounded, so neither startup nor a one-minute
+maintenance cycle traverses the entire retained history.
+
+A site may set `requireBackupBeforeSealedJournalDeletion=true`. In that stronger mode, creation of
+an optional coordinated snapshot keeps the application stopped through authenticated checksum,
+archive-member, and PostgreSQL verification. OSCAR records backup confirmation only when that
+accepted snapshot contains the exact CSV, manifest, and sealed-segment inventory and the live
+publication still matches. The receipt is bound to the backup ID and authenticated
+`oscar-state.tar.gz` SHA-256. Manual `backup-verify` does not create receipts or change `CURRENT`.
 
 ## Media lifecycle
 
@@ -297,7 +299,7 @@ original occupancy.
 
 ### Five-frame publication
 
-With the standard `timeToRetention=0`, the sliding retention query processes each eligible camera
+With the standard `timeToRetention=1`, the sliding retention query processes each eligible camera
 source on its first lifecycle cycle. It decodes the clip twice: first to construct the frame timeline, then to capture the five
 selected distinct ordinals. A valid set contains:
 
@@ -326,6 +328,13 @@ failed job. After successful publication the source is
 `PRESERVED_FOR_ROLLBACK` for `sourceRollbackGraceHours` (24 by default). A subsequent retention pass
 re-verifies the set and, if no hold applies, advances through `ELIGIBLE_FOR_DELETION` to `DELETED`.
 
+The standard worker runs every five minutes and advances the primary cursor by at most six hours of
+event time per cycle. A separate delayed cursor revisits event time only after the 24-hour
+late-arrival allowance, runs at most every six hours, and advances at most two hours per cycle. A
+restart-resumable historical sweep handles older delayed records in 24-hour chunks and repeats
+daily. Occupancy datastream IDs are cached for 15 minutes. These durable, bounded paths prevent a
+late or previously uncatalogued clip from being skipped without restoring an all-history scan.
+
 ### Recording and retained-media regression gate
 
 Release acceptance must create fresh alarm and non-alarm occupancies rather than validating only
@@ -337,9 +346,10 @@ camera reconnect must preserve exact event/lane/camera ownership.
 
 After the test-only retention interval elapses, acceptance requires one complete manifest per source
 with exactly five independently decodable JPEGs, matching source identity and event/lane/camera
-ledger fields, one successful attempt, and no failure record. The shipped production default is
-already zero retention days; qualification may shorten only the query cadence on an isolated
-disposable site and must still prove the same five-frame and 24-hour source-grace contracts.
+ledger fields, one successful attempt, and no failure record. The shipped production defaults are
+one retention day and a five-minute query cadence; qualification may use an accelerated profile on
+an isolated disposable site but must still prove the same five-frame and 24-hour source-grace
+contracts.
 
 The retained-media worker captures this profile when OSCAR starts. On a newly initialized
 qualification site, save the accelerated profile and perform a supported OSCAR restart **before**

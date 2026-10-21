@@ -46,6 +46,8 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Journal `zoneId` | `UTC` | Defines immutable daily windows and local timestamp field |
 | Journal observation mode | `LATEST` | Keeps the live `dailyFile` events required for lane occupancy processing; only completed manifest-validated local days are removed, so the current unsealed day remains queryable |
 | Daily-file cleanup work limit | 50 lane/day attempts per invocation | Bounds both the midnight attempt and each hourly manifest-gated retry while an outage backlog converges oldest-first |
+| Sealed journal retention / backup gate | 30 days / `false` | Deletes private sealed source only after the later of day close or publication plus immutable-publication validation and exact frozen replay; sites may opt into an additional verified-backup requirement |
+| Sealed journal lifecycle queue | bounded durable batches | Avoids startup and periodic all-history directory scans while recovery and deletion backlogs converge |
 | Database `idProviderType` | `SEQUENTIAL` | Required for exact, race-free archive ownership |
 | Database batch | 10,000 rows / 1 s | Bounded insert transaction and commit period |
 | Archive hot retention | 2 days | Age before the five allowlisted high-volume detector streams are copied to cold storage |
@@ -58,22 +60,27 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Parquet compression | ZSTD level 6 | Cold-storage size/CPU tradeoff |
 | Archive rollback grace | 1 day | Verified hot/cold overlap after activation before exact hot-row deletion |
 | `deleteHotAfterArchive` | `true` | Deletes only generation-owned eligible rows after parity and overlap, normally about 72 hours after observation plus scheduling |
-| Video retention age | 0 days | Processes a source video on the first eligible lifecycle cycle |
+| Video retention age | 1 day | Makes a completed source video eligible for five-JPEG conversion after one day |
+| Retention scan / catch-up | 5 min / 6 h forward | Bounds normal discovery and catch-up work after downtime |
+| Late-arrival scan | every 6 h / 2 h per pass / 24 h allowance | Rechecks delayed observations without an all-history rescan |
+| Historical reconciliation | every 24 h / 24 h per pass | Durable repair path for older eligible observations |
 | Retained evidence | exactly 5 JPEGs, quality 85 | First, quarter, middle, three-quarter, and last decoded frames |
 | Source-video rollback grace | 24 h | MP4 preserved after a successful five-frame publication |
 | Storage pressure | trigger 85%, target 80% | Removes only eligible cataloged media sets |
 | Pressure minimum age | 10 min | Prevents immediate removal of newly published sets |
 | Backup mode | `disabled` | Backup creation, verification, restore, and retired prune command require explicit `single` opt-in |
-| Local recovery snapshots | 1 authenticated current snapshot | New schema-v2 snapshot commits through `CURRENT`; prior verified snapshot is cleaned only after commit |
+| Local recovery snapshots | 1 authenticated current snapshot | New schema-v2 snapshot commits through `CURRENT`; a prior snapshot is cleaned only after commit and independent full acceptance verification |
 
 The one-snapshot value is steady state. Creating its replacement temporarily requires capacity for
 the old snapshot and the complete new candidate until authenticated `CURRENT` commits. A crash may
-leave non-current or private staging debris; the next locked storage command reconciles it using
-authenticated `CURRENT` before proceeding. Before the first `CURRENT` exists, cleanup instead
-authenticates and retires only uncommitted schema-v2 candidates and preserves/restores schema-v1
-recovery points. It durably marks an authenticated uncommitted schema-v2 candidate as
-`.deleting-uncommitted-v2-<backup-id>` before recursive removal, so restart can safely resume a
-partially completed cleanup; an unsafe or dangling `CURRENT` entry stops cleanup without mutation.
+leave non-current or private staging debris; the next locked storage command first requires an
+authenticated, fully accepted schema-v2 `CURRENT`. It removes only non-current candidates whose
+contents independently pass the same core and acceptance checks. Schema-v1, failed, partial,
+unauthenticated, unaccepted, and incomplete deletion candidates are preserved with warnings. Before
+the first `CURRENT` exists, exactly one fully accepted schema-v2 candidate is adopted by rebuilding
+authenticated `CURRENT`; multiple accepted candidates are preserved and stop the command for
+operator review. An unsafe, dangling, or acceptance-invalid `CURRENT` entry stops cleanup without
+candidate mutation.
 
 `delegateObservationLifecycleToDatabase=true` disables the old occupancy-gated high-volume purge so
 the tiered database owns gamma/neutron lifecycle. It does not disable connection-status maintenance
@@ -255,8 +262,8 @@ cause a major outage.
 ### Phase 4: cold retention
 
 After the archive has accumulated beyond the site's cold-retention period, use the reviewed,
-tokenized deletion workflow below. Keep at least one tested backup chain and apply the same policy to
-portable/off-site copies.
+tokenized deletion workflow below. Keep at least one tested coordinated recovery snapshot or
+off-site recovery point and apply the same policy to portable copies.
 
 ## Routine command reference
 
@@ -566,8 +573,11 @@ still in progress; this is expected and is stronger than an HTTP-only liveness p
 `unhealthy`, inspect the OSCAR logs for the specific module that did not start instead of immediately
 issuing another restart.
 
-Afterward, run `archive status`, `archive verify`, a cold-range query, and a backup. Retain the
-approval, dry-run output, deletion ledger, and verification result with records-management evidence.
+Afterward, run `archive status`, `archive verify`, and a cold-range query. When `single` backup mode
+is enabled, also create and verify the replacement snapshot. In disabled mode, confirm that the
+backup command refuses without changing state and follow the site's approved recovery/export
+policy. Retain the approval, dry-run output, deletion ledger, and verification result with
+records-management evidence.
 
 ## Export a generation for independent review
 
@@ -621,12 +631,13 @@ hourly maintenance pass retries the same bounded, oldest-first catch-up; after p
 that the prior-day rows are removed and the checkpoint advances. Current-day rows remain until the
 day is sealed and published. Do not manually delete them to imitate a single-row `LATEST` view.
 
-Private sealed segments become retention-eligible only after a newly created coordinated backup
-has passed HMAC/checksum, strict tar-member, and PostgreSQL verification and has recorded a receipt
-for the exact lane/day CSV, manifest, and sealed-segment inventory captured in that snapshot. The
-receipt is bound to the backup ID and authenticated application-state SHA-256. Manual
-`backup-verify` does not create these receipts. An old-day segment arriving after the snapshot is
-therefore not covered and must not be removed by the journal sweep.
+By default, private sealed segments become retention-eligible 30 days after the later of day close
+or actual publication only when the immutable CSV, manifest, and ledger validate and a frozen replay
+of every sealed segment exactly matches the published CSV. A late, missing, corrupt, linked, open,
+or mismatched segment blocks deletion. Durable bounded lifecycle queues keep startup and each
+maintenance cycle independent of total retained history. If the site enables
+`requireBackupBeforeSealedJournalDeletion`, the exact lane/day inventory must additionally be bound
+to an accepted coordinated snapshot; manual `backup-verify` does not create that receipt.
 
 Journal internals live under `files/.dailyfile-journal`. They are private recovery state, not a
 bucket for users to edit or download. Published CSVs are available in the authenticated
@@ -711,15 +722,23 @@ docker compose exec -T oscar sh -c \
 docker compose exec -T postgres sh -c \
   'du -sh /var/lib/postgresql/data; df -h /var/lib/postgresql/data'
 sudo du -sh -- \
-  "$(awk -F= '$1=="OSCAR_ARCHIVE_DIR" {print substr($0,index($0,"=")+1)}' .env)" \
+  "$(awk -F= '$1=="OSCAR_ARCHIVE_DIR" {print substr($0,index($0,"=")+1)}' .env)"
+```
+
+When `OSCAR_BACKUP_MODE=single`, measure the separately configured backup root too:
+
+```sh
+sudo du -sh -- \
   "$(awk -F= '$1=="OSCAR_BACKUP_DIR" {print substr($0,index($0,"=")+1)}' .env)"
 ```
 
 Trend the file counts as well as bytes and inodes. Coordinated-backup archive validation uses a
 bounded 256 MiB private tmpfs; its scratch demand grows with tar member count and path length, not
-with compressed media bytes. Treat an abrupt cardinality increase as an operational signal,
-and run `backup-verify` and an isolated restore against a representative high-watermark backup
-before adopting a materially larger retention window. See
+with compressed media bytes. Treat an abrupt cardinality increase as an operational signal. When
+`single` mode is enabled, run `backup-verify` and an isolated restore against a representative
+high-watermark backup before adopting a materially larger retention window. In disabled mode,
+confirm backup-command refusal/unchanged state and qualify the site's approved recovery/export
+procedure instead. See
 [Backup and restore](BACKUP_RESTORE.md#verify-a-backup) for the fail-closed limit and response.
 
 PostgreSQL database and major relations:
@@ -776,7 +795,9 @@ Track at least:
 - journal force/publication errors and time since last daily manifest per lane;
 - media conversion success/failure, source-grace backlog, and pressure-deletion results;
 - OSCAR/PostgreSQL CPU, resident memory, disk latency, and filesystem saturation;
-- backup age, verification age, off-site-copy age, and last successful restore drill; and
+- in `single` mode, backup age, verification age, off-site-copy age, and last successful restore
+  drill; in disabled mode, the age and last successful drill of the site-approved recovery/export
+  procedure; and
 - query p50/p95/p99 for current events, UUID lookup, reports, and cross-tier history.
 
 ## Failure modes and recovery
@@ -816,8 +837,12 @@ At least monthly, and before changing retention:
 5. Sample daily CSV manifest checks across lanes and daylight-saving boundaries where applicable.
 6. Sample retained media across cameras, including source deletion after grace and legacy fallback.
 7. Review orphaned partials/unregistered files without deleting them until ownership is established.
-8. Verify the newest backup, off-site copy, and encryption-key escrow.
-9. Review PostgreSQL WAL generation, archive/backup growth, and the tested endpoint-recovery snapshot.
+8. In `single` mode, verify the newest backup, off-site copy, and encryption-key escrow. In disabled
+   mode, confirm backup-command refusal/unchanged state and verify the site-approved recovery/export
+   procedure.
+9. Review PostgreSQL WAL generation and archive growth. In `single` mode, also review backup growth
+   and the tested endpoint-recovery snapshot; in disabled mode, review the site-approved
+   recovery/export evidence.
 10. Compare CPU, memory, disk latency, WAL, and query latency with the prior baseline.
 11. Record findings, corrective actions, owner, and deadline in the site's operations system.
 

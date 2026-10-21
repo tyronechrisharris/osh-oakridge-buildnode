@@ -98,8 +98,8 @@ launcher authorizes backup protection only for immutable daily-file lane/days wh
 and exact sealed-segment inventory are present in that authenticated core. It then writes and
 validates `JOURNAL_CONFIRMED`; only that receipt completes schema-v2 acceptance. The launcher next
 atomically replaces authenticated `CURRENT`; that pointer replacement is the commit point. Only
-afterward may it remove a previous non-current verified snapshot. Services that were running are
-restarted after the acceptance gates. A failure before the pointer switch leaves the prior current
+afterward may it remove a previous non-current fully accepted schema-v2 snapshot. Services that were
+running are restarted after the acceptance gates. A failure before the pointer switch leaves the prior current
 snapshot authoritative; a failure afterward leaves the new snapshot authoritative and defers stale
 cleanup to a later locked command.
 
@@ -242,26 +242,32 @@ Expected stages are:
 8. atomic `VERIFIED` core verification, then offline confirmation of only the published journal
    lane/days and exact sealed segments captured by that core, followed by the authenticated
    `JOURNAL_CONFIRMED` receipt that completes schema-v2 acceptance; and
-9. atomic authenticated `CURRENT` replacement, removal of only stale non-current verified
-   snapshots, then service resume and health wait.
+9. atomic authenticated `CURRENT` replacement, removal of only stale non-current schema-v2
+   snapshots that independently pass full core and acceptance verification, then service resume and
+   health wait.
 
 There is one logical current snapshot. A second successful backup does not create a retention chain:
-it commits the new snapshot through `CURRENT` and then cleans the prior verified snapshot. Stale
-`.partial`, unverified, unknown, or unauthenticated directories are never selected as current or
-deleted merely because of age. Keep independent off-host copies under site policy; they are not
-managed by the local `CURRENT` pointer.
+it commits the new snapshot through `CURRENT` and then cleans the prior fully authenticated and
+accepted schema-v2 snapshot. Schema-v1, failed, `.partial`, unverified, unaccepted, unknown, or
+unauthenticated directories are preserved with warnings rather than selected or deleted merely
+because of age or name. Keep independent off-host copies under site policy; they are not managed by
+the local `CURRENT` pointer.
 
 "One current snapshot" describes steady state, not peak disk use. During replacement the backup
 root must have room for both the old snapshot and the complete new candidate until `CURRENT`
 commits. A crash can also leave a published non-current snapshot or private staging debris. If
-`CURRENT` exists, the next locked storage command authenticates it before reconciling anything. If
-the first schema-v2 backup failed before any `CURRENT` commit, the command independently
-authenticates and retires only those uncommitted schema-v2 candidates; pre-3.9.2 schema-v1 recovery
-points are preserved, including restoration of an interrupted legacy deletion tombstone. An
-authenticated schema-v2 candidate is first durably renamed to the exact
-`.deleting-uncommitted-v2-<backup-id>` form, allowing a later command to safely resume a partially
-completed removal after power loss. A malformed, non-regular, reparse-point, or dangling `CURRENT`
-entry fails closed before any candidate is changed.
+`CURRENT` exists, the next locked storage command requires both its authenticated pointer and its
+fully authenticated schema-v2 acceptance receipts before reconciling anything. Every non-current
+final directory or deletion tombstone must independently pass the same core and acceptance checks
+before removal; a name alone never authorizes recursive deletion. Schema-v1, failed, partial,
+unauthenticated, and unaccepted candidates are preserved with warnings. If no `CURRENT` exists and
+exactly one fully accepted schema-v2 candidate exists, the launcher reconstructs authenticated
+`CURRENT` for it instead of erasing the only recovery point. Multiple accepted candidates are all
+preserved and the command stops for operator review. Interrupted legacy schema-v1 deletion
+tombstones are restored; old `.deleting-uncommitted-v2-*` and incomplete deletion tombstones are
+preserved because their remaining contents cannot prove deletion authorization. A malformed,
+non-regular, reparse-point, dangling, or acceptance-invalid `CURRENT` entry fails closed before any
+candidate is changed.
 
 The cleanup trap attempts to resume services if a stage fails. Always run `status` after a failed
 backup and inspect both OSCAR and PostgreSQL logs. If structural verification succeeds but the
@@ -545,8 +551,8 @@ a current PITR chain.
 The local backup root has one authenticated logical current snapshot. `CURRENT`, not modification
 time or directory sort order, selects it. A new backup is built and verified without disturbing the
 old pointer; after the new snapshot is accepted and journal-confirmed, an atomic `CURRENT`
-replacement commits it. Cleanup may then remove the prior non-current verified snapshot. This order
-prevents a failed backup or crash from leaving zero authenticated recovery points.
+replacement commits it. Cleanup may then remove the prior non-current fully accepted schema-v2
+snapshot. This order prevents a failed backup or crash from leaving zero authenticated recovery points.
 
 `backup-prune` is retired. It remains accepted only to print retirement guidance and performs no
 deletion. `OSCAR_BACKUP_RETENTION_COUNT` and `OSCAR_BACKUP_AUTO_PRUNE` are ignored legacy settings

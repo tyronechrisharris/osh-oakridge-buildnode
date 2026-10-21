@@ -26,6 +26,24 @@ const fail = message => {
     process.exitCode = 1;
 };
 
+const validateLocalizedMediaDefaults = relative => {
+    const source = fs.readFileSync(path.join(root, relative), 'utf8');
+    const section = source.match(/^### 4\.3[^\n]*\n([\s\S]*?)(?=\n### |(?![\s\S]))/m)?.[1];
+    if (!section) {
+        fail(`${relative} is missing localized video-retention section 4.3`);
+        return;
+    }
+    const numericDefaults = section.split(/\r?\n/)
+        .filter(line => line.startsWith('|'))
+        .map(line => line.split('|').slice(1, -1).map(cell => cell.trim()))
+        .filter(cells => cells.length >= 3 && /^\d+$/.test(cells[1]))
+        .map(cells => Number(cells[1]));
+    const expected = [1, 5, 6, 24, 360, 2, 24, 24, 15, 200, 200, 5, 85, 24];
+    if (JSON.stringify(numericDefaults) !== JSON.stringify(expected)) {
+        fail(`${relative} video-retention defaults do not match the production profile`);
+    }
+};
+
 if (requestedVersion && sourceVersion !== requestedVersion) {
     fail(`expected build.gradle version ${requestedVersion}, received ${sourceVersion || '<unresolved>'}`);
 }
@@ -52,6 +70,14 @@ if (env.OSCAR_BACKUP_MODE !== 'disabled') {
 }
 for (const retiredName of ['OSCAR_BACKUP_RETENTION_COUNT', 'OSCAR_BACKUP_AUTO_PRUNE']) {
     if (Object.hasOwn(env, retiredName)) fail(`${retiredName} is retired from the single-snapshot backup contract`);
+}
+const backupDisabledMessages = {
+    'oscar-storage.sh': 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.',
+    'oscar-storage.ps1': 'OSCAR backups are disabled. Re-run upgrade with -BackupMode single -BackupDir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.',
+};
+for (const [relative, expected] of Object.entries(backupDisabledMessages)) {
+    const source = fs.readFileSync(path.join(root, relative), 'utf8');
+    if (!source.includes(expected)) fail(`${relative} does not provide platform-correct disabled-backup guidance`);
 }
 
 const expected = [
@@ -183,8 +209,30 @@ if (!fs.existsSync(standardConfigPath)) {
         const expectedArchiveOutputs = [
             'gammaCounts', 'gammaThreshold', 'neutronCounts', 'setupGamma', 'setupNeutron',
         ];
-        if (oscarServiceConfig?.videoRetentionConfig?.timeToRetention !== 0) {
-            fail('the standard video-retention age must be 0 days (first eligible cycle)');
+        const videoRetentionConfig = oscarServiceConfig?.videoRetentionConfig;
+        const dailyJournalConfig = modules.find(module =>
+            module?.objClass === 'com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig');
+        const expectedVideoRetention = {
+            timeToRetention: 1,
+            videoQueryPeriod: 5,
+            maximumCatchUpHours: 6,
+            lateArrivalOverlapHours: 24,
+            lateArrivalScanPeriodMinutes: 360,
+            lateArrivalCatchUpHours: 2,
+            reconciliationCatchUpHours: 24,
+            reconciliationPeriodHours: 24,
+            occupancyStreamRefreshMinutes: 15,
+            enableFrameRetention: true,
+            frameRetentionCount: 5,
+            jpegQuality: 85,
+            sourceRollbackGraceHours: 24,
+            maintenanceWorkLimit: 200,
+            metadataReclamationWorkLimit: 200,
+        };
+        for (const [field, expected] of Object.entries(expectedVideoRetention)) {
+            if (videoRetentionConfig?.[field] !== expected) {
+                fail(`the standard video-retention ${field} must be ${expected}`);
+            }
         }
         if (archiveConfig?.hotRetentionDays !== 2) {
             fail('the standard cold-tier eligibility age must be 2 days');
@@ -194,6 +242,13 @@ if (!fs.existsSync(standardConfigPath)) {
         }
         if (archiveConfig?.deleteHotAfterArchive !== true) {
             fail('the standard profile must delete eligible hot observations after verified overlap');
+        }
+        if (archiveConfig?.requireParityReceipt !== true) {
+            fail('the standard profile must require a parity receipt before deleting eligible hot observations');
+        }
+        if (dailyJournalConfig?.sealedJournalRetentionDays !== 30 ||
+            dailyJournalConfig?.requireBackupBeforeSealedJournalDeletion !== false) {
+            fail('the standard daily journal must retain sealed sources for 30 days and use exact replay without requiring managed backup');
         }
         if (JSON.stringify(archiveConfig?.outputNames) !== JSON.stringify(expectedArchiveOutputs)) {
             fail('the standard cold tier must remain limited to the five approved high-volume output names');
@@ -231,6 +286,11 @@ for (const relative of files) {
 }
 
 const markdownFiles = files.filter(relative => relative.endsWith('.md'));
+for (const manual of ['README.md', 'README_es.md', 'README_fr.md', 'README_el.md']) {
+    const relative = `documentation/operator-manual/${manual}`;
+    if (!files.includes(relative)) fail(`missing localized operator manual ${relative}`);
+    else validateLocalizedMediaDefaults(relative);
+}
 const linkPattern = /!?\[[^\]]*\]\(([^)]+)\)/g;
 for (const relative of markdownFiles) {
     const source = fs.readFileSync(path.join(root, relative), 'utf8');

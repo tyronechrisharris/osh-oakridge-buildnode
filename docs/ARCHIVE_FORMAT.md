@@ -163,7 +163,7 @@ deployment running the matching release rather than starting older code on a new
 | `oscar_deletion_plan` / `oscar_deletion_plan_item` | Frozen, expiring cold-deletion selection |
 | `oscar_deletion_ledger` | Per-object deletion audit trail |
 | `oscar_media_manifest` / `oscar_media_asset` | Reserved structured media catalog records |
-| `oscar_backup_epoch` | Link between a backup manifest/WAL location and the bounded count, byte length, and SHA-256 receipt for its authenticated active/sealed-generation inventory; exact UUIDs stay in the backup file rather than a per-backup PostgreSQL array |
+| `oscar_backup_epoch` | Link between a coordinated backup manifest and the bounded count, byte length, and SHA-256 receipt for its authenticated active/sealed-generation inventory; exact UUIDs stay in the backup file rather than a per-backup PostgreSQL array |
 
 Generation states used by the observation reader/lifecycle are:
 
