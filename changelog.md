@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 - Require a fresh 3.9.2 database and standard configuration for the current test systems and new production deployments; preserve any required pre-3.9.2 production history through a separately validated migration
 - Make the five allowlisted high-volume outputs Parquet-eligible after 48 hours and delete only exact generation-owned hot rows after parity plus a verified 24-hour overlap (about 72 hours plus scheduling); other observations and tables remain hot
 - Replace aging-video keyframe reduction with an additive exact-five JPEG retained-media format; keep the legacy occupancy `videoPaths` field and Viewer playback fallback for old/unconverted events
-- Make completed alarm video eligible for five-JPEG conversion after one day, preserve the source MP4 for 24 hours after verified publication, and keep every failed/fewer-than-five-frame source intact
+- Make completed alarm video immediately eligible for asynchronous five-JPEG conversion on the next retention scan, preserve the source MP4 for 24 hours after verified publication, and keep every failed/fewer-than-five-frame source intact
 - Make new self-signed deployments LAN/Tailscale-ready by adding active non-container LAN IPv4, stable Tailscale IPv4/IPv6, and discoverable MagicDNS identity to certificate SANs, accepting explicit additional DNS/IP SANs, validating every requested identity, and printing covered client URLs plus a verifiable public-certificate fingerprint
 
 ### Storage and data lifecycle
@@ -58,13 +58,13 @@ All notable changes to this project will be documented in this file.
 - Fail closed unless retained media can resolve the authoritative `urn:osh:system:lane:*` parent, preventing a camera set from being committed under an RPM UID
 - Bind each retention scan to a cancellable PostgreSQL operation and honor interruption between bounded maintenance items, allowing the supported OSCAR-before-PostgreSQL restart sequence to drain a historical backlog without leaving a database query running
 - Preserve a successfully converted source for a configurable 24-hour rollback grace and delete it only on a later verified, unheld lifecycle pass
-- Begin five-JPEG conversion at one day in the production profile, scan forward work in bounded five-minute windows, cache occupancy datastream IDs for 15 minutes, and persist bounded late-arrival plus repeating historical reconciliation cursors so restarts, delayed commits, and clock corrections do not skip eligible media
+- Set the production profile to zero-day five-JPEG eligibility, scan asynchronous work in bounded five-minute windows, cache occupancy datastream IDs for 15 minutes, and persist bounded late-arrival plus repeating historical reconciliation cursors so restarts, delayed commits, and clock corrections do not skip eligible media
 - Add an authenticated read-only event media API and Viewer five-frame gallery, with `404` fallback to unchanged legacy video playback
 - Enforce streaming catalog/asset transfer limits plus bounded retained-media camera, frame-byte, dimension, decoded-pixel, and event-wide budgets in the Viewer; fetch only each camera's selected frame and limit event-wide frame-request concurrency
 - Restrict storage-pressure cleanup to complete cataloged media sets, honor holds and source grace, publish `DELETING` before removal, and leave legacy video, daily files, adjudications, reports, and archives untouched
 
 ### Backup, deletion, and operations
-- Default fresh deployments to `OSCAR_BACKUP_MODE=disabled`; require explicit `single` opt-in and a secondary-drive path before backup, verification, restore, or the retired prune command can run
+- Default fresh deployments to `OSCAR_BACKUP_MODE=disabled`; require explicit `single` opt-in and an operator-selected safe absolute non-overlapping backup path before backup, verification, restore, or the retired prune command can run; recommend, but do not require, a separate physical drive for failure isolation
 - Recover a unique fully accepted first-backup snapshot by reconstructing authenticated `CURRENT`; preserve ambiguous accepted sets plus schema-v1, failed, partial, unauthenticated, unaccepted, and incomplete deletion candidates for operator review, and fail closed on unsafe or acceptance-invalid `CURRENT`
 - Add coordinated schema-v2 snapshot commands for a streamed PostgreSQL base backup, OSCAR state, primary Parquet cold tier, release metadata, and AES-256-CBC/PBKDF2-encrypted deployment credentials; omit cumulative `wal-archive.tar.gz`
 - Automatically verify each new snapshot with SHA-256 and `pg_verifybackup`, retain versioned backup-epoch manifests and `VERIFIED` markers, and commit exactly one logical current snapshot through a four-line HMAC-authenticated `CURRENT` pointer

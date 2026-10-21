@@ -35,11 +35,11 @@ deployment and storage commands fail closed there.
 | Cold detector observations | `${OSCAR_ARCHIVE_DIR}` bind mount | Tiered OSH database and archive catalog | Immutable Parquet generation plus manifest and schema snapshot |
 | Daily-file source journal | `files/.dailyfile-journal` in `oscar_state` | Daily File Journal service | Per-lane framed segments and publication ledger; private sealed segments expire after 30 days only after immutable-publication validation and exact frozen replay, with an optional additional backup gate |
 | Published daily files | `files/dailyfiles` in `oscar_state` | Daily File Journal service | Immutable legacy CSV plus versioned SHA-256 manifest |
-| Current alarm video | `files/videos` in `oscar_state` | Bucket and OSCAR services | Five-JPEG conversion becomes eligible after one day; source MP4 remains for 24 hours after verified publication |
+| Current alarm video | `files/videos` in `oscar_state` | Bucket and OSCAR services | Five-JPEG conversion is immediately eligible after completion and begins asynchronously on a retention scan; source MP4 remains for 24 hours after verified publication |
 | Retained alarm media | `files/videos/retained-media/v1` in `oscar_state` | Retained-media backend | Exactly five JPEGs, manifest, and job ledger |
 | Reports, adjudication artifacts, sitemap | Bucket directories in `oscar_state` | Bucket and OSCAR services | Not deleted by cold-observation or storage-pressure maintenance |
 | Legacy PostgreSQL WAL root | Preserved `${OSCAR_WAL_ARCHIVE_DIR}` host path, when present | Administrator legacy data | Not mounted or read by current restore; retained unchanged only to avoid destructive upgrade behavior, not a current PITR chain |
-| Coordinated snapshot | Administrator-owned `${OSCAR_BACKUP_DIR}` host root | OSCAR storage CLI | Disabled by default; `single` mode commits one verified snapshot through authenticated `CURRENT`; never mounted into a long-running service |
+| Coordinated snapshot | Administrator-owned `${OSCAR_BACKUP_DIR}` host root | OSCAR storage CLI | Disabled by default; `single` mode uses an operator-selected safe absolute non-overlapping path and commits one verified snapshot through authenticated `CURRENT`; a separate physical drive is recommended, not required; never mounted into a long-running service |
 | Container logs | Docker `json-file` storage | Docker | Size-rotated per service by Compose |
 
 Paths beginning with `files/` are relative to OSCAR's persistent application directory inside the
@@ -254,8 +254,8 @@ The full journal contract is maintained in the modules repository at
 
 ### Five-frame retained media
 
-With the standard one-day retention age, each eligible camera clip is processed on a bounded
-retained-media lifecycle cycle after it becomes old enough. It is decoded and
+With the standard zero-day retention age, a completed camera clip is immediately eligible and is
+processed asynchronously by the next bounded retained-media lifecycle cycle. It is decoded and
 sampled at `FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`. The five selections must be
 distinct decoded frame ordinals. Each output is an opaque baseline sRGB JPEG; default quality is
 85. Frames are written, forced, decoded and verified independently, then a typed manifest is

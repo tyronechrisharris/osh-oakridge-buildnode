@@ -82,7 +82,7 @@ const dailyJournal = config.find(item =>
     item.objClass === 'com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig');
 const outputs = ['gammaCounts', 'gammaThreshold', 'neutronCounts', 'setupGamma', 'setupNeutron'];
 const expectedVideoRetention = {
-    timeToRetention: 1,
+    timeToRetention: 0,
     videoQueryPeriod: 5,
     maximumCatchUpHours: 6,
     lateArrivalOverlapHours: 24,
@@ -198,8 +198,13 @@ fi
 
 assert_contains '--backup-mode disabled\|single' "$setup_shell_script"
 assert_contains '--backup-dir ABSOLUTE_PATH' "$setup_shell_script"
+assert_contains 'safe absolute path that does not overlap the release or archive roots' "$setup_shell_script"
+assert_contains 'safe absolute path that does not overlap the release or archive roots' "$setup_powershell_script"
 assert_contains 'backup\|backup-verify\|backup-prune\|restore\)' "$shell_script"
-assert_contains 'Re-run upgrade with -BackupMode single -BackupDir <absolute-secondary-drive-path>' "$powershell_script"
+assert_contains 'Re-run upgrade with -BackupMode single -BackupDir <safe-absolute-backup-path>' "$powershell_script"
+for backup_policy_script in "$setup_shell_script" "$setup_powershell_script" "$shell_script" "$powershell_script"; do
+    assert_not_contains 'secondary[- ]drive|absolute-secondary-drive-path' "$backup_policy_script"
+done
 write_backup_mode_environment 'OSCAR_BACKUP_MODE=disabled'
 if disabled_backup_error=$(bash -c '
     storage_script=$1
@@ -210,7 +215,7 @@ if disabled_backup_error=$(bash -c '
     printf 'Disabled backup mode allowed a protected backup command.\n' >&2
     exit 1
 fi
-grep -Fq -- '--backup-mode single --backup-dir <absolute-secondary-drive-path>' <<<"$disabled_backup_error" || {
+grep -Fq -- '--backup-mode single --backup-dir <safe-absolute-backup-path>' <<<"$disabled_backup_error" || {
     printf 'Disabled backup-mode error did not provide exact upgrade opt-in guidance.\n' >&2
     exit 1
 }

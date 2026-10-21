@@ -217,7 +217,7 @@ function Get-ValidatedBackupMode {
 
 function Assert-BackupModeEnabled {
     if ((Get-ValidatedBackupMode) -cne 'single') {
-        Fail 'OSCAR backups are disabled. Re-run upgrade with -BackupMode single -BackupDir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+        Fail 'OSCAR backups are disabled. Re-run upgrade with -BackupMode single -BackupDir <safe-absolute-backup-path> before using backup, verification, pruning, or restore.'
     }
 }
 

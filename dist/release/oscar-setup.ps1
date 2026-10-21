@@ -511,7 +511,7 @@ function Set-RequestedBackupConfiguration([string]$SourceMode, [switch]$Fresh) {
     if ($targetMode -cnotin @('disabled', 'single')) { throw 'OSCAR_BACKUP_MODE must be disabled or single.' }
     if ($BackupDir -and $targetMode -cne 'single') { throw '-BackupDir may be used only with -BackupMode single.' }
     if (($Fresh -and $targetMode -ceq 'single') -or ($SourceMode -ceq 'disabled' -and $targetMode -ceq 'single')) {
-        if (-not $BackupDir) { throw 'Enabling single-backup mode requires -BackupDir with an absolute dedicated backup path.' }
+        if (-not $BackupDir) { throw 'Enabling single-backup mode requires -BackupDir with a safe absolute path that does not overlap the release or archive roots.' }
     }
     if ($BackupDir) {
         if (-not (Test-FullyQualifiedDeploymentPath $BackupDir)) { throw '-BackupDir must be an absolute path on a local volume.' }

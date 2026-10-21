@@ -88,7 +88,7 @@ configured_backup_mode() {
 
 require_single_backup_mode() {
     [[ $(configured_backup_mode) == single ]] ||
-        fail 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+        fail 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <safe-absolute-backup-path> before using backup, verification, pruning, or restore.'
 }
 
 assert_managed_environment_bindings() {

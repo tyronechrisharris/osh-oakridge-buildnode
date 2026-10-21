@@ -136,7 +136,7 @@
     "objClass": "com.botts.impl.service.oscar.OSCARServiceConfig",
     "videoRetentionConfig": {
       "objClass": "com.botts.impl.service.oscar.video.VideoRetentionConfig",
-      "timeToRetention": 1,
+      "timeToRetention": 0,
       "videoQueryPeriod": 5,
       "maximumCatchUpHours": 6,
       "lateArrivalOverlapHours": 24,

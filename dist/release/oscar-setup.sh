@@ -96,7 +96,7 @@ done
 [[ -z $backup_mode_value || $backup_mode_value == disabled || $backup_mode_value == single ]] ||
     fail '--backup-mode must be disabled or single.'
 [[ -z $backup_directory_value || $backup_directory_value == /* ]] ||
-    fail '--backup-dir must be an absolute path on the selected secondary drive.'
+    fail '--backup-dir must be an operator-selected safe absolute path.'
 
 require_admin() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || fail 'Run this command as root (for example, with sudo).'
@@ -1025,7 +1025,7 @@ case "$command_name" in
             fail '--backup-dir is valid only when --backup-mode single is selected.'
         fi
         if [[ $target_backup_mode == single && -z $backup_directory_value ]]; then
-            fail 'Fresh single-backup mode requires --backup-dir on an operator-selected secondary drive.'
+            fail 'Fresh single-backup mode requires --backup-dir with a safe absolute path that does not overlap the release or archive roots.'
         fi
         mkdir -p "$script_dir/secrets" "$script_dir/tls"
         allow_docker_desktop_bind_mount_access
@@ -1114,7 +1114,7 @@ case "$command_name" in
             fail '--backup-dir is valid only when single-backup mode is enabled.'
         fi
         if [[ $current_backup_mode == disabled && $target_backup_mode == single && -z $backup_directory_value ]]; then
-            fail 'Enabling single-backup mode requires --backup-dir on an operator-selected secondary drive.'
+            fail 'Enabling single-backup mode requires --backup-dir with a safe absolute path that does not overlap the release or archive roots.'
         fi
         [[ -z $backup_mode_value ]] || set_env_value OSCAR_BACKUP_MODE "$backup_mode_value"
         [[ -z $backup_directory_value ]] || set_env_value OSCAR_BACKUP_DIR "$backup_directory_value"

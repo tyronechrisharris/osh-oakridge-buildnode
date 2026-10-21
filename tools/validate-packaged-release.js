@@ -38,7 +38,7 @@ const validateLocalizedMediaDefaults = relative => {
         .map(line => line.split('|').slice(1, -1).map(cell => cell.trim()))
         .filter(cells => cells.length >= 3 && /^\d+$/.test(cells[1]))
         .map(cells => Number(cells[1]));
-    const expected = [1, 5, 6, 24, 360, 2, 24, 24, 15, 200, 200, 5, 85, 24];
+    const expected = [0, 5, 6, 24, 360, 2, 24, 24, 15, 200, 200, 5, 85, 24];
     if (JSON.stringify(numericDefaults) !== JSON.stringify(expected)) {
         fail(`${relative} video-retention defaults do not match the production profile`);
     }
@@ -72,8 +72,8 @@ for (const retiredName of ['OSCAR_BACKUP_RETENTION_COUNT', 'OSCAR_BACKUP_AUTO_PR
     if (Object.hasOwn(env, retiredName)) fail(`${retiredName} is retired from the single-snapshot backup contract`);
 }
 const backupDisabledMessages = {
-    'oscar-storage.sh': 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.',
-    'oscar-storage.ps1': 'OSCAR backups are disabled. Re-run upgrade with -BackupMode single -BackupDir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.',
+    'oscar-storage.sh': 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <safe-absolute-backup-path> before using backup, verification, pruning, or restore.',
+    'oscar-storage.ps1': 'OSCAR backups are disabled. Re-run upgrade with -BackupMode single -BackupDir <safe-absolute-backup-path> before using backup, verification, pruning, or restore.',
 };
 for (const [relative, expected] of Object.entries(backupDisabledMessages)) {
     const source = fs.readFileSync(path.join(root, relative), 'utf8');
@@ -213,7 +213,7 @@ if (!fs.existsSync(standardConfigPath)) {
         const dailyJournalConfig = modules.find(module =>
             module?.objClass === 'com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig');
         const expectedVideoRetention = {
-            timeToRetention: 1,
+            timeToRetention: 0,
             videoQueryPeriod: 5,
             maximumCatchUpHours: 6,
             lateArrivalOverlapHours: 24,
@@ -318,7 +318,8 @@ const staleDocumentation = [
     [/newest 14 verified|14 verified (?:local )?backups/i, 'retired fourteen-backup policy'],
     [/PostgreSQL (?:stays online|is then stopped)[^\n]*archived-WAL|stable archived-WAL snapshot/i, 'retired v2 archived-WAL snapshot flow'],
     [/shipping (?:copy-only profile|default)[^\n]*deleteHotAfterArchive[^\n]*false|deleteHotAfterArchive=false[^\n]*shipping default/i, 'retired copy-only lifecycle default'],
-    [/video retention age \| 7 days|timeToRetention` \(seven days by default\)|after the configured seven-day retention age/i, 'retired seven-day media default'],
+    [/video retention age \| (?:1|7) days?|timeToRetention(?:=|` \()(?:1|one|seven)\b|five[- ]JPEGs?[^\n]{0,80}(?:after|at) one day|(?:after|at) one day[^\n]{0,80}five[- ]JPEGs?|one-day[^\n]{0,80}(?:exact-five[ -]?|five[- ])JPEGs?|after the configured seven-day retention age/i, 'retired delayed media default'],
+    [/secondary[- ]drive|absolute-secondary-drive-path/i, 'retired mandatory-secondary-drive backup wording'],
     [/archive hot retention \| 30 days|older than 30 days|after the 30-day cutoff/i, 'retired thirty-day cold-tier default'],
 ];
 for (const relative of markdownFiles) {

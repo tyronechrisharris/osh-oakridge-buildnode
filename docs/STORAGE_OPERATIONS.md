@@ -60,7 +60,7 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Parquet compression | ZSTD level 6 | Cold-storage size/CPU tradeoff |
 | Archive rollback grace | 1 day | Verified hot/cold overlap after activation before exact hot-row deletion |
 | `deleteHotAfterArchive` | `true` | Deletes only generation-owned eligible rows after parity and overlap, normally about 72 hours after observation plus scheduling |
-| Video retention age | 1 day | Makes a completed source video eligible for five-JPEG conversion after one day |
+| Video retention age | 0 days | Makes a completed source video immediately eligible for asynchronous five-JPEG conversion on a retention scan |
 | Retention scan / catch-up | 5 min / 6 h forward | Bounds normal discovery and catch-up work after downtime |
 | Late-arrival scan | every 6 h / 2 h per pass / 24 h allowance | Rechecks delayed observations without an all-history rescan |
 | Historical reconciliation | every 24 h / 24 h per pass | Durable repair path for older eligible observations |
@@ -103,7 +103,9 @@ the file shipped in the ZIP became active.
 ## New installation and storage paths
 
 For a new 3.9.2 production system, keep the live archive on durable monitored storage. Backup mode
-is disabled until an administrator deliberately selects a secondary-drive backup path:
+is disabled until an administrator deliberately selects a safe absolute backup path that does not
+overlap the release or archive roots. A separate physical drive is recommended for failure
+isolation, but it is not required:
 
 ```dotenv
 OSCAR_ARCHIVE_DIR=/absolute/path/to/oscar-storage/archive
@@ -259,7 +261,7 @@ Review parity receipts and failed archive jobs with the queries below.
 If the site requires OSCAR-managed recovery snapshots, opt in explicitly:
 
 ```sh
-sudo bash oscar.sh upgrade --backup-mode single --backup-dir /absolute/secondary/oscar-backups
+sudo bash oscar.sh upgrade --backup-mode single --backup-dir /srv/oscar-backups
 ```
 
 ```powershell

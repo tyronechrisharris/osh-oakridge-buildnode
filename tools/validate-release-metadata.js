@@ -70,7 +70,7 @@ function requireLocalizedMediaDefaults(relativePath) {
         .map((line) => line.split('|').slice(1, -1).map((cell) => cell.trim()))
         .filter((cells) => cells.length >= 3 && /^\d+$/.test(cells[1]))
         .map((cells) => Number(cells[1]));
-    const expected = [1, 5, 6, 24, 360, 2, 24, 24, 15, 200, 200, 5, 85, 24];
+    const expected = [0, 5, 6, 24, 360, 2, 24, 24, 15, 200, 200, 5, 85, 24];
     if (JSON.stringify(numericDefaults) !== JSON.stringify(expected)) {
         throw new Error(`${relativePath}: localized video-retention defaults do not match the production profile.`);
     }
@@ -103,7 +103,7 @@ const videoRetention = standardOscar[0].videoRetentionConfig;
 const archive = standardDatabases[0].dbConfig?.archive;
 const dailyJournal = standardDailyJournals[0];
 const expectedStorageDefaults = {
-    'videoRetentionConfig.timeToRetention': [videoRetention?.timeToRetention, 1],
+    'videoRetentionConfig.timeToRetention': [videoRetention?.timeToRetention, 0],
     'videoRetentionConfig.videoQueryPeriod': [videoRetention?.videoQueryPeriod, 5],
     'videoRetentionConfig.maximumCatchUpHours': [videoRetention?.maximumCatchUpHours, 6],
     'videoRetentionConfig.lateArrivalOverlapHours': [videoRetention?.lateArrivalOverlapHours, 24],

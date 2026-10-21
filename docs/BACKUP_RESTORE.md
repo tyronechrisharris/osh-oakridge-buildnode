@@ -146,11 +146,13 @@ so those exact images can be reloaded after a host loss.
 
 ## Before the first backup
 
-Fresh initialization leaves backup mode disabled. To opt in, select a durable secondary-drive path
-and run the supported setup workflow; do not hand-edit the mode around setup validation:
+Fresh initialization leaves backup mode disabled. To opt in, select an operator-controlled safe
+absolute path that does not overlap the release or archive roots and run the supported setup
+workflow; do not hand-edit the mode around setup validation. A separate physical drive is
+recommended for failure isolation, but it is not required:
 
 ```sh
-sudo bash oscar.sh upgrade --backup-mode single --backup-dir /absolute/secondary/oscar-backups
+sudo bash oscar.sh upgrade --backup-mode single --backup-dir /srv/oscar-backups
 ```
 
 ```powershell

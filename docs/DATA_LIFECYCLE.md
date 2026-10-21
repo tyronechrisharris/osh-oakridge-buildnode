@@ -14,7 +14,7 @@ hosts. macOS deployment and storage operations fail closed; it is not a supporte
 | Selected high-volume detector observations | Copy to an `ACTIVE` Parquet generation when older than 48 hours | Valid Parquet/schema/manifest objects, active catalog generation, exact-row parity receipt, 24-hour overlap, no applicable hold | Yes for exact eligible rows in the shipping profile, normally about 72 hours after observation plus scheduling |
 | Other PostgreSQL observations and transactional records | Remain hot | Existing application policy | Not by the cold-tier scheduler |
 | Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV, v1 manifest, `PUBLISHED` ledger, 30 days after the later of day close or actual publication, and exact sealed-journal replay parity; sites may additionally require verified backup confirmation | Yes for eligible private sealed segments; published daily files are not pressure-cleanup candidates |
-| Alarm source MP4 | Attempt exactly five JPEGs after one day | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
+| Alarm source MP4 | Immediately eligible for an asynchronous attempt to publish exactly five JPEGs | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
 | Retained five-JPEG media set | Remains available | Complete set, no hold, rollback grace elapsed, minimum pressure age met, filesystem at pressure threshold | Yes, only under configured storage pressure |
 | Uncatalogued legacy video | Legacy behavior only | Not eligible for new pressure cleanup | No |
 | Daily files, reports, adjudication, sitemap | Remain in application state | Site policy and explicit administration | No by storage-pressure cleanup |
@@ -299,8 +299,8 @@ original occupancy.
 
 ### Five-frame publication
 
-With the standard `timeToRetention=1`, the sliding retention query processes each eligible camera
-source on its first lifecycle cycle. It decodes the clip twice: first to construct the frame timeline, then to capture the five
+With the standard `timeToRetention=0`, each completed camera source is immediately eligible; the
+sliding retention query processes it asynchronously on a retention cycle (every five minutes by default). It decodes the clip twice: first to construct the frame timeline, then to capture the five
 selected distinct ordinals. A valid set contains:
 
 1. first frame;
