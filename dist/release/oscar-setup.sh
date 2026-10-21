@@ -793,8 +793,10 @@ prepare_deployment_images() {
         heading 'Importing offline container images'
         docker load --input "$script_dir/offline-images.tar"
     else
-        while IFS= read -r image; do container_image_exists "$image" || missing+=("$image"); done < <(required_images)
-        ((${#missing[@]} == 0)) && return
+        # Connected releases build both local contexts on every mutating init/
+        # upgrade. A matching mutable pre-release tag is not proof that its
+        # bytes came from this extracted release (and can otherwise leave an
+        # older PostGIS restore helper paired with a newer OSCAR image).
         heading 'Building deployment images'
         compose build oscar postgres
 

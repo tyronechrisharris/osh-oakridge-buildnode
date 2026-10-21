@@ -688,8 +688,8 @@ ps_upgrade_case=$(extract_case_body "$setup_powershell_script" "        'upgrade
     exit 1
 }
 
-# A connected init/upgrade may need to rebuild the local OSCAR/PostGIS images
-# while the pinned gateway image is already cached. Recheck the inventory after
+# A connected init/upgrade always rebuilds the local OSCAR/PostGIS images, even
+# when their mutable pre-release tags are cached. Recheck the inventory after
 # those builds: an unnecessary gateway pull would make that valid local state
 # depend on registry credentials/network access. Pull remains required when the
 # gateway really is absent.
@@ -732,7 +732,7 @@ bash -c '
     gateway_present=true
     actions=()
     prepare_deployment_images
-    [[ ${#actions[@]} == 0 ]] || exit 43
+    [[ ${#actions[@]} == 1 && ${actions[0]} == "build oscar postgres" ]] || exit 43
 ' _ "$setup_shell_script" || {
     printf 'Bash connected image preparation did not avoid an unnecessary cached-gateway pull.\n' >&2
     exit 1

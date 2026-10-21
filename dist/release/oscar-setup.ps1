@@ -933,8 +933,10 @@ function Prepare-DeploymentImages {
         Write-Heading 'Importing offline container images'
         Invoke-External 'docker' @('load', '--input', $offlineArchive)
     } else {
-        $missingImages = @($requiredImages | Where-Object { -not (Test-ContainerImage $_) })
-        if ($missingImages.Count -eq 0) { return }
+        # Connected releases build both local contexts on every mutating init/
+        # upgrade. A matching mutable pre-release tag is not proof that its
+        # bytes came from this extracted release (and can otherwise leave an
+        # older PostGIS restore helper paired with a newer OSCAR image).
         Write-Heading 'Building deployment images'
         Build-ConnectedDeploymentImages
 

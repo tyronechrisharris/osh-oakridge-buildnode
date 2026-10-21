@@ -230,8 +230,9 @@ try {
         $script:GatewayPresent = $true
         $script:ImagePreparationActions.Clear()
         Prepare-DeploymentImages
-        Assert-True ($script:ImagePreparationActions.Count -eq 0) `
-            'Windows connected image preparation mutated a complete local image inventory.'
+        Assert-True ($script:ImagePreparationActions.Count -eq 1 -and
+            $script:ImagePreparationActions[0] -ceq 'build-local') `
+            'Windows connected image preparation trusted stale mutable local image tags.'
     }
     Assert-True ($setupSource.Contains("'build', '--build-arg', `"OSCAR_VERSION=`$version`", '--tag', `"oscar:`$version`"")) `
         'Windows connected setup does not build the OSCAR image from its exact local release context.'
