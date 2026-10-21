@@ -79,7 +79,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "curl --silent --show-error --output /dev/null http://127.0.0.1:8282/"]
+      test: ["CMD-SHELL", "test -f /tmp/oscar-ready && curl --silent --show-error --output /dev/null http://127.0.0.1:8282/"]
       start_period: 90s
       interval: 30s
       timeout: 5s

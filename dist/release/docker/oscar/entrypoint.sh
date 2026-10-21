@@ -7,7 +7,9 @@ DEFAULT_CONFIG=/opt/oscar/config.json
 ADMIN_PASSWORD_FILE="${INITIAL_ADMIN_PASSWORD_FILE:-/run/secrets/oscar_admin_password}"
 DB_PASSWORD_FILE="${OSCAR_DB_PASSWORD_FILE:-/run/secrets/oscar_db_password}"
 NATIVE_TMP_DIR=/run/oscar-native
+READY_FILE=/tmp/oscar-ready
 readonly NATIVE_TMP_DIR
+readonly READY_FILE
 
 umask 077
 
@@ -47,6 +49,16 @@ if ! is_tmpfs_mount /tmp \
     || ! mount_has_option /tmp nosuid \
     || ! mount_has_option /tmp nodev; then
     echo "ERROR: /tmp must be a dedicated rw,noexec,nosuid,nodev tmpfs" >&2
+    exit 1
+fi
+
+# Docker can restart the JVM in the same container. Remove any marker left by
+# an ungraceful prior process before the HTTP server has a chance to accept
+# traffic; the OSCAR service republishes it only after every top-level
+# auto-start module is started and its nested members complete their startup
+# attempt, including devices that explicitly settle offline.
+if ! rm -f -- "${READY_FILE}" "${READY_FILE}.tmp"; then
+    echo "ERROR: cannot clear the OSCAR application-readiness marker" >&2
     exit 1
 fi
 if ! is_tmpfs_mount "${NATIVE_TMP_DIR}" \

@@ -256,6 +256,17 @@ explicit removal of every retained data location.
 
 WebID is disabled by default. Failure to reach an optional configured WebID endpoint must not prevent OSCAR from starting.
 
+The OSCAR container health check is an application-readiness check, not merely an HTTP liveness
+probe. It becomes healthy only after the web service and every top-level auto-start module are
+`STARTED`, and after each nested RPM/camera member has completed its startup attempt. A device that
+cannot connect may settle offline while OSCAR remains healthy so the Status of Health page can
+report it. During a 50-lane startup,
+`docker compose ps` may therefore show OSCAR as `starting` after the login endpoint begins to
+respond. Do not chain another restart or storage-maintenance operation during that interval. The
+launcher and storage commands wait for this stronger health signal automatically. An `unhealthy`
+result means at least one required module failed to complete startup; inspect the OSCAR container
+logs for that module.
+
 ## Security verification
 
 After startup:
@@ -293,6 +304,9 @@ and `postgres_data` volumes plus the exact external archive and preserved legacy
 container is required even when an image and service model are unchanged: release-local secret,
 certificate, and gateway-config bind sources and the Compose `working_dir`/`config_files` provenance
 must point to the new clean release directory. It never removes volumes or external storage roots.
+OSCAR health includes complete recursive module readiness, so a successful command cannot return
+while lane RPM or camera initialization is still in flight.
+
 Confirm the result with `oscar.bat status`
 (Windows) or `sudo bash oscar.sh status` (Ubuntu).
 

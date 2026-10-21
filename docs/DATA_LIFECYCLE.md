@@ -162,7 +162,12 @@ deletion flow documented under [Delete old cold generations](STORAGE_OPERATIONS.
 2. `archive purge` accepts only the matching plan and token, briefly stops only a previously running
    OSCAR service, and preflights every relative path and SHA-256 through a networkless, read-only
    one-shot helper that sees only the archive mount. It always attempts to resume OSCAR's prior
-   state and rechecks holds under the same database lock used by hold creation. One transaction
+   state and does not report that resume complete until OSCAR's top-level auto-start services are
+   started and each RPM/camera member nested under a lane has completed its startup attempt. An
+   unavailable device may settle offline while OSCAR remains usable to report that state. This
+   application-readiness barrier prevents a following administrative command from
+   stopping a partially initialized node. Purge rechecks holds under the same database lock used
+   by hold creation. One transaction
    moves every selected generation and object to durable `DELETING` state, making the entire
    generation non-queryable before filesystem removal begins. It then revalidates and deletes each
    object through the helper with archive write access and records `DELETED` or the crash-recovery

@@ -432,7 +432,9 @@ The restore workflow:
     post-promotion write across checkpoint and clean restart while `archive_mode` remains off;
 12. removes the persisted one-time recovery settings, restarts PostgreSQL while OSCAR remains
     stopped, and requires the recovery GUCs to return to defaults with no pending restart; and
-13. starts OSCAR/gateway and waits for complete Compose health.
+13. starts OSCAR/gateway and waits for complete Compose health: top-level auto-start modules must be
+    started and nested lane devices must have completed their startup attempts, rather than merely
+    accepting HTTP availability. A device may settle offline without hiding its status UI.
 
 Decryption, environment merge, credential-tree validation, and schema-v1 payload authentication
 finish before the safety copy is created, services are stopped, or replaceable data is changed. A malformed encrypted set,

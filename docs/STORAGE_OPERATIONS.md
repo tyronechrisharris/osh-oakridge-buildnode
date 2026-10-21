@@ -556,6 +556,16 @@ hours. Finalization preserves the generation tombstone/catalog/deletion ledger b
 removes observation overlays and observation tombstones that carry the exact now-`PURGED`
 generation ID. Legacy unowned mutation rows require a separately reviewed migration.
 
+When OSCAR was running before purge, the command returns only after the web service and all
+top-level auto-start modules have reached `STARTED`, and after every nested lane RPM/camera has
+completed its startup attempt. A disconnected device may settle offline without making OSCAR
+unavailable; the Status of Health page reports that condition.
+
+Docker may show the OSCAR container as `starting` while that bounded application initialization is
+still in progress; this is expected and is stronger than an HTTP-only liveness probe. If it becomes
+`unhealthy`, inspect the OSCAR logs for the specific module that did not start instead of immediately
+issuing another restart.
+
 Afterward, run `archive status`, `archive verify`, a cold-range query, and a backup. Retain the
 approval, dry-run output, deletion ledger, and verification result with records-management evidence.
 

@@ -118,10 +118,15 @@ try {
     Assert-True ($oscarService.Contains('- /tmp:rw,noexec,nosuid,nodev')) 'Compose does not keep OSCAR /tmp noexec.'
     Assert-True ($oscarService.Contains("- $nativeTmpfs")) 'Compose is missing the bounded owner-only executable native tmpfs.'
     Assert-True (([Text.RegularExpressions.Regex]::Matches($compose, [Text.RegularExpressions.Regex]::Escape($nativeTmpfs))).Count -eq 1) 'The executable native tmpfs must be scoped to OSCAR only.'
+    Assert-True ($oscarService.Contains('test -f /tmp/oscar-ready && curl --silent --show-error')) `
+        'Compose health does not require application readiness before HTTP availability.'
 
     $dockerfile = [IO.File]::ReadAllText($oscarDockerfile)
     Assert-True ($dockerfile.Contains('/var/lib/oscar /run/oscar-native')) 'The OSCAR image is missing its private native-tmpfs mount point.'
     $entrypoint = [IO.File]::ReadAllText($oscarEntrypoint)
+    Assert-True ($entrypoint.Contains('READY_FILE=/tmp/oscar-ready')) 'The OSCAR entrypoint is missing the application-readiness path.'
+    Assert-True ($entrypoint.Contains('rm -f -- "${READY_FILE}" "${READY_FILE}.tmp"')) `
+        'The OSCAR entrypoint does not clear stale readiness before JVM startup.'
     $javaOptionsIndex = $entrypoint.IndexOf('exec java ${JAVA_OPTS:-}')
     Assert-True ($javaOptionsIndex -ge 0) 'The OSCAR entrypoint is missing its managed Java launch.'
     foreach ($managedProperty in @(

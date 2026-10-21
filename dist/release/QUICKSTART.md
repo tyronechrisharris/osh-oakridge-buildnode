@@ -185,6 +185,11 @@ Administrator Guide. Preserve its `.oscar-volume-adoption` receipt with `.env`, 
 upgrades through `oscar.bat` or `oscar.sh`, not a direct `docker compose up`: setup validates the
 exact external named volumes before Compose attaches them and force-recreates every service so no
 container retains a secret/config bind or Compose provenance from the prior extracted release.
+The OSCAR container remains `starting` until its HTTP service and all top-level auto-start modules
+are started and every nested lane RPM/camera has completed its startup attempt. Offline devices do
+not prevent access to the Status of Health page; supported setup and storage commands wait only for
+the attempt-complete application-readiness signal before returning.
+
 Delete the prior extracted release only after health and container-mount verification, and never
 delete a persistent archive, legacy WAL, or backup root preserved by `.env`.
 If verified pre-3.9.2 archive or enabled-backup roots are nonempty and have no root marker, the
