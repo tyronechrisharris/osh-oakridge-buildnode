@@ -356,7 +356,9 @@ However, an existing deployment's persistent `config.json` is intentionally not 
 initialized. There is no automatic conversion of an old database/configuration into the complete
 3.9.2 storage profile. The corrected 3.9.2 observation natural-key index also treats null fields as
 equal; index creation fails safely if a legacy database contains duplicates under that definition,
-and those rows require an explicit reviewed migration decision.
+and those rows require an explicit reviewed migration decision. Natural-key verification uses the
+same `COALESCE` expressions as the unique index, including for null fields, so PostgreSQL generic
+prepared plans can probe the complete key instead of scanning every row for a datastream.
 Exact natural-key replays are no-ops, while corrected values retain the original OSH observation
 ID. If the observation is already archive-owned, OSCAR writes the correction to the immutable
 generation's PostgreSQL overlay—both during hot-copy grace and after the hot row has been deleted—

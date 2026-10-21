@@ -142,6 +142,7 @@ jobs:
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.concurrentResultCorrectionRejectsStaleExportAndRetriesExactly \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.concurrentDeleteAndInsertCannotSubstituteForExportedIdentity \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.existingObservationTableReceivesNullSafeNaturalKeyIndex \
+            --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.naturalKeyLookupGenericPlanUsesNullSafeUniqueIndex \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.closeSurfacesFinalFlushFailureAndRetainsPendingObservation \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.archivePayloadByteCapFailsBeforePublication \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.byteHeavyArchiveWindowSplitsAndActivatesBothPrefixes \
