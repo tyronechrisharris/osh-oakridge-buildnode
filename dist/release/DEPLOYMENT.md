@@ -36,7 +36,6 @@ The menu accepts the same command and options shown below. For example, enter `i
 | Upgrade | `oscar.bat upgrade` | `sudo bash oscar.sh upgrade` |
 | Coordinated backup | `oscar.bat backup` | `sudo bash oscar.sh backup` |
 | Verify backup | `oscar.bat backup-verify -BackupId ID` | `sudo bash oscar.sh backup-verify ID` |
-| Prune verified backups/WAL | `oscar.bat backup-prune -Keep 14` | `sudo bash oscar.sh backup-prune --keep 14` |
 | Archive status | `oscar.bat archive status` | `sudo bash oscar.sh archive status` |
 | Archive integrity | `oscar.bat archive verify` | `sudo bash oscar.sh archive verify` |
 | Retention holds | `oscar.bat archive hold list` | `sudo bash oscar.sh archive hold list` |
@@ -217,7 +216,7 @@ tls/server.key
 
 Docker Compose mounts secrets read-only. On Ubuntu, the setup CLI makes `secrets` and `tls` mode `0700`, with contained files readable by the deliberately non-root services. On Windows, it restricts the directories to the installing administrator and `SYSTEM` while preserving container-readable, read-only mounts.
 
-The application configuration is copied into the `oscar_state` volume on first startup. Runtime configuration saves update only that persistent copy. Application libraries and viewer assets remain read-only in the image. PostgreSQL data is stored in the `postgres_data` volume. OSCAR 3.9.2 uses long-lived host bind mounts configured in `.env` for the Parquet archive (`OSCAR_ARCHIVE_DIR`) and PostgreSQL WAL archive (`OSCAR_WAL_ARCHIVE_DIR`). `OSCAR_BACKUP_DIR` is a separate administrator-owned host root that is never mounted into a long-running service; the storage CLI exposes only a selected input or output to a narrowly scoped one-shot helper. Monitor and protect all five persistent locations; a Docker named-volume backup alone is incomplete.
+The application configuration is copied into the `oscar_state` volume on first startup. Runtime configuration saves update only that persistent copy. Application libraries and viewer assets remain read-only in the image. PostgreSQL data is stored in the `postgres_data` volume. OSCAR 3.9.2 uses a long-lived host bind for the primary Parquet cold tier (`OSCAR_ARCHIVE_DIR`). PostgreSQL runs with `archive_mode=off`, no external archive command, and no WAL bind. An existing `OSCAR_WAL_ARCHIVE_DIR` is preserved only to avoid deleting legacy data; current schema-v1/v2 restore does not use it. Fresh deployments set `OSCAR_BACKUP_MODE=disabled`; after explicit `single` opt-in, `OSCAR_BACKUP_DIR` is an administrator-owned host root that is never mounted into a long-running service. A Docker named-volume backup or Parquet copy alone is incomplete.
 
 The OSCAR service keeps the general-purpose `/tmp` tmpfs `noexec`. Embedded Java native libraries,
 including DuckDB JDBC and JavaCPP/FFmpeg, are extracted instead to a separate 256 MiB tmpfs at
@@ -249,10 +248,10 @@ The backup key encrypts `.env`, deployment secrets, and TLS private material ins
 
 The gateway gives content-hashed Viewer files under `/_next/static/` a private, one-year immutable browser cache policy, while `/sw.js` is always revalidated. This prevents repeated full-route navigations from downloading the same application bundles again without allowing a shared proxy to cache an authenticated response. HTML and API responses keep their normal revalidation behavior.
 
-`oscar stop` retains containers, named data volumes, the archive/WAL bind mounts, and the external
+`oscar stop` retains containers, named data volumes, the archive bind, preserved legacy data, and the external
 backup root. Do not use `docker compose down --volumes` as a records-destruction procedure: Compose
 skips OSCAR's external named volumes, and neither that command nor container removal deletes the
-archive, WAL, or backup roots. Authorized permanent destruction therefore requires the documented,
+archive, legacy-WAL, or backup roots. Authorized permanent destruction therefore requires the documented,
 explicit removal of every retained data location.
 
 WebID is disabled by default. Failure to reach an optional configured WebID endpoint must not prevent OSCAR from starting.
@@ -274,7 +273,7 @@ Every reported privilege flag for `oscar_app` must be false. A host scan must sh
 
 ## Upgrade
 
-For a 3.9.2-or-newer same-storage-profile upgrade, create and verify a coordinated backup first. A pre-3.9.2 release does not have that CLI; use that release's supported backup/export procedure and retain the old system read-only until the separately qualified migration is complete. Extract the new release into a clean sibling directory; do not overlay it on the previous release because files removed by the new version would otherwise remain in the image build context. Copy only `.env`, `secrets/`, and `tls/` from the existing deployment into the clean release directory. If the deployment has a `.oscar-volume-adoption` receipt, copy that file too; it is required to keep an intentionally adopted pair of unlabelled legacy volumes bound to the same deployment. Release archives do not contain these runtime files. Preserve the absolute `OSCAR_ARCHIVE_DIR`, `OSCAR_WAL_ARCHIVE_DIR`, and `OSCAR_BACKUP_DIR` values written by initialization; they deliberately point outside the versioned release and must continue to identify the existing storage. Custom relative storage paths are rejected because their meaning would change after relocation. Before starting services, use `docker compose config` to confirm the resolved archive and WAL bind sources, then inspect the single `OSCAR_BACKUP_DIR` entry in `.env` to confirm the external backup root. Compose uses the fixed `oscar` project name for containers, while `compose.yaml` attaches the exact external volumes `oscar_oscar_state` and `oscar_postgres_data`. Setup, not Compose, owns their creation and validates their deployment identity before start or upgrade. This prevents Compose from attempting to reconcile immutable volume labels or offering to recreate an adopted legacy volume. Then run:
+For a 3.9.2-or-newer same-storage-profile upgrade, create and verify a coordinated snapshot first when the site has explicitly selected `OSCAR_BACKUP_MODE=single`. A disabled site must use its separately approved protection procedure or opt in through `upgrade` before invoking backup or restore. A pre-3.9.2 release does not have this CLI; use that release's supported backup/export procedure and retain the old system read-only until the separately qualified migration is complete. Extract the new release into a clean sibling directory; do not overlay it on the previous release because removed files would otherwise remain in the image build context. Copy only `.env`, `secrets/`, and `tls/` from the existing deployment into the clean release directory. If the deployment has a `.oscar-volume-adoption` receipt, copy that file too. Preserve `OSCAR_BACKUP_MODE`, the absolute active `OSCAR_ARCHIVE_DIR` and `OSCAR_BACKUP_DIR` values, and any existing absolute `OSCAR_WAL_ARCHIVE_DIR` compatibility binding; setup must never delete legacy roots or data while changing modes. Before starting services, use `docker compose config` to confirm the archive bind and the absence of a PostgreSQL WAL bind, then inspect the single mode and backup-root entries in `.env`. Compose attaches the exact external volumes `oscar_oscar_state` and `oscar_postgres_data`; setup owns their creation and validates deployment identity. Then run:
 
 ```powershell
 .\oscar.bat upgrade
@@ -285,12 +284,12 @@ sudo bash oscar.sh upgrade
 ```
 
 The command preserves existing settings and data while normalizing the required 3.9.2 managed
-bindings: deployment identity, absolute external storage roots, and the canonical backup-key
+bindings: deployment identity, exact backup mode, absolute external storage roots, and the canonical backup-key
 binding. A legacy deployment may also receive a generated backup key plus explicit volume/root
 adoption metadata when the corresponding adoption options are supplied. After those guarded
 normalizations it updates `OSCAR_VERSION`, validates Compose, prepares the versioned images,
 force-recreates all service containers, waits for health checks, and retains the fixed `oscar_state`
-and `postgres_data` volumes plus the exact external archive/WAL/backup roots. Recreating every
+and `postgres_data` volumes plus the exact external archive and preserved legacy/backup roots. Recreating every
 container is required even when an image and service model are unchanged: release-local secret,
 certificate, and gateway-config bind sources and the Compose `working_dir`/`config_files` provenance
 must point to the new clean release directory. It never removes volumes or external storage roots.
@@ -299,8 +298,9 @@ Confirm the result with `oscar.bat status`
 
 Retire the previous extracted release directory only after all upgraded services are healthy and
 `docker inspect` confirms that every container's release-local bind sources and Compose
-`working_dir`/`config_files` labels refer to the new directory. The absolute archive, WAL, and backup
-roots intentionally continue to refer to the persistent paths copied in `.env`; do not remove a
+`working_dir`/`config_files` labels refer to the new directory. The absolute archive and backup
+roots intentionally continue to refer to the persistent paths copied in `.env`; a legacy-WAL
+binding only preserves the location of existing compatibility data. Do not remove a
 previous release's parent or sibling storage directory merely because its service containers were
 replaced.
 
@@ -316,12 +316,13 @@ every subsequent clean-directory upgrade.
 
 Storage-root ownership is a separate gate. New roots receive an administrator-owned
 `.oscar-storage-root` version-1 identity bound to `OSCAR_DEPLOYMENT_ID` and the exact root kind. A
-nonempty pre-3.9.2 archive, WAL, or backup root without that marker requires a one-time, reviewed
+nonempty pre-3.9.2 active archive or backup root without that marker requires a one-time, reviewed
 `oscar.bat upgrade -AdoptLegacyStorageRoots` or
 `sudo bash oscar.sh upgrade --adopt-legacy-storage-roots`. The marker records the adoption time and
 actor. Setup rejects a foreign UUID, swapped kind, unsafe marker, or unacknowledged nonempty root
 before claiming any path. Backups exclude these host-local markers, and restore preserves and
-revalidates the target markers instead of accepting identities from backup media.
+revalidates the target markers instead of accepting identities from backup media. A retired
+legacy-WAL tree is neither claimed nor mutated by current setup.
 
 The OSCAR application libraries and exported Viewer are part of the `oscar:<version>` image. A restart does not rebuild that image. To test OSCAR 3.9.2 from a connected release artifact, prepare the clean release directory as described above. Use `init` and fresh state for the complete 3.9.2 storage profile; use `upgrade` only when intentionally retaining the existing storage/configuration profile. Confirm that `docker compose images` reports `oscar:3.9.2` before accepting the test result.
 
@@ -343,7 +344,7 @@ from the same release and protected runtime state rather than deleting the volum
 
 OSCAR 3.9.2 changes the default database module, write path, daily-file source capture, media-retention format, and PostgreSQL initialization. `upgrade` deliberately does not overwrite the saved module configuration or recreate the PostgreSQL cluster, so an upgraded pre-3.9.2 system does not automatically gain the complete 3.9.2 storage profile or data checksums.
 
-Initialize the current test systems and new production systems with a fresh 3.9.2 database/configuration. If existing production history must be retained, keep the old system read-only after a verified backup and use a separately designed and tested migration. Do not delete production volumes merely to make the new module start. Follow the staged copy-only, parity, restore-drill, and hot-deletion rollout in [`../../docs/STORAGE_OPERATIONS.md`](../../docs/STORAGE_OPERATIONS.md).
+Initialize the current test systems and new production systems with a fresh 3.9.2 database/configuration. If existing production history must be retained, keep the old system read-only after a verified backup and use a separately designed and tested migration. Do not delete production volumes merely to make the new module start. Follow the parity, restore-drill, and bounded hot-deletion validation in [`../../docs/STORAGE_OPERATIONS.md`](../../docs/STORAGE_OPERATIONS.md).
 
 The OSCAR container keeps `/var/lib/oscar/config.json` readable and writable only by the OSCAR runtime user (`0600`) and repairs older read-only copies during startup. After importing a lane CSV, wait for every lane to appear under **Sensors**, select the global **Save** action, restart OSCAR, and confirm that the same lanes reload. Historical systems in PostgreSQL are not proof that runtime sensor modules were saved; an empty **Sensors** tree after restart indicates that the module configuration was not persisted.
 
@@ -351,9 +352,9 @@ On Windows, OSCAR grants the local `docker-users` group read-only access to the 
 
 ## Storage administration
 
-The release implements coordinated backup/verification/restore, verified-backup/WAL pruning,
+The release implements an opt-in one-current-snapshot backup/verification/restore workflow,
 retention holds, and archive status, integrity, portable export, and restartable tokenized deletion
-commands. The full procedures are in:
+commands. `backup-prune` is retired and performs no deletion. The full procedures are in:
 
 - [`../../docs/STORAGE_ARCHITECTURE.md`](../../docs/STORAGE_ARCHITECTURE.md)
 - [`../../docs/DATA_LIFECYCLE.md`](../../docs/DATA_LIFECYCLE.md)
@@ -371,17 +372,24 @@ hot/cold logical removal and tombstone creation. Single removal fails on a hold;
 removal skips protected rows and counts only rows actually removed.
 
 The same files are under `documentation/` in the packaged release. `backup` verifies the newly
-created backup automatically and authenticates its checksum inventory with the separately stored
-backup key. It rejects unsafe tar members, atomically marks the recovery point `VERIFIED`, and,
+created schema-v2 snapshot automatically and authenticates its checksum inventory with the separately stored
+backup key. It rejects unsafe tar members and any v2 `wal-archive.tar.gz`, atomically marks the recovery point `VERIFIED`, and,
 while OSCAR remains stopped, confirms only exact published daily-file/segment sets captured by the
-accepted authenticated snapshot. Confirmation failure preserves that valid recovery point but
-fails the command and skips automatic pruning. PostgreSQL remains online for `pg_basebackup`, is
-stopped for the final stable WAL-archive snapshot, and resumes before catalog receipt and
-verification. `backup-verify` runs `pg_verifybackup` in a dependency-free utility container, so the
+accepted authenticated snapshot. After confirmation, an atomic HMAC-authenticated `CURRENT`
+replacement commits the one logical snapshot; only then can the previous non-current verified
+snapshot be cleaned. Confirmation failure leaves the old pointer authoritative. PostgreSQL remains
+online for `pg_basebackup --wal-method=stream`; there is no cumulative WAL snapshot.
+`backup-verify` runs `pg_verifybackup` in a dependency-free utility container, so the
 live database and its catalog receipt are not recovery dependencies. Use `backup-verify` to recheck
-it before every upgrade or retention reduction. The standard environment retains the newest 14 verified local backups and, only after a
-new backup is created and verified, automatically prunes older verified backups plus WAL before the
-oldest retained start boundary. Manual verification and restore do not prune the recovery target.
+it before every upgrade or retention reduction. Schema-v1 snapshots remain explicitly verifiable
+and restorable and require their historical WAL payload for authentication; restore ignores that
+external payload because streamed `postgres/pg_wal` is sufficient. OSCAR does not provide PITR.
+One logical snapshot is the steady state, not the peak capacity requirement. A replacement keeps
+the old snapshot while the complete new candidate is built, verified, accepted, and committed
+through `CURRENT`, so size the backup root for both. The next locked storage command uses the
+authenticated pointer to reconcile any non-current snapshot or private staging debris left by a
+crash. If the first schema-v2 attempt failed before any `CURRENT` existed, it authenticates and
+retires only uncommitted schema-v2 candidates while preserving/restoring schema-v1 recovery points.
 All storage-administration commands share one nonblocking, crash-released deployment lock; a
 concurrent invocation fails rather than racing backup/archive state. The lock is keyed by
 `OSCAR_DEPLOYMENT_ID` in `/run/lock/oscar-storage` on Ubuntu or
@@ -391,12 +399,12 @@ and both named-volume ownership identities; only offline-capable `backup-verify`
 those live dependencies. Verification is still an acceptance mutation: it publishes/replaces
 `VERIFIED` and normalizes backup permissions, and may update the live catalog only after proving
 volume ownership.
-Backup prune HMAC-authenticates and fully re-verifies every usable candidate before persisting a
-durable recovery intent or deleting anything, and authenticates the oldest retained
-`postgres/backup_label` again before pruning WAL. Review those settings against
-site recovery policy. Keep `deleteHotAfterArchive=false` during initial rollout;
-enable it only after mixed-tier parity and an isolated restore drill pass. Cold archive deletion
-always requires a reviewed `archive dry-run` plan and its one-time token.
+Fresh deployments default to backup mode `disabled`; backup, verification, restore, and the retired
+prune command fail with opt-in guidance until setup changes the mode to `single`. The standard data
+lifecycle archives only five allowlisted high-volume outputs after 48 hours and deletes their exact
+hot rows only after successful parity plus 24 hours of overlap (about 72 hours plus scheduling).
+Parquet is the primary cold tier, not a backup. Cold archive deletion always requires a reviewed
+`archive dry-run` plan and its one-time token.
 
 Certificate renewal and a site-specific migration of retained pre-3.9.2 history remain controlled administrator operations and must be validated before an upgrade is declared production-ready.
 

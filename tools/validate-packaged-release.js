@@ -47,6 +47,12 @@ const version = env.OSCAR_VERSION;
 if (!expectedVersion || version !== expectedVersion) fail(`expected OSCAR_VERSION=${expectedVersion || '<unresolved>'}, received ${version || '<missing>'}`);
 if (Object.hasOwn(env, 'OSCAR_POSTGIS_VERSION')) fail('OSCAR_POSTGIS_VERSION must not diverge from OSCAR_VERSION');
 if (env.OSCAR_DEPLOYMENT_ID !== '') fail('OSCAR_DEPLOYMENT_ID must be empty in the packaged template');
+if (env.OSCAR_BACKUP_MODE !== 'disabled') {
+    fail(`OSCAR_BACKUP_MODE must be disabled in the packaged template, received ${env.OSCAR_BACKUP_MODE || '<missing>'}`);
+}
+for (const retiredName of ['OSCAR_BACKUP_RETENTION_COUNT', 'OSCAR_BACKUP_AUTO_PRUNE']) {
+    if (Object.hasOwn(env, retiredName)) fail(`${retiredName} is retired from the single-snapshot backup contract`);
+}
 
 const expected = [
     'oscar-storage.sh', 'oscar-storage.ps1', 'validate-storage-archive.sh',
@@ -108,6 +114,16 @@ if (compose.includes('com.botts.oscar.deployment-id')) {
     fail('compose.yaml must not reconcile immutable deployment labels on named volumes');
 }
 
+const postgresService = compose.match(/^  postgres:\r?\n[\s\S]*?(?=^volumes:)/m)?.[0];
+if (!postgresService || (postgresService.match(/- archive_mode=off/g) || []).length !== 1) {
+    fail('the PostgreSQL service must set archive_mode=off exactly once');
+}
+for (const staleWalSetting of ['archive_mode=on', 'archive_command=', 'archive_timeout=', '/var/lib/postgresql/wal-archive']) {
+    if (postgresService.includes(staleWalSetting)) {
+        fail(`the PostgreSQL service still contains retired external-WAL setting ${staleWalSetting}`);
+    }
+}
+
 const oscarService = compose.match(/^  oscar:\r?\n[\s\S]*?(?=^  postgres:)/m)?.[0];
 const nativeTmpfs = '/run/oscar-native:rw,exec,nosuid,nodev,size=256m,mode=0700,uid=10001,gid=10001';
 if (!oscarService?.includes('- /tmp:rw,noexec,nosuid,nodev')) {
@@ -139,11 +155,50 @@ if (!oscarEntrypoint.includes('NATIVE_TMP_DIR=/run/oscar-native') ||
 
 const expectedStorageDefaults = {
     OSCAR_ARCHIVE_DIR: '../oscar-storage/archive',
-    OSCAR_WAL_ARCHIVE_DIR: '../oscar-storage/wal-archive',
     OSCAR_BACKUP_DIR: '../oscar-storage/backups',
 };
 for (const [name, value] of Object.entries(expectedStorageDefaults)) {
     if (env[name] !== value) fail(`${name} must be ${value} in the packaged template`);
+}
+if (Object.prototype.hasOwnProperty.call(env, 'OSCAR_WAL_ARCHIVE_DIR')) {
+    fail('the packaged template must not create a retired legacy-WAL root binding');
+}
+
+const standardConfigPath = path.join(root, 'osh-node-oscar', 'config.json');
+if (!fs.existsSync(standardConfigPath)) {
+    fail('missing osh-node-oscar/config.json');
+} else {
+    let standardConfig;
+    try {
+        standardConfig = JSON.parse(fs.readFileSync(standardConfigPath, 'utf8'));
+    } catch (error) {
+        fail(`osh-node-oscar/config.json is not valid JSON: ${error.message}`);
+    }
+    if (standardConfig) {
+        const modules = Array.isArray(standardConfig) ? standardConfig : [];
+        const oscarServiceConfig = modules.find(module => module?.objClass === 'com.botts.impl.service.oscar.OSCARServiceConfig');
+        const tieredDatabaseConfig = modules.find(module =>
+            module?.dbConfig?.objClass === 'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig')?.dbConfig;
+        const archiveConfig = tieredDatabaseConfig?.archive;
+        const expectedArchiveOutputs = [
+            'gammaCounts', 'gammaThreshold', 'neutronCounts', 'setupGamma', 'setupNeutron',
+        ];
+        if (oscarServiceConfig?.videoRetentionConfig?.timeToRetention !== 0) {
+            fail('the standard video-retention age must be 0 days (first eligible cycle)');
+        }
+        if (archiveConfig?.hotRetentionDays !== 2) {
+            fail('the standard cold-tier eligibility age must be 2 days');
+        }
+        if (archiveConfig?.rollbackGraceDays !== 1) {
+            fail('the standard verified hot/cold overlap must be 1 day');
+        }
+        if (archiveConfig?.deleteHotAfterArchive !== true) {
+            fail('the standard profile must delete eligible hot observations after verified overlap');
+        }
+        if (JSON.stringify(archiveConfig?.outputNames) !== JSON.stringify(expectedArchiveOutputs)) {
+            fail('the standard cold tier must remain limited to the five approved high-volume output names');
+        }
+    }
 }
 
 const files = [];
@@ -195,6 +250,21 @@ for (const relative of markdownFiles) {
         } else if (!fs.existsSync(resolved)) {
             fail(`${relative} has a broken local link: ${target}`);
         }
+    }
+}
+
+const staleDocumentation = [
+    [/OSCAR_BACKUP_RETENTION_COUNT\s*=\s*14|OSCAR_BACKUP_AUTO_PRUNE\s*=\s*true/, 'retired backup-pruning defaults'],
+    [/newest 14 verified|14 verified (?:local )?backups/i, 'retired fourteen-backup policy'],
+    [/PostgreSQL (?:stays online|is then stopped)[^\n]*archived-WAL|stable archived-WAL snapshot/i, 'retired v2 archived-WAL snapshot flow'],
+    [/shipping (?:copy-only profile|default)[^\n]*deleteHotAfterArchive[^\n]*false|deleteHotAfterArchive=false[^\n]*shipping default/i, 'retired copy-only lifecycle default'],
+    [/video retention age \| 7 days|timeToRetention` \(seven days by default\)|after the configured seven-day retention age/i, 'retired seven-day media default'],
+    [/archive hot retention \| 30 days|older than 30 days|after the 30-day cutoff/i, 'retired thirty-day cold-tier default'],
+];
+for (const relative of markdownFiles) {
+    const source = fs.readFileSync(path.join(root, relative), 'utf8');
+    for (const [pattern, description] of staleDocumentation) {
+        if (pattern.test(source)) fail(`${relative} contains ${description}`);
     }
 }
 

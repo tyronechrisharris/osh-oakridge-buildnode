@@ -53,7 +53,6 @@ echo   verify
 echo   upgrade
 echo   backup
 echo   backup-verify -BackupId BACKUP_ID
-echo   backup-prune -Keep 14
 echo   restore -BackupId BACKUP_ID -Confirm BACKUP_ID
 echo   archive status
 echo   archive verify

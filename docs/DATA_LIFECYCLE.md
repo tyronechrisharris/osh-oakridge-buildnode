@@ -11,16 +11,16 @@ hosts. macOS deployment and storage operations fail closed; it is not a supporte
 
 | Data class | Default transition | Removal gate | Removed automatically? |
 | --- | --- | --- | --- |
-| Selected raw detector observations | Copy to an `ACTIVE` Parquet generation when older than 30 days | `deleteHotAfterArchive=true`, valid Parquet and schema objects, active catalog generation, exact-row parity receipt, 7-day rollback grace, no applicable hold | No in the shipping profile; `deleteHotAfterArchive` defaults to `false` |
+| Selected high-volume detector observations | Copy to an `ACTIVE` Parquet generation when older than 48 hours | Valid Parquet/schema/manifest objects, active catalog generation, exact-row parity receipt, 24-hour overlap, no applicable hold | Yes for exact eligible rows in the shipping profile, normally about 72 hours after observation plus scheduling |
 | Other PostgreSQL observations and transactional records | Remain hot | Existing application policy | Not by the cold-tier scheduler |
 | Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV, v1 manifest, and `PUBLISHED` ledger before compatibility-observation cleanup; retry hourly if midnight publication is still in progress | Journal files are not pressure-cleanup candidates |
-| Alarm source MP4 | Convert after 7 days | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
+| Alarm source MP4 | Attempt exactly five JPEGs on the first eligible lifecycle cycle | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
 | Retained five-JPEG media set | Remains available | Complete set, no hold, rollback grace elapsed, minimum pressure age met, filesystem at pressure threshold | Yes, only under configured storage pressure |
 | Uncatalogued legacy video | Legacy behavior only | Not eligible for new pressure cleanup | No |
 | Daily files, reports, adjudication, sitemap | Remain in application state | Site policy and explicit administration | No by storage-pressure cleanup |
-| Cold archive generation | Remains queryable as `ACTIVE` in copy-only mode; becomes `SEALED` only after optional exact hot-row deletion | Explicit dry-run plan selecting only `SEALED` generations, review, unexpired one-time token, no hold, object hash recheck | No; an administrator must run `archive purge` |
+| Cold archive generation | Primary cold tier; `ACTIVE` during verified overlap, then `SEALED` after exact hot-row deletion | Explicit dry-run plan selecting only `SEALED` generations, review, unexpired one-time token, no hold, object hash recheck | No; an administrator must run `archive purge` |
 | Docker logs | JSON log rotation | Docker rotation settings | Yes, size-based rotation |
-| Backups and archived WAL | Remain in configured host paths | Verified-backup count and oldest retained base-backup WAL boundary | Yes: after a new backup is verified, the default policy retains 14 verified backups and prunes older verified backups and earlier WAL; manual verification/restore do not prune, and unverified/partial/unknown items are preserved |
+| Coordinated recovery snapshot | Disabled by default; manual `single` mode commits one schema-v2 snapshot through authenticated `CURRENT` | Full HMAC/checksum/tar/`pg_verifybackup` verification and journal confirmation before pointer replacement | The prior non-current verified snapshot is cleaned only after the new pointer commits; `backup-prune` is retired |
 
 Defaults are starting points, not universal retention policy. The site owner must set periods that
 meet regulatory, evidentiary, privacy, legal-hold, and capacity requirements.
@@ -35,7 +35,8 @@ flushes every second or at 10,000 observations. Until a successful flush, the ob
 not durable in PostgreSQL; a failed batch remains queued for a later commit attempt.
 
 The hot store remains authoritative for systems, datastream metadata, recent observations, event
-records, occupancy/alarm workflows, adjudications, and reports. Only output names listed in
+records, occupancy/alarm workflows, adjudications, and reports. Parquet is the primary cold tier,
+not a backup, and only output names listed in
 `archive.outputNames` are eligible for cold tiering. The 3.9.2 default list is:
 
 ```text
@@ -46,7 +47,8 @@ setupGamma
 setupNeutron
 ```
 
-Occupancy/event records and the `dailyFile` compatibility stream are intentionally absent.
+Occupancy/event records and the `dailyFile` compatibility stream are intentionally absent. OSCAR
+does not cold-tier every table or every observation stream.
 
 ### 2. Non-disruptive archive export
 
@@ -132,18 +134,15 @@ its rows in ID order, loads the exact hot IDs in bounded batches, and compares c
 digests. The receipt records expected/actual rows and success or failure. A failed receipt leaves
 all hot data in place.
 
-The shipped 3.9.2 profile sets `deleteHotAfterArchive` to `false`. This copy-only mode is the safe
-initial rollout state: archive generation and mixed-tier queries run, but PostgreSQL rows are not
-removed.
-
-After a site has passed the acceptance and restore tests, it may enable hot deletion. A generation
-then becomes eligible only after:
+The shipped 3.9.2 profile sets `deleteHotAfterArchive=true`. A generation becomes hot-deletion
+eligible only after:
 
 - a successful `HOT_COLD_PARITY` receipt;
-- `rollbackGraceDays` since activation (seven days by default); and
+- `rollbackGraceDays` since activation (one day by default); and
 - no active generation hold.
 
-Deletion uses exact IDs from the verified Parquet object in transactions of `deleteBatchSize`
+Together with the two-day archive threshold, this produces roughly 72 hours of hot residency plus
+hourly scheduling and processing time. Deletion uses exact IDs from the verified Parquet object in transactions of `deleteBatchSize`
 (5,000 by default) and additionally requires each PostgreSQL row's `archivegenerationid` to equal
 that generation. Observation-specific holds are skipped. If held rows remain, the generation stays
 `ACTIVE` and receives a deferred-hold receipt; a later cycle retries. It becomes `SEALED` only after
@@ -262,7 +261,8 @@ or otherwise unsafe segment state fails or skips confirmation; it never expands 
 eligibility. Only a matching confirmation plus elapsed `sealedJournalRetentionDays` permits a later
 periodic sweep to remove that sealed day. A confirmation-stage interruption can leave a valid
 `VERIFIED` backup and a strict subset of receipts; that is safe because unconfirmed days remain
-protected, and automatic pruning is skipped. Manual backup re-verification does not create receipts.
+protected, and the previous authenticated `CURRENT` is not replaced. Manual backup re-verification
+does not create receipts or change `CURRENT`.
 
 ## Media lifecycle
 
@@ -287,8 +287,8 @@ original occupancy.
 
 ### Five-frame publication
 
-At `timeToRetention` (seven days by default), the sliding retention query processes each camera
-source. It decodes the clip twice: first to construct the frame timeline, then to capture the five
+With the standard `timeToRetention=0`, the sliding retention query processes each eligible camera
+source on its first lifecycle cycle. It decodes the clip twice: first to construct the frame timeline, then to capture the five
 selected distinct ordinals. A valid set contains:
 
 1. first frame;
@@ -327,16 +327,16 @@ camera reconnect must preserve exact event/lane/camera ownership.
 
 After the test-only retention interval elapses, acceptance requires one complete manifest per source
 with exactly five independently decodable JPEGs, matching source identity and event/lane/camera
-ledger fields, one successful attempt, and no failure record. Release qualification may set the
-disposable test deployment to zero retention days and a one-minute query period; shipped production
-defaults remain seven days and must not be accelerated merely to make a test complete sooner.
+ledger fields, one successful attempt, and no failure record. The shipped production default is
+already zero retention days; qualification may shorten only the query cadence on an isolated
+disposable site and must still prove the same five-frame and 24-hour source-grace contracts.
 
 The retained-media worker captures this profile when OSCAR starts. On a newly initialized
 qualification site, save the accelerated profile and perform a supported OSCAR restart **before**
 importing lanes or permitting emulator traffic. Verify the startup log and scan checkpoint use the
 new eligible-through cutoff, then provision the lanes and perform the fixture's supported restart.
 Saving the form alone does not reconfigure an already running worker. A checkpoint created under
-the seven-day profile deliberately resumes from its durable cursor instead of jumping over
+an older profile deliberately resumes from its durable cursor instead of jumping over
 unexamined history. Never delete or fast-forward a scan or reconciliation checkpoint to accelerate
 a test. If a disposable site was initialized in the wrong order, recreate its disposable database
 and state, or allow bounded oldest-first catch-up. Production requires catch-up or a reviewed

@@ -3,7 +3,10 @@
 OSCAR's cold observation tier is a portable set of ZSTD-compressed Parquet files, JSON manifests,
 gzip-compressed datastream schema snapshots, and a PostgreSQL catalog. OSCAR uses the catalog for
 safe online queries and lifecycle decisions; exported generations can be inspected independently
-with DuckDB or another Parquet-capable tool.
+with DuckDB or another Parquet-capable tool. This is the primary cold tier for the configured five
+high-volume output names, not a backup and not an export of every PostgreSQL table. A recoverable
+system snapshot must also include the matching catalog, overlays/tombstones, application state, and
+other coordinated payloads.
 
 See [Storage architecture](STORAGE_ARCHITECTURE.md) for the system context and
 [Storage operations](STORAGE_OPERATIONS.md) for the supported verification, export, and deletion

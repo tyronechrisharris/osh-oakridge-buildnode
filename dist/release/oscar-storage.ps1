@@ -203,6 +203,24 @@ function Get-EnvValue([string]$Name, [string]$Fallback) {
     return $Fallback
 }
 
+function Get-ValidatedBackupMode {
+    $source = Join-Path $ScriptRoot '.env'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { Fail 'Run OSCAR init first.' }
+    $matches = @([IO.File]::ReadAllLines($source) | Where-Object { $_.StartsWith('OSCAR_BACKUP_MODE=', [StringComparison]::Ordinal) })
+    if ($matches.Count -ne 1) { Fail 'Deployment .env must contain exactly one literal OSCAR_BACKUP_MODE binding.' }
+    $value = $matches[0].Substring('OSCAR_BACKUP_MODE='.Length)
+    if ($value -cnotin @('disabled', 'single')) {
+        Fail 'OSCAR_BACKUP_MODE must be the literal lowercase value disabled or single.'
+    }
+    return $value
+}
+
+function Assert-BackupModeEnabled {
+    if ((Get-ValidatedBackupMode) -cne 'single') {
+        Fail 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+    }
+}
+
 function Test-FullyQualifiedDeploymentPath([string]$Value) {
     if (-not $Value -or -not [IO.Path]::IsPathRooted($Value)) { return $false }
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
@@ -221,9 +239,10 @@ function Assert-ManagedEnvironmentBindings {
         Fail 'Deployment .env must be a regular, non-reparse-point file.'
     }
     $lines = [IO.File]::ReadAllLines($source)
-    foreach ($name in @(
-        'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR',
-        'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR', 'OSCAR_BACKUP_KEY_FILE')) {
+    $mode = Get-ValidatedBackupMode
+    $required = @('OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_MODE', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR')
+    if ($mode -ceq 'single') { $required += @('OSCAR_BACKUP_DIR', 'OSCAR_BACKUP_KEY_FILE') }
+    foreach ($name in $required) {
         $matches = @($lines | Where-Object { $_.StartsWith("$name=", [StringComparison]::Ordinal) })
         if ($matches.Count -ne 1) { Fail "Deployment .env must contain exactly one literal $name binding." }
         $value = $matches[0].Substring($name.Length + 1)
@@ -231,7 +250,7 @@ function Assert-ManagedEnvironmentBindings {
         if (-not $value -or $interpreted -or @($value.ToCharArray() | Where-Object { [char]::IsWhiteSpace($_) }).Count -ne 0) {
             Fail "Deployment .env contains a Compose-interpreted or nonliteral $name value."
         }
-        if ($name -in @('OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR', 'OSCAR_WAL_ARCHIVE_DIR') -and
+        if ($name -in @('OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR') -and
             -not (Test-FullyQualifiedDeploymentPath $value)) {
             Fail "$name must be an absolute stable storage-root path."
         }
@@ -278,13 +297,10 @@ function Resolve-PhysicalContainmentPath([string]$Path) {
     return [IO.Path]::GetFullPath($resolved)
 }
 
-function Assert-StorageRootShapes {
+function Assert-StorageRootShapes([switch]$IncludeBackup) {
     $releasePath = Resolve-PhysicalContainmentPath $ScriptRoot
-    $roots = @(
-        @('OSCAR_ARCHIVE_DIR', (Resolve-PhysicalContainmentPath $ArchiveDirectory)),
-        @('OSCAR_BACKUP_DIR', (Resolve-PhysicalContainmentPath $BackupDirectory)),
-        @('OSCAR_WAL_ARCHIVE_DIR', (Resolve-PhysicalContainmentPath $WalArchiveDirectory))
-    )
+    $roots = ,@('OSCAR_ARCHIVE_DIR', (Resolve-PhysicalContainmentPath $ArchiveDirectory))
+    if ($IncludeBackup) { $roots += ,@('OSCAR_BACKUP_DIR', (Resolve-PhysicalContainmentPath $BackupDirectory)) }
     foreach ($entry in $roots) {
         $label = $entry[0]
         $path = [IO.Path]::GetFullPath($entry[1])
@@ -310,15 +326,17 @@ function Assert-StorageRootShapes {
         for ($right = $left + 1; $right -lt $roots.Count; $right++) {
             if ((Test-PathContains $roots[$left][1] $roots[$right][1]) -or
                 (Test-PathContains $roots[$right][1] $roots[$left][1])) {
-                Fail 'Archive, backup, and WAL archive directories must be distinct and must not contain one another.'
+                Fail 'Archive and backup directories must be distinct and must not contain one another.'
             }
         }
     }
 }
 
-function Assert-StorageRootsReady {
-    Assert-StorageRootShapes
-    foreach ($path in @($ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory)) {
+function Assert-StorageRootsReady([switch]$IncludeBackup) {
+    Assert-StorageRootShapes -IncludeBackup:$IncludeBackup
+    $paths = @($ArchiveDirectory)
+    if ($IncludeBackup) { $paths += $BackupDirectory }
+    foreach ($path in $paths) {
         if (-not (Test-Path -LiteralPath $path -PathType Container)) {
             Fail 'Configured storage directories are missing; run OSCAR init/upgrade preparation first.'
         }
@@ -363,7 +381,7 @@ function Assert-ProtectedAdministratorAcl(
     $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $administratorSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
     $allowedSids = @($administratorSids + $AllowedAdditionalWriteSids)
-    if (-not $acl.AreAccessRulesProtected -or $ownerSid -notin @('S-1-5-18', 'S-1-5-32-544')) {
+    if (-not $acl.AreAccessRulesProtected -or $ownerSid -notin $administratorSids) {
         Fail "$Description is not protected and owned by an administrator: $Path"
     }
     # Use only atomic mutating rights here. Composite values such as
@@ -468,10 +486,9 @@ function Assert-StorageRootIdentity(
     }
 }
 
-function Assert-StorageRootIdentities {
+function Assert-StorageRootIdentities([switch]$IncludeBackup) {
     Assert-StorageRootIdentity $ArchiveDirectory 'archive'
-    Assert-StorageRootIdentity $BackupDirectory 'backup'
-    Assert-StorageRootIdentity $WalArchiveDirectory 'wal-archive'
+    if ($IncludeBackup) { Assert-StorageRootIdentity $BackupDirectory 'backup' }
 }
 
 function Write-StorageRootIdentity([string]$Path, [string]$Kind, [string]$Adoption) {
@@ -506,7 +523,7 @@ function Write-StorageRootIdentity([string]$Path, [string]$Kind, [string]$Adopti
 }
 
 function Assert-OfflineBackupDirectory {
-    Assert-StorageRootShapes
+    Assert-StorageRootShapes -IncludeBackup
     if (-not (Test-Path -LiteralPath $BackupDirectory -PathType Container)) { Fail "Configured backup directory is missing: $BackupDirectory" }
     Assert-NoReparseComponents $BackupDirectory
 }
@@ -682,7 +699,7 @@ function Clear-ComposeOverrideEnvironment {
     $saved = @{}
     foreach ($name in @(
         'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME', 'COMPOSE_ENV_FILES', 'COMPOSE_PROFILES',
-        'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR',
+        'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_MODE', 'OSCAR_BACKUP_DIR',
         'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR', 'OSCAR_BACKUP_KEY_FILE',
         'OSCAR_HTTPS_PORT', 'OSCAR_JAVA_OPTS', 'OSCAR_POSTGIS_PLATFORM')) {
         if (Test-Path -LiteralPath "Env:$name") {
@@ -1471,15 +1488,17 @@ function Protect-DockerReadableAdministratorFile([string]$Path) {
 
 function Initialize-StorageDirectories([switch]$AdoptExisting) {
     Assert-Administrator
-    Assert-StorageRootShapes
-    foreach ($path in @($ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory)) {
+    $includeBackup = (Get-ValidatedBackupMode) -ceq 'single'
+    Assert-StorageRootShapes -IncludeBackup:$includeBackup
+    $paths = @($ArchiveDirectory)
+    if ($includeBackup) { $paths += $BackupDirectory }
+    foreach ($path in $paths) {
         Assert-SafeCreatableDirectoryPath $path
     }
-    New-Item -ItemType Directory -Force -Path $ArchiveDirectory, $BackupDirectory, $WalArchiveDirectory | Out-Null
-    Assert-StorageRootsReady
-    $roots = @(
-        @($ArchiveDirectory, 'archive'), @($BackupDirectory, 'backup'), @($WalArchiveDirectory, 'wal-archive')
-    )
+    New-Item -ItemType Directory -Force -Path $paths | Out-Null
+    Assert-StorageRootsReady -IncludeBackup:$includeBackup
+    $roots = ,@($ArchiveDirectory, 'archive')
+    if ($includeBackup) { $roots += ,@($BackupDirectory, 'backup') }
     # Preflight every root before claiming any one of them so a foreign/swapped
     # marker or an unacknowledged nonempty legacy root cannot cause a partial claim.
     foreach ($entry in $roots) {
@@ -1504,7 +1523,7 @@ function Initialize-StorageDirectories([switch]$AdoptExisting) {
             if ($isNonempty) { Write-Host "Adopted existing $($entry[1]) storage root for this deployment: $($entry[0])" -ForegroundColor Yellow }
         }
     }
-    Assert-StorageRootIdentities
+    Assert-StorageRootIdentities -IncludeBackup:$includeBackup
 }
 
 function Write-Checksums([string]$Root) {
@@ -1547,7 +1566,8 @@ function Confirm-ReleaseConfigArchive([string]$Root, [string]$Image) {
     Invoke-DockerShellInput $validation @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-seu')
 }
 
-function Confirm-BackupArchiveMembers([string]$Root, [string]$Image) {
+function Confirm-BackupArchiveMembers([string]$Root, [string]$Image, [int]$SchemaVersion) {
+    $walValidation = if ($SchemaVersion -eq 1) { "    wal-archive /backup/wal-archive.tar.gz \`n" } else { '' }
     $validation = @'
 secret_archive=$(mktemp /tmp/oscar-secrets.XXXXXX.tar.gz)
 trap 'rm -f -- "$secret_archive"' EXIT HUP INT TERM
@@ -1555,10 +1575,10 @@ openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deplo
 sh /validator/validate-storage-archive.sh \
     oscar-state /backup/oscar-state.tar.gz \
     cold-archive /backup/archive.tar.gz \
-    wal-archive /backup/wal-archive.tar.gz \
-    release-config /backup/release-config.tar.gz \
+__WAL_VALIDATION__    release-config /backup/release-config.tar.gz \
     deployment-secrets "$secret_archive"
 '@
+    $validation = $validation.Replace('__WAL_VALIDATION__', $walValidation)
     Invoke-DockerShellInput $validation @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${Root}:/backup:ro", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", '--volume', "${ScriptRoot}:/validator:ro", $Image, '-seu')
 }
 
@@ -1649,6 +1669,93 @@ function Confirm-JournalConfirmationReceipt(
     $expected = $lines[4].Substring('hmac_sha256='.Length)
     if ((Get-JournalConfirmationHmac $receipt $Image) -cne $expected) {
         Fail 'Journal-confirmation receipt authentication failed.'
+    }
+}
+
+function Get-CurrentPointerHmac([string]$PointerPath, [string]$Image) {
+    $item = Get-Item -LiteralPath $PointerPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'CURRENT pointer payload is missing or unsafe.'
+    }
+    $script = 'key=$(cat /backup-key.txt); head -n 3 /current | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A'
+    $output = Get-DockerShellInputOutput $script @(
+        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+        '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${PointerPath}:/current:ro",
+        '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-seu')
+    $tag = (($output -join '').Trim())
+    if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not authenticate the CURRENT backup pointer.' }
+    return $tag
+}
+
+function Read-CurrentBackupId([switch]$AllowMissing) {
+    $pointer = Join-Path $BackupDirectory 'CURRENT'
+    $nameComparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [StringComparison]::OrdinalIgnoreCase
+    } else {
+        [StringComparison]::Ordinal
+    }
+    $pointerEntries = @(Get-ChildItem -LiteralPath $BackupDirectory -Force -ErrorAction Stop |
+        Where-Object { $_.Name.Equals('CURRENT', $nameComparison) })
+    if ($pointerEntries.Count -eq 0) {
+        if ($AllowMissing) { return $null }
+        Fail 'The authenticated CURRENT backup pointer is missing.'
+    }
+    if ($pointerEntries.Count -ne 1 -or $pointerEntries[0].Name -cne 'CURRENT') {
+        Fail 'CURRENT backup pointer does not have the exact canonical direct-child name.'
+    }
+    $pointerItem = $pointerEntries[0]
+    if (($pointerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'CURRENT backup pointer is a reparse point.'
+    }
+    if ($pointerItem.PSIsContainer -or $pointerItem -isnot [IO.FileInfo]) {
+        Fail 'CURRENT backup pointer is not a regular file.'
+    }
+    Assert-AdministratorFile $pointerItem.FullName 'CURRENT backup pointer'
+    $raw = [IO.File]::ReadAllText($pointer)
+    $lines = @([IO.File]::ReadAllLines($pointer))
+    if ($lines.Count -ne 4 -or $lines[0] -cne 'format=oscar-current-backup' -or $lines[1] -cne 'version=1' -or
+        $lines[2] -cnotmatch '^backup_id=([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$' -or
+        $lines[3] -cnotmatch '^hmac_sha256=([A-Za-z0-9+/]{43}=)$') {
+        Fail 'CURRENT backup pointer is malformed.'
+    }
+    $id = $lines[2].Substring('backup_id='.Length)
+    $expectedRaw = "format=oscar-current-backup`nversion=1`nbackup_id=$id`nhmac_sha256=$($lines[3].Substring('hmac_sha256='.Length))`n"
+    if ($raw -cne $expectedRaw) { Fail 'CURRENT backup pointer is not canonically LF-terminated.' }
+    $expected = $lines[3].Substring('hmac_sha256='.Length)
+    if ((Get-CurrentPointerHmac $pointer (Get-OscarImage)) -cne $expected) {
+        Fail 'CURRENT backup pointer authentication failed.'
+    }
+    $snapshot = Join-Path $BackupDirectory $id
+    if (-not (Test-Path -LiteralPath $snapshot -PathType Container) -or
+        ((Get-Item -LiteralPath $snapshot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "CURRENT points to a missing or unsafe backup snapshot: $id"
+    }
+    return $id
+}
+
+function Write-CurrentBackupPointer([string]$Id, [string]$Image) {
+    if (-not (Test-BackupId $Id)) { Fail 'Cannot publish an invalid CURRENT backup ID.' }
+    [void](Read-CurrentBackupId -AllowMissing)
+    $pointer = Join-Path $BackupDirectory 'CURRENT'
+    $temporary = Join-Path $BackupDirectory ('.CURRENT.tmp.' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $prefix = "format=oscar-current-backup`nversion=1`nbackup_id=$Id`n"
+        $bytes = $Utf8NoBom.GetBytes($prefix)
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Protect-DockerReadableAdministratorFile $temporary
+        $tag = Get-CurrentPointerHmac $temporary $Image
+        $bytes = $Utf8NoBom.GetBytes("${prefix}hmac_sha256=$tag`n")
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::Truncate, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        Protect-DockerReadableAdministratorFile $temporary
+        Move-DurableReplace $temporary $pointer
+        Sync-DurableMetadata $BackupDirectory
+        Protect-DockerReadableAdministratorFile $pointer
+        Sync-DurableMetadata $BackupDirectory
+        if ((Read-CurrentBackupId) -cne $Id) { Fail 'CURRENT backup pointer publication did not persist the requested backup ID.' }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -1819,7 +1926,7 @@ function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, 
 }
 
 function Complete-NewBackupAcceptance([string]$Id, [string]$Root, [string]$Image, [string]$OscarStateSha256) {
-    # Retention authorization is last. The immutable core first passes every
+    # CURRENT publication is last. The immutable core first passes every
     # checksum/HMAC/archive/pg_verifybackup/image check and commits VERIFIED in
     # both the filesystem and live catalog. The post-verification journal audit
     # receipt is outside SHA256SUMS and authenticates itself with the backup key.
@@ -1830,7 +1937,7 @@ function Complete-NewBackupAcceptance([string]$Id, [string]$Root, [string]$Image
 }
 
 function New-Backup {
-    Assert-Administrator; Assert-Configured
+    Assert-Administrator; Assert-Configured; Assert-BackupModeEnabled
     Assert-CanonicalCredentialBindings (Join-Path $ScriptRoot '.env')
     Assert-BackupKey; Assert-DeploymentVolumeOwnership; Initialize-StorageDirectories
     $version = Get-EnvValue 'OSCAR_VERSION' 'unknown'
@@ -1842,6 +1949,7 @@ function New-Backup {
     $postgresImage = Get-PostgresImage
     Assert-LocalImage $image
     Assert-LocalImage $postgresImage
+    Invoke-SingleBackupRecoveryCleanup
     $timestamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
     $randomBytes = New-Object byte[] 4
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -1854,7 +1962,7 @@ function New-Backup {
     New-Item -ItemType Directory -Path $work | Out-Null
     Protect-DockerStorageDirectory $work 'ReadWrite'
     New-Item -ItemType Directory -Path (Join-Path $work 'postgres') | Out-Null
-    foreach ($name in @('oscar-state.tar.gz', 'archive.tar.gz', 'wal-archive.tar.gz')) {
+    foreach ($name in @('oscar-state.tar.gz', 'archive.tar.gz')) {
         [IO.File]::WriteAllBytes((Join-Path $work $name), [byte[]]@())
     }
 
@@ -1873,7 +1981,6 @@ function New-Backup {
         $lsn = Invoke-Psql 'SELECT pg_current_wal_lsn();'
         $epochId = Invoke-Psql 'SELECT gen_random_uuid();'
         if (-not (Test-Uuid $epochId)) { Fail 'PostgreSQL did not return a valid backup epoch ID.' }
-        Invoke-Psql 'SELECT pg_switch_wal();' | Out-Null
         $postgresContainers = @(Get-ComposeOutput @('ps', '--quiet', 'postgres'))
         if ($postgresContainers.Count -ne 1 -or $postgresContainers[0] -notmatch '^[0-9a-f]{12,64}$') {
             Fail 'Could not resolve the running PostgreSQL container for pg_basebackup.'
@@ -1894,8 +2001,6 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclu
 '@
         Invoke-DockerShellInput $stateArchive @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state:ro', '--volume', "$(Join-Path $work 'oscar-state.tar.gz'):/output.tar.gz", $image, '-seu')
         Invoke-DockerShellInput "tar --exclude='./.oscar-storage-root' -C /archive -czf /output.tar.gz ." @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive:ro", '--volume', "$(Join-Path $work 'archive.tar.gz'):/output.tar.gz", $image, '-seu')
-        $walArchiveScript = "if find /wal-archive -type f -name '*.partial*' -print -quit | grep -q .; then echo 'WAL archive contains a .partial file while backup writers are quiesced.' >&2; exit 1; fi; tar --exclude='./.oscar-storage-root' -C /wal-archive -czf /output.tar.gz ."
-        Invoke-DockerShellInput $walArchiveScript @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', 'sh', '--volume', "${WalArchiveDirectory}:/wal-archive:ro", '--volume', "$(Join-Path $work 'wal-archive.tar.gz'):/output.tar.gz", $postgresImage, '-seu')
 
     $encryptedSecrets = Join-Path $work 'deployment-secrets.tar.gz.enc'
     [IO.File]::WriteAllBytes($encryptedSecrets, [byte[]]@())
@@ -1912,7 +2017,7 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclu
     Invoke-External 'docker' (@('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'tar', '--volume', "${ScriptRoot}:/deployment:ro", '--volume', "${releaseConfigArchive}:/release-config.tar.gz", $image, '-C', '/deployment', '-czf', '/release-config.tar.gz') + $releaseConfigFiles)
 
     $epoch = [ordered]@{
-        format = 'oscar-backup-epoch'; version = 1; backupEpochId = $epochId; backupId = $id
+        format = 'oscar-backup-epoch'; version = 2; backupEpochId = $epochId; backupId = $id
         createdAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); oscarVersion = $version
         postgresLsn = $lsn; archiveRoot = '/var/lib/oscar/archive'; secrets = 'AES-256-CBC/PBKDF2 with HMAC-SHA-256 manifest authentication; key stored separately'; state = 'CREATED'
     }
@@ -1921,6 +2026,7 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclu
     $oscarStateSha256 = (Get-FileHash -LiteralPath (Join-Path $work 'oscar-state.tar.gz') -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Checksums $work
     Write-ChecksumHmac $work $image
+    Confirm-Backup $id -ReadOnly -RootOverride $work
     Protect-DockerStorageDirectory $work 'ReadOnly'
     Sync-DurableTree $work
     Move-DurableNoReplace $work $final
@@ -1936,9 +2042,11 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclu
     } catch {
         Write-Warning "Backup payload is complete, but its live catalog receipt could not be inserted: $($_.Exception.Message)"
     }
-    Write-Host "Backup created: $final" -ForegroundColor Green
-    Write-Host "Store $BackupKeyFile separately from the backup media; it is required to restore encrypted credentials."
     Complete-NewBackupAcceptance $id $final $image $oscarStateSha256
+    Write-CurrentBackupPointer $id $image
+    Invoke-SingleBackupRecoveryCleanup
+    Write-Host "Backup created and committed as CURRENT: $final" -ForegroundColor Green
+    Write-Host "Store $BackupKeyFile separately from the backup media; it is required to restore encrypted credentials."
     } finally {
         $services = @()
         if ($resumePostgres) { $services += 'postgres' }
@@ -1946,7 +2054,6 @@ tar --exclude='./archive' --exclude='./backups' --exclude='./duckdb-tmp' --exclu
         if ($resumeGateway) { $services += 'gateway' }
         if ($services.Count -gt 0) { Invoke-Compose (@('up', '--detach', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300') + $services) }
     }
-    if ((Get-EnvValue 'OSCAR_BACKUP_AUTO_PRUNE' 'true') -ceq 'true') { Remove-ExpiredBackups 0 }
 }
 
 function Confirm-BackupManifestInventory([string]$Root, [string[]]$ManifestPaths) {
@@ -1982,10 +2089,54 @@ function Confirm-PostgresBaseBackup([string]$Root, [string]$PostgresImage) {
     Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_READ_SEARCH', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'pg_verifybackup', '--volume', "$(Join-Path $Root 'postgres'):/backup:ro", $PostgresImage, '/backup')
 }
 
-function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
+function Read-ValidatedBackupEpoch([string]$Root, [string]$Id) {
+    $epochPath = Resolve-ConfinedStorageFile $Root 'epoch.json'
+    $epochRaw = [IO.File]::ReadAllText($epochPath)
+    if (@([IO.File]::ReadAllLines($epochPath)).Count -ne 12) {
+        Fail 'Backup epoch must use the exact supported 12-line field shape.'
+    }
+    try { $epoch = $epochRaw | ConvertFrom-Json }
+    catch { Fail 'Backup epoch manifest is not valid JSON.' }
+    $epochKeys = @('format','version','backupEpochId','backupId','createdAt','oscarVersion','postgresLsn','archiveRoot','secrets','state')
+    if (@($epoch.PSObject.Properties).Count -ne $epochKeys.Count) { Fail 'Backup epoch must contain exactly the version-1/version-2 field set.' }
+    foreach ($epochKey in $epochKeys) {
+        if (@($epoch.PSObject.Properties | Where-Object Name -CEQ $epochKey).Count -ne 1 -or
+            ([regex]::Matches($epochRaw, '(?m)^\s*"' + [regex]::Escape($epochKey) + '"\s*:')).Count -ne 1) {
+            Fail "Backup epoch must contain exactly one $epochKey field."
+        }
+    }
+    [int]$schemaVersion = 0
+    try { $schemaVersion = [int]$epoch.version } catch { Fail 'Backup epoch schema version is invalid.' }
+    if (-not (Test-Uuid ([string]$epoch.backupEpochId)) -or
+        [string]$epoch.format -cne 'oscar-backup-epoch' -or $schemaVersion -notin @(1, 2) -or
+        [string]$epoch.backupId -cne $Id -or [string]$epoch.state -cne 'CREATED') {
+        Fail 'Backup epoch identity, schema version, or creation state does not match this recovery-point directory.'
+    }
+    if ([string]$epoch.oscarVersion -cne $RequiredReleaseVersion) { Fail "Backup epoch must identify OSCAR $RequiredReleaseVersion." }
+    if ([string]$epoch.postgresLsn -notmatch '^[0-9A-F]+/[0-9A-F]+$') { Fail 'Backup epoch PostgreSQL LSN is invalid.' }
+    return [pscustomobject]@{ Epoch = $epoch; Raw = $epochRaw; SchemaVersion = $schemaVersion }
+}
+
+function Confirm-Backup(
+    [string]$Id,
+    [switch]$ReadOnly,
+    [string]$RootOverride,
+    [switch]$RequireAcceptance
+) {
     Assert-Administrator; Assert-Configured; Assert-BackupKey
     if (-not (Test-BackupId $Id)) { Fail 'A valid backup ID is required.' }
-    $root = Join-Path $BackupDirectory $Id
+    $expectedFinal = [IO.Path]::GetFullPath((Join-Path $BackupDirectory $Id))
+    $expectedPartial = [IO.Path]::GetFullPath((Join-Path $BackupDirectory "$Id.partial"))
+    $expectedDeleting = [IO.Path]::GetFullPath((Join-Path $BackupDirectory ".deleting-$Id"))
+    $root = if ($RootOverride) { [IO.Path]::GetFullPath($RootOverride) } else { $expectedFinal }
+    if ($root -cne $expectedFinal -and $root -cne $expectedPartial -and
+        (-not $ReadOnly -or $root -cne $expectedDeleting)) {
+        Fail 'Backup verification root is not a confined final, staging, or read-only deletion snapshot path.'
+    }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { Fail "Backup does not exist: $root" }
+    $rootItem = Get-Item -LiteralPath $root -Force
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "Backup root is a reparse point: $root" }
+    Assert-NoReparseComponents $root
     $checksumFile = Join-Path $root 'SHA256SUMS'
     if (-not (Test-Path -LiteralPath $checksumFile -PathType Leaf)) { Fail "Backup is incomplete: $root" }
     $image = Get-OscarImage
@@ -1993,14 +2144,16 @@ function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
     Assert-LocalImage $image
     Assert-LocalImage $postgresImage
     Confirm-ChecksumHmac $root $image
+    $epochInfo = Read-ValidatedBackupEpoch $root $Id
+    $schemaVersion = [int]$epochInfo.SchemaVersion
     $manifestPaths = New-Object System.Collections.Generic.List[string]
     $oscarStateSha256 = $null
     $oscarStateEntries = 0
     $requiredPayloadCounts = @{
         'archive.tar.gz' = 0; 'archive-generation-ids.txt' = 0; 'deployment-secrets.tar.gz.enc' = 0; 'epoch.json' = 0
         'image-inventory.txt' = 0; 'oscar-state.tar.gz' = 0; 'release-config.tar.gz' = 0
-        'wal-archive.tar.gz' = 0
     }
+    if ($schemaVersion -eq 1) { $requiredPayloadCounts['wal-archive.tar.gz'] = 0 }
     foreach ($line in [IO.File]::ReadAllLines($checksumFile)) {
         if ($line -notmatch '^([0-9a-f]{64})  \./(.+)$') { Fail "Invalid checksum entry: $line" }
         $manifestPaths.Add($Matches[2])
@@ -2016,33 +2169,30 @@ function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
     foreach ($payload in $requiredPayloadCounts.Keys) {
         if ($requiredPayloadCounts[$payload] -ne 1) { Fail "Authenticated checksum manifest must contain $payload exactly once." }
     }
+    if ($schemaVersion -eq 2 -and
+        (($manifestPaths -contains 'wal-archive.tar.gz') -or (Test-Path -LiteralPath (Join-Path $root 'wal-archive.tar.gz')))) {
+        Fail 'Schema-version-2 backups must not contain wal-archive.tar.gz.'
+    }
     [void](Get-ArchiveGenerationInventory $root)
     Confirm-BackupManifestInventory $root $manifestPaths
     Confirm-PostgresBaseBackup $root $postgresImage
     Confirm-ReleaseConfigArchive $root $image
-    Confirm-BackupArchiveMembers $root $image
+    Confirm-BackupArchiveMembers $root $image $schemaVersion
     Confirm-ImageInventory $root
-    $epochRaw = Get-Content -LiteralPath (Join-Path $root 'epoch.json') -Raw
-    $epoch = $epochRaw | ConvertFrom-Json
-    $epochKeys = @('format','version','backupEpochId','backupId','createdAt','oscarVersion','postgresLsn','archiveRoot','secrets','state')
-    if (@($epoch.PSObject.Properties).Count -ne $epochKeys.Count) { Fail 'Backup epoch must contain exactly the version-1 field set.' }
-    foreach ($epochKey in $epochKeys) {
-        if (@($epoch.PSObject.Properties | Where-Object Name -CEQ $epochKey).Count -ne 1 -or
-            ([regex]::Matches($epochRaw, '(?m)^\s*"' + [regex]::Escape($epochKey) + '"\s*:')).Count -ne 1) {
-            Fail "Backup epoch must contain exactly one $epochKey field."
-        }
-    }
-    if (-not (Test-Uuid $epoch.backupEpochId)) { Fail 'Backup epoch manifest is invalid.' }
-    if ([string]$epoch.format -cne 'oscar-backup-epoch' -or [int]$epoch.version -ne 1 -or
-        [string]$epoch.backupId -cne $Id -or [string]$epoch.state -cne 'CREATED') {
-        Fail 'Backup epoch identity, format version, or creation state does not match this recovery-point directory.'
-    }
-    if ([string]$epoch.oscarVersion -cne $RequiredReleaseVersion) { Fail "Backup epoch must identify OSCAR $RequiredReleaseVersion." }
-    if ([string]$epoch.postgresLsn -notmatch '^[0-9A-F]+/[0-9A-F]+$') { Fail 'Backup epoch PostgreSQL LSN is invalid.' }
+    $epoch = $epochInfo.Epoch
     $journalReceipt = Join-Path $root 'JOURNAL_CONFIRMED'
     if (Test-Path -LiteralPath $journalReceipt) {
-        try { Confirm-JournalConfirmationReceipt $root $Id $oscarStateSha256 $image }
-        catch { Write-Warning "Post-verification journal-confirmation audit sidecar is invalid; the authenticated recovery core remains usable: $($_.Exception.Message)" }
+        if ($RequireAcceptance) {
+            Confirm-JournalConfirmationReceipt $root $Id $oscarStateSha256 $image
+        } else {
+            try { Confirm-JournalConfirmationReceipt $root $Id $oscarStateSha256 $image }
+            catch { Write-Warning "Post-verification journal-confirmation audit sidecar is invalid; the authenticated recovery core remains usable: $($_.Exception.Message)" }
+        }
+    } elseif ($RequireAcceptance -and $schemaVersion -eq 2) {
+        Fail 'Accepted schema-version-2 backup is missing JOURNAL_CONFIRMED.'
+    }
+    if ($RequireAcceptance) {
+        Assert-AdministratorFile (Join-Path $root 'VERIFIED') 'VERIFIED marker'
     }
     if (-not $ReadOnly) {
         $postgresRunning = $false
@@ -2069,222 +2219,294 @@ function Confirm-Backup([string]$Id, [switch]$ReadOnly) {
     }
 }
 
-function Get-AuthenticatedBackupLabelBoundary([string]$Root) {
-    $checksumPath = Join-Path $Root 'SHA256SUMS'
-    $matches = @([IO.File]::ReadAllLines($checksumPath) | Where-Object { $_ -cmatch '^[0-9a-f]{64}  \./postgres/backup_label$' })
-    if ($matches.Count -ne 1) { Fail "Authenticated manifest must contain postgres/backup_label exactly once: $Root" }
-    $label = Resolve-ConfinedStorageFile $Root 'postgres/backup_label'
-    $actual = (Get-FileHash -LiteralPath $label -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -cne $matches[0].Substring(0, 64)) { Fail "Authenticated PostgreSQL backup_label checksum mismatch: $Root" }
-    $boundaryMatch = [Regex]::Match([IO.File]::ReadAllText($label), '\(file ([0-9A-F]{24})\)')
-    if (-not $boundaryMatch.Success) { Fail "Could not determine the safe WAL boundary from authenticated backup_label: $Root" }
-    return $boundaryMatch.Groups[1].Value
-}
-
-function Get-PruneIntentHmac([string]$FileName, [string]$Image) {
-    if ($FileName -cne '.oscar-backup-prune-intent') { Fail 'Unsafe backup prune intent filename.' }
-    $intentPath = Join-Path $BackupDirectory $FileName
-    $script = 'key=$(cat /backup-key.txt); openssl dgst -sha256 -hmac "$key" -binary /prune-intent | openssl base64 -A'
-    $output = Get-DockerShellInputOutput $script @(
-        'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "${intentPath}:/prune-intent:ro",
-        '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $Image, '-seu')
-    $tag = (($output -join '').Trim())
-    if ($tag -notmatch '^[A-Za-z0-9+/]{43}=$') { Fail 'Could not calculate a valid backup prune intent authentication tag.' }
-    return $tag
-}
-
-function Read-PruneIntent {
-    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
-    $tagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
-    Assert-AdministratorFile $intentPath 'Backup prune recovery intent'
-    Assert-AdministratorFile $tagPath 'Backup prune recovery intent authentication tag'
-    $expected = [IO.File]::ReadAllText($tagPath).Trim()
-    if ($expected -notmatch '^[A-Za-z0-9+/]{43}=$' -or (Get-PruneIntentHmac '.oscar-backup-prune-intent' (Get-OscarImage)) -cne $expected) {
-        Fail 'Backup prune recovery intent authentication failed; no deletion was attempted.'
-    }
-    $lines = @([IO.File]::ReadAllLines($intentPath))
-    $scalar = @{}
-    $deleteBackups = New-Object System.Collections.Generic.List[string]
-    $deleteWal = New-Object System.Collections.Generic.List[string]
-    foreach ($line in $lines) {
-        if ($line -cmatch '^delete_backup=([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$') { $deleteBackups.Add($Matches[1]); continue }
-        if ($line -cmatch '^delete_wal=([0-9A-F]{24})$') { $deleteWal.Add($Matches[1]); continue }
-        if ($line -notmatch '^([^=]+)=(.*)$' -or $scalar.ContainsKey($Matches[1])) { Fail 'Backup prune recovery intent is malformed.' }
-        $scalar[$Matches[1]] = $Matches[2]
-    }
-    $keys = @('format','version','deployment_id','retention','oldest_retained','wal_boundary','created_at')
-    if ($scalar.Count -ne $keys.Count -or @($keys | Where-Object { -not $scalar.ContainsKey($_) }).Count -ne 0 -or
-        $scalar.format -cne 'oscar-backup-prune-intent' -or $scalar.version -cne '1' -or
-        $scalar.deployment_id -cne (Get-EnvValue 'OSCAR_DEPLOYMENT_ID' '') -or
-        $scalar.retention -notmatch '^(?:[1-9][0-9]{0,3}|10000)$' -or
-        -not (Test-BackupId $scalar.oldest_retained) -or $scalar.wal_boundary -notmatch '^[0-9A-F]{24}$' -or
-        $scalar.created_at -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' -or
-        @($deleteBackups | Sort-Object -Unique).Count -ne $deleteBackups.Count -or
-        @($deleteWal | Sort-Object -Unique).Count -ne $deleteWal.Count) {
-        Fail 'Backup prune recovery intent is malformed, foreign, or internally inconsistent.'
-    }
-    return [pscustomobject]@{
-        Path = $intentPath; TagPath = $tagPath; Retention = [int]$scalar.retention
-        OldestRetained = $scalar.oldest_retained; WalBoundary = $scalar.wal_boundary
-        DeleteBackups = @($deleteBackups); DeleteWal = @($deleteWal)
-    }
-}
-
-function Write-PruneIntent([int]$Retention, [string]$OldestRetained, [string]$WalBoundary, [string[]]$DeleteBackups, [string[]]$DeleteWal) {
-    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
-    $tagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
-    if ((Test-Path -LiteralPath $intentPath) -or (Test-Path -LiteralPath $tagPath)) {
-        Fail 'A backup prune recovery intent already exists and must be recovered before starting another prune.'
-    }
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($line in @(
-        'format=oscar-backup-prune-intent', 'version=1', "deployment_id=$(Get-EnvValue 'OSCAR_DEPLOYMENT_ID' '')",
-        "retention=$Retention", "oldest_retained=$OldestRetained", "wal_boundary=$WalBoundary",
-        "created_at=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))")) { $lines.Add($line) }
-    foreach ($id in $DeleteBackups) { $lines.Add("delete_backup=$id") }
-    foreach ($name in $DeleteWal) { $lines.Add("delete_wal=$name") }
-    $temporary = Join-Path $BackupDirectory ('.oscar-backup-prune-intent.tmp.' + [Guid]::NewGuid().ToString('N'))
-    $tagTemporary = Join-Path $BackupDirectory ('.oscar-backup-prune-intent.hmac.tmp.' + [Guid]::NewGuid().ToString('N'))
-    try {
-        $bytes = $Utf8NoBom.GetBytes(([string]::Join("`n", $lines) + "`n"))
-        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
-        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-        Protect-DockerReadableAdministratorFile $temporary
-        Move-DurableNoReplace $temporary $intentPath
-        Sync-DurableMetadata $BackupDirectory
-        $tag = Get-PruneIntentHmac '.oscar-backup-prune-intent' (Get-OscarImage)
-        $tagBytes = $Utf8NoBom.GetBytes("$tag`n")
-        $stream = [IO.FileStream]::new($tagTemporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
-        try { $stream.Write($tagBytes, 0, $tagBytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-        Protect-AdministratorFile $tagTemporary
-        Move-DurableNoReplace $tagTemporary $tagPath
-        Sync-DurableMetadata $BackupDirectory
-        [void](Read-PruneIntent)
-    } finally {
-        foreach ($path in @($temporary, $tagTemporary)) {
-            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+function Assert-BackupCleanupAcl([string]$Path, [string]$Description) {
+    $acl = Get-Acl -LiteralPath $Path
+    $ownerSid = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $dockerSid = Get-DockerUsersSid
+    $administratorSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
+    $allowedSids = @($administratorSids + $dockerSid.Value)
+    if ($ownerSid -notin $administratorSids) { Fail "$Description is not administrator-owned: $Path" }
+    $writeMask = [Security.AccessControl.FileSystemRights]::WriteData -bor
+        [Security.AccessControl.FileSystemRights]::AppendData -bor
+        [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+        [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($sid -notin $allowedSids -and ($rule.FileSystemRights -band $writeMask) -ne 0) {
+            Fail "$Description grants unsafe write or ownership rights: $Path"
         }
     }
 }
 
-function Complete-PruneIntent {
-    $intent = Read-PruneIntent
-    $retained = Join-Path $BackupDirectory $intent.OldestRetained
-    if (-not (Test-Path -LiteralPath $retained -PathType Container)) { Fail 'Oldest retained backup named by prune intent is missing; WAL was not touched.' }
-    Confirm-Backup $intent.OldestRetained -ReadOnly
-    if ((Get-AuthenticatedBackupLabelBoundary $retained) -cne $intent.WalBoundary) { Fail 'Authenticated WAL boundary changed after prune intent was written.' }
-    foreach ($id in $intent.DeleteBackups) {
-        $path = Join-Path $BackupDirectory $id
-        $deleting = Join-Path $BackupDirectory ".deleting-$id"
-        if ((Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $deleting)) { Fail "Both live and deleting backup paths exist for intent candidate: $id" }
-        if (Test-Path -LiteralPath $path) { Confirm-Backup $id -ReadOnly }
+function Assert-SafeBackupCleanupDirectory([string]$Path, [string]$ExpectedName, [string]$Description) {
+    $expected = [IO.Path]::GetFullPath((Join-Path $BackupDirectory $ExpectedName))
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $full.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail "$Description is not a direct child of the authenticated backup root: $Path"
     }
-    foreach ($name in $intent.DeleteWal) {
-        $path = Join-Path $WalArchiveDirectory $name
-        $deleting = Join-Path $WalArchiveDirectory ".deleting-$name"
-        if ((Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $deleting)) { Fail "Both live and deleting WAL paths exist for intent candidate: $name" }
-        foreach ($candidate in @($path, $deleting)) {
-            if (Test-Path -LiteralPath $candidate) {
-                $item = Get-Item -LiteralPath $candidate -Force
-                if ($item.PSIsContainer -or $item -isnot [IO.FileInfo] -or
-                    ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    Fail "WAL prune candidate is unsafe: $candidate"
-                }
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) { Fail "$Description is missing: $full" }
+    $item = Get-Item -LiteralPath $full -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "$Description is a reparse point: $full" }
+    Assert-BackupCleanupAcl $full $Description
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($full)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail "$Description contains a reparse point: $($child.FullName)"
             }
+            if ($child.PSIsContainer) { $pending.Push($child.FullName); continue }
+            if ($child -isnot [IO.FileInfo]) { Fail "$Description contains a non-regular entry: $($child.FullName)" }
         }
     }
-    foreach ($id in $intent.DeleteBackups) {
-        $path = Join-Path $BackupDirectory $id
-        $deleting = Join-Path $BackupDirectory ".deleting-$id"
-        if (Test-Path -LiteralPath $path) {
-            Move-DurableNoReplace $path $deleting
-            Sync-DurableMetadata $BackupDirectory
-        }
-        if (Test-Path -LiteralPath $deleting) {
-            Remove-Item -LiteralPath $deleting -Recurse -Force
-            Sync-DurableMetadata $BackupDirectory
-        }
-        Add-DurableLogLine (Join-Path $BackupDirectory 'retention.log') "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) deleted authenticated backup $id"
-    }
-    Confirm-Backup $intent.OldestRetained -ReadOnly
-    if ((Get-AuthenticatedBackupLabelBoundary $retained) -cne $intent.WalBoundary) { Fail 'Oldest retained backup failed revalidation; WAL was not touched.' }
-    foreach ($name in $intent.DeleteWal) {
-        $path = Join-Path $WalArchiveDirectory $name
-        $deleting = Join-Path $WalArchiveDirectory ".deleting-$name"
-        if ((Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $deleting)) { Fail "Both live and deleting WAL paths exist for intent candidate: $name" }
-        if (Test-Path -LiteralPath $path) {
-            $item = Get-Item -LiteralPath $path -Force
-            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "WAL prune candidate is unsafe: $path" }
-            Move-DurableNoReplace $path $deleting
-            Sync-DurableMetadata $WalArchiveDirectory
-        }
-        if (Test-Path -LiteralPath $deleting) {
-            $item = Get-Item -LiteralPath $deleting -Force
-            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "WAL prune recovery candidate is unsafe: $deleting" }
-            Remove-Item -LiteralPath $deleting -Force
-            Sync-DurableMetadata $WalArchiveDirectory
-            Add-DurableLogLine (Join-Path $BackupDirectory 'retention.log') "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) deleted archived WAL $name (oldest retained start WAL=$($intent.WalBoundary))"
-        }
-    }
-    Remove-Item -LiteralPath $intent.TagPath -Force
-    Sync-DurableMetadata $BackupDirectory
-    Remove-Item -LiteralPath $intent.Path -Force
+}
+
+function Remove-SafeBackupCleanupDirectory([string]$Path, [string]$ExpectedName, [string]$Description) {
+    Assert-SafeBackupCleanupDirectory $Path $ExpectedName $Description
+    Remove-Item -LiteralPath $Path -Recurse -Force
     Sync-DurableMetadata $BackupDirectory
 }
 
-function Resume-OrDiscardPruneIntent {
-    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
-    $tagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
-    $hasIntent = Test-Path -LiteralPath $intentPath
-    $hasTag = Test-Path -LiteralPath $tagPath
-    if ($hasIntent -and $hasTag) { Complete-PruneIntent; return }
-    if ($hasIntent -or $hasTag) {
-        $orphan = if ($hasIntent) { $intentPath } else { $tagPath }
-        Assert-AdministratorFile $orphan 'Incomplete backup prune publication'
-        Remove-Item -LiteralPath $orphan -Force
+function Remove-BackupAcceptanceTemporaries([string]$Root, [string]$ExpectedName) {
+    Assert-SafeBackupCleanupDirectory $Root $ExpectedName 'backup snapshot'
+    $temporaries = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @(Get-ChildItem -LiteralPath $Root -Force)) {
+        if ($item.Name.StartsWith('.VERIFIED.', [StringComparison]::Ordinal) -or
+            $item.Name.StartsWith('.JOURNAL_CONFIRMED.', [StringComparison]::Ordinal)) {
+            if ($item.Name -cnotmatch '^\.(VERIFIED|JOURNAL_CONFIRMED)\.[0-9a-f]{32}$') {
+                Fail "Malformed backup acceptance temporary was preserved: $($item.FullName)"
+            }
+            if ($item.PSIsContainer -or $item -isnot [IO.FileInfo] -or
+                ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail "Backup acceptance temporary is unsafe: $($item.FullName)"
+            }
+            Assert-BackupCleanupAcl $item.FullName 'backup acceptance temporary'
+            $temporaries.Add($item)
+        }
+    }
+    foreach ($item in $temporaries) {
+        Remove-Item -LiteralPath $item.FullName -Force
+        Sync-DurableMetadata $Root
+    }
+}
+
+function Invoke-SingleBackupRecoveryCleanup {
+    Assert-BackupModeEnabled
+    Assert-StorageRootIdentity $BackupDirectory 'backup'
+    $currentId = Read-CurrentBackupId -AllowMissing
+    if ($currentId) {
+        $currentRoot = Join-Path $BackupDirectory $currentId
+        Remove-BackupAcceptanceTemporaries $currentRoot $currentId
+        Confirm-Backup $currentId -ReadOnly -RequireAcceptance
+    }
+
+    $pointerTemps = New-Object System.Collections.Generic.List[object]
+    $partialDirectories = New-Object System.Collections.Generic.List[object]
+    $deletingPartialDirectories = New-Object System.Collections.Generic.List[object]
+    $scratchDirectories = New-Object System.Collections.Generic.List[object]
+    $deletingSnapshots = New-Object System.Collections.Generic.List[object]
+    $deletingUncommittedV2Snapshots = New-Object System.Collections.Generic.List[object]
+    $snapshotCandidates = New-Object System.Collections.Generic.List[object]
+    $deletingSnapshotsToRemove = New-Object System.Collections.Generic.List[object]
+    $deletingSnapshotsToRestore = New-Object System.Collections.Generic.List[object]
+    $deletingSnapshotsToMigrateUncommittedV2 = New-Object System.Collections.Generic.List[object]
+    $snapshotCandidatesToRemove = New-Object System.Collections.Generic.List[object]
+    $deletingPartialIds = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $deletingSnapshotIds = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $deletingUncommittedV2Ids = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+
+    foreach ($item in @(Get-ChildItem -LiteralPath $BackupDirectory -Force)) {
+        $name = $item.Name
+        if ($name -cmatch '^\.CURRENT\.tmp\.[0-9a-f]{32}$') {
+            if ($item.PSIsContainer -or $item -isnot [IO.FileInfo]) { Fail "CURRENT temporary pointer is not a regular file: $($item.FullName)" }
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "CURRENT temporary pointer is a reparse point: $($item.FullName)" }
+            Assert-BackupCleanupAcl $item.FullName 'CURRENT temporary pointer'
+            $pointerTemps.Add($item)
+            continue
+        }
+        if ($name.StartsWith('.CURRENT.tmp.', [StringComparison]::Ordinal)) {
+            Fail "Malformed CURRENT temporary pointer was preserved: $($item.FullName)"
+        }
+        if ($name -cmatch '^([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})\.partial$') {
+            if (-not $item.PSIsContainer) { Fail "Backup partial is not a directory: $($item.FullName)" }
+            $partialDirectories.Add([pscustomobject]@{ Item = $item; Id = $Matches[1] })
+            continue
+        }
+        if ($name -cmatch '^\.deleting-partial-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$') {
+            if (-not $item.PSIsContainer) { Fail "Deleting backup partial is not a directory: $($item.FullName)" }
+            [void]$deletingPartialIds.Add($Matches[1])
+            $deletingPartialDirectories.Add([pscustomobject]@{ Item = $item; Id = $Matches[1] })
+            continue
+        }
+        if ($name -cmatch '^\.(journal-confirm|restore-payload)-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})-([0-9a-f]{32})$') {
+            if (-not $item.PSIsContainer) { Fail "Backup recovery scratch entry is not a directory: $($item.FullName)" }
+            $scratchDirectories.Add($item)
+            continue
+        }
+        if ($name -cmatch '^\.deleting-uncommitted-v2-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$') {
+            if (-not $item.PSIsContainer) { Fail "Deleting uncommitted schema-version-2 snapshot is not a directory: $($item.FullName)" }
+            [void]$deletingUncommittedV2Ids.Add($Matches[1])
+            $deletingUncommittedV2Snapshots.Add([pscustomobject]@{ Item = $item; Id = $Matches[1] })
+            continue
+        }
+        if ($name -cmatch '^\.deleting-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$') {
+            if (-not $item.PSIsContainer) { Fail "Deleting backup snapshot is not a directory: $($item.FullName)" }
+            [void]$deletingSnapshotIds.Add($Matches[1])
+            $deletingSnapshots.Add([pscustomobject]@{ Item = $item; Id = $Matches[1] })
+            continue
+        }
+        if (Test-BackupId $name) {
+            if (-not $item.PSIsContainer) { Fail "Backup snapshot is not a directory: $($item.FullName)" }
+            if ($name -cne $currentId) { $snapshotCandidates.Add($item) }
+            continue
+        }
+        if ($name -cmatch '^[0-9]{8}T' -or $name.StartsWith('.deleting-', [StringComparison]::Ordinal) -or
+            $name.StartsWith('.journal-confirm-', [StringComparison]::Ordinal) -or
+            $name.StartsWith('.restore-payload-', [StringComparison]::Ordinal)) {
+            Fail "Malformed OSCAR backup recovery directory was preserved: $($item.FullName)"
+        }
+    }
+
+    foreach ($partial in $partialDirectories) {
+        if ($deletingPartialIds.Contains([string]$partial.Id)) {
+            Fail "Both live and deleting partial directories exist for backup $($partial.Id)."
+        }
+        Assert-SafeBackupCleanupDirectory $partial.Item.FullName $partial.Item.Name 'backup partial'
+    }
+    foreach ($partial in $deletingPartialDirectories) {
+        Assert-SafeBackupCleanupDirectory $partial.Item.FullName $partial.Item.Name 'deleting backup partial'
+    }
+    foreach ($scratch in $scratchDirectories) {
+        Assert-SafeBackupCleanupDirectory $scratch.FullName $scratch.Name 'backup recovery scratch directory'
+    }
+    foreach ($candidate in $snapshotCandidates) {
+        if ($deletingSnapshotIds.Contains([string]$candidate.Name) -or
+            $deletingUncommittedV2Ids.Contains([string]$candidate.Name)) {
+            Fail "Both live and deleting snapshots exist for backup $($candidate.Name)."
+        }
+    }
+    foreach ($deleting in $deletingSnapshots) {
+        if ($deletingUncommittedV2Ids.Contains([string]$deleting.Id)) {
+            Fail "Both legacy and uncommitted schema-version-2 deletion tombstones exist for backup $($deleting.Id)."
+        }
+    }
+    foreach ($deleting in $deletingUncommittedV2Snapshots) {
+        if ($deleting.Id -ceq $currentId) { Fail 'Refusing to delete an uncommitted tombstone whose ID matches CURRENT.' }
+        Assert-SafeBackupCleanupDirectory $deleting.Item.FullName $deleting.Item.Name 'deleting uncommitted schema-version-2 snapshot'
+    }
+    foreach ($deleting in $deletingSnapshots) {
+        Assert-SafeBackupCleanupDirectory $deleting.Item.FullName $deleting.Item.Name 'deleting backup snapshot'
+        if ($currentId) {
+            if ($deleting.Id -ceq $currentId) { Fail 'Refusing to delete the authenticated CURRENT backup tombstone.' }
+            $deletingSnapshotsToRemove.Add($deleting)
+            continue
+        }
+        Remove-BackupAcceptanceTemporaries $deleting.Item.FullName $deleting.Item.Name
+        Confirm-Backup $deleting.Id -ReadOnly -RootOverride $deleting.Item.FullName
+        $epochInfo = Read-ValidatedBackupEpoch $deleting.Item.FullName $deleting.Id
+        if ([int]$epochInfo.SchemaVersion -eq 1) {
+            $deletingSnapshotsToRestore.Add($deleting)
+        } elseif ([int]$epochInfo.SchemaVersion -eq 2) {
+            $deletingSnapshotsToMigrateUncommittedV2.Add($deleting)
+        } else {
+            Fail "Authenticated backup has an unsupported schema version: $($deleting.Item.FullName)"
+        }
+    }
+    foreach ($candidate in $snapshotCandidates) {
+        Assert-SafeBackupCleanupDirectory $candidate.FullName $candidate.Name 'non-current backup snapshot'
+        Remove-BackupAcceptanceTemporaries $candidate.FullName $candidate.Name
+        Confirm-Backup $candidate.Name -ReadOnly -RootOverride $candidate.FullName
+        if ($currentId) {
+            $snapshotCandidatesToRemove.Add($candidate)
+            continue
+        }
+        $epochInfo = Read-ValidatedBackupEpoch $candidate.FullName $candidate.Name
+        if ([int]$epochInfo.SchemaVersion -eq 2) {
+            $snapshotCandidatesToRemove.Add($candidate)
+        } elseif ([int]$epochInfo.SchemaVersion -ne 1) {
+            Fail "Authenticated backup has an unsupported schema version: $($candidate.FullName)"
+        }
+    }
+
+    foreach ($pointerTemp in $pointerTemps) {
+        Remove-Item -LiteralPath $pointerTemp.FullName -Force
         Sync-DurableMetadata $BackupDirectory
-        Write-Host 'Discarded an incomplete authenticated-prune publication; no backup or WAL payload was deleted.'
+    }
+    foreach ($partial in $partialDirectories) {
+        $tombstoneName = ".deleting-partial-$($partial.Id)"
+        $tombstone = Join-Path $BackupDirectory $tombstoneName
+        Move-DurableNoReplace $partial.Item.FullName $tombstone
+        Sync-DurableMetadata $BackupDirectory
+        Remove-SafeBackupCleanupDirectory $tombstone $tombstoneName 'deleting backup partial'
+    }
+    foreach ($partial in $deletingPartialDirectories) {
+        Remove-SafeBackupCleanupDirectory $partial.Item.FullName $partial.Item.Name 'deleting backup partial'
+    }
+    foreach ($scratch in $scratchDirectories) {
+        Remove-SafeBackupCleanupDirectory $scratch.FullName $scratch.Name 'backup recovery scratch directory'
+    }
+    foreach ($deleting in $deletingSnapshotsToRestore) {
+        if ($null -ne (Read-CurrentBackupId -AllowMissing)) { Fail 'CURRENT appeared during serialized snapshot cleanup.' }
+        $destination = Join-Path $BackupDirectory $deleting.Id
+        if (Test-Path -LiteralPath $destination) { Fail "Refusing to overwrite a restored legacy backup: $destination" }
+        Move-DurableNoReplace $deleting.Item.FullName $destination
+        Sync-DurableMetadata $BackupDirectory
+        Write-Host "Restored authenticated legacy schema-version-1 backup: $($deleting.Id)"
+    }
+    foreach ($deleting in $deletingUncommittedV2Snapshots) {
+        $observedCurrentId = Read-CurrentBackupId -AllowMissing
+        if (($currentId -and $observedCurrentId -cne $currentId) -or
+            (-not $currentId -and $null -ne $observedCurrentId)) {
+            Fail 'CURRENT changed during serialized snapshot cleanup.'
+        }
+        Remove-SafeBackupCleanupDirectory $deleting.Item.FullName $deleting.Item.Name 'deleting uncommitted schema-version-2 snapshot'
+    }
+    foreach ($deleting in $deletingSnapshotsToMigrateUncommittedV2) {
+        if ($null -ne (Read-CurrentBackupId -AllowMissing)) { Fail 'CURRENT appeared during serialized snapshot cleanup.' }
+        $tombstoneName = ".deleting-uncommitted-v2-$($deleting.Id)"
+        $tombstone = Join-Path $BackupDirectory $tombstoneName
+        Move-DurableNoReplace $deleting.Item.FullName $tombstone
+        Sync-DurableMetadata $BackupDirectory
+        Remove-SafeBackupCleanupDirectory $tombstone $tombstoneName 'deleting uncommitted schema-version-2 snapshot'
+    }
+    foreach ($deleting in $deletingSnapshotsToRemove) {
+        $observedCurrentId = Read-CurrentBackupId -AllowMissing
+        if (($currentId -and $observedCurrentId -cne $currentId) -or
+            (-not $currentId -and $null -ne $observedCurrentId)) {
+            Fail 'CURRENT changed during serialized snapshot cleanup.'
+        }
+        Remove-SafeBackupCleanupDirectory $deleting.Item.FullName $deleting.Item.Name 'deleting backup snapshot'
+    }
+    foreach ($candidate in $snapshotCandidatesToRemove) {
+        $observedCurrentId = Read-CurrentBackupId -AllowMissing
+        if (($currentId -and $observedCurrentId -cne $currentId) -or
+            (-not $currentId -and $null -ne $observedCurrentId)) {
+            Fail 'CURRENT changed during serialized snapshot cleanup.'
+        }
+        $tombstoneName = if ($currentId) {
+            ".deleting-$($candidate.Name)"
+        } else {
+            ".deleting-uncommitted-v2-$($candidate.Name)"
+        }
+        $tombstone = Join-Path $BackupDirectory $tombstoneName
+        Move-DurableNoReplace $candidate.FullName $tombstone
+        Sync-DurableMetadata $BackupDirectory
+        $description = if ($currentId) { 'deleting backup snapshot' } else { 'deleting uncommitted schema-version-2 snapshot' }
+        Remove-SafeBackupCleanupDirectory $tombstone $tombstoneName $description
+        Write-Host "Removed authenticated non-current backup: $($candidate.Name)"
     }
 }
 
 function Remove-ExpiredBackups([int]$RequestedKeep) {
-    Assert-Administrator; Assert-Configured; Assert-BackupKey
-    $retention = $RequestedKeep
-    if ($retention -eq 0) {
-        $configured = Get-EnvValue 'OSCAR_BACKUP_RETENTION_COUNT' '14'
-        if ($configured -notmatch '^(?:[1-9][0-9]{0,3}|10000)$') { Fail 'OSCAR_BACKUP_RETENTION_COUNT must be between 1 and 10000.' }
-        $retention = [int]$configured
-    }
-    Assert-LocalImage (Get-OscarImage)
-    $intentPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent'
-    $intentTagPath = Join-Path $BackupDirectory '.oscar-backup-prune-intent.hmac'
-    if ((Test-Path -LiteralPath $intentPath) -or (Test-Path -LiteralPath $intentTagPath)) { Resume-OrDiscardPruneIntent }
-    $verified = @(Get-ChildItem -LiteralPath $BackupDirectory -Directory -ErrorAction SilentlyContinue |
-        Where-Object {
-            $marker = Join-Path $_.FullName 'VERIFIED'
-            (Test-BackupId $_.Name) -and (Test-Path -LiteralPath $marker -PathType Leaf) -and
-                (((Get-Item -LiteralPath $marker -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
-        } |
-        Sort-Object Name -Descending)
-    foreach ($candidate in $verified) { Confirm-Backup $candidate.Name -ReadOnly }
-    if ($verified.Count -eq 0) { Write-Host 'No authenticated, verified backups exist; WAL archive was not pruned.'; return }
-    $deleteBackups = @($verified | Select-Object -Skip $retention | ForEach-Object Name)
-    $retainedCount = [Math]::Min($verified.Count, $retention)
-    $oldestRetained = $verified[$retainedCount - 1]
-    $boundary = Get-AuthenticatedBackupLabelBoundary $oldestRetained.FullName
-    $deleteWal = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @(Get-ChildItem -LiteralPath $WalArchiveDirectory -Force -ErrorAction SilentlyContinue)) {
-        if ($item.Name -notmatch '^[0-9A-F]{24}$') { continue }
-        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "WAL prune candidate is unsafe: $($item.FullName)" }
-        if ([String]::CompareOrdinal($item.Name, $boundary) -lt 0) { $deleteWal.Add($item.Name) }
-    }
-    if ($deleteBackups.Count -eq 0 -and $deleteWal.Count -eq 0) {
-        Write-Host "Backup retention complete; $($verified.Count) authenticated recovery point(s) remain and no WAL was eligible." -ForegroundColor Green
-        return
-    }
-    Write-PruneIntent $retention $oldestRetained.Name $boundary $deleteBackups @($deleteWal)
-    Complete-PruneIntent
-    Write-Host "Backup retention complete; kept $retention newest authenticated recovery point(s). WAL history required by the oldest retained backup was preserved." -ForegroundColor Green
+    Assert-BackupModeEnabled
+    Fail 'backup-prune is retired in OSCAR_BACKUP_MODE=single; a successful backup atomically commits CURRENT and then removes only authenticated non-current snapshots.'
 }
 
 function Get-RestoreLocalEnvironmentKeys {
@@ -2296,7 +2518,7 @@ function Get-RestoreLocalEnvironmentKeys {
         'OSCAR_SECRETS_DIR',
         'OSCAR_TLS_DIR',
         'OSCAR_ARCHIVE_DIR',
-        'OSCAR_WAL_ARCHIVE_DIR',
+        'OSCAR_BACKUP_MODE',
         'OSCAR_BACKUP_DIR',
         'OSCAR_BACKUP_KEY_FILE'
     )
@@ -2337,11 +2559,27 @@ function Merge-RestoredEnvironment([string]$Restored, [string]$Target) {
         if ($matches.Count -ne 1) { Fail "Target .env must contain exactly one $name binding before restore." }
         $value = $matches[0].Substring($name.Length + 1)
         if (-not $value) { Fail "Target .env has an empty $name binding; restore was not installed." }
-        if ($name -in @('OSCAR_ARCHIVE_DIR', 'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR') -and
+        if ($name -ceq 'OSCAR_BACKUP_MODE' -and $value -cnotin @('disabled', 'single')) {
+            Fail 'Target OSCAR_BACKUP_MODE must remain the literal lowercase value disabled or single.'
+        }
+        if ($name -in @('OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR') -and
             -not [IO.Path]::IsPathRooted($value)) {
             Fail "Target $name must be an absolute path before restore: $value"
         }
         $bindings.Add($name, $matches[0])
+    }
+    # The retired WAL root is not required by either backup schema. Preserve a
+    # legacy target binding when one exists, but never import the source
+    # deployment's path into a target that has already removed it.
+    $optionalWalName = 'OSCAR_WAL_ARCHIVE_DIR'
+    $optionalWalMatches = @($targetLines | Where-Object { $_ -match "^$optionalWalName=" })
+    if ($optionalWalMatches.Count -gt 1) { Fail "Target .env contains duplicate $optionalWalName bindings before restore." }
+    if ($optionalWalMatches.Count -eq 1) {
+        $optionalWalValue = $optionalWalMatches[0].Substring($optionalWalName.Length + 1)
+        if (-not $optionalWalValue -or -not [IO.Path]::IsPathRooted($optionalWalValue)) {
+            Fail "Target $optionalWalName must be an absolute path before restore: $optionalWalValue"
+        }
+        $bindings.Add($optionalWalName, $optionalWalMatches[0])
     }
     $deploymentId = $bindings['OSCAR_DEPLOYMENT_ID'].Substring('OSCAR_DEPLOYMENT_ID='.Length)
     if (-not (Test-ValidDeploymentId $deploymentId)) {
@@ -2354,12 +2592,17 @@ function Merge-RestoredEnvironment([string]$Restored, [string]$Target) {
         $name = if ($equals -gt 0) { $line.Substring(0, $equals) } else { '' }
         if ($bindings.ContainsKey($name)) {
             if ($written.Add($name)) { $merged.Add($bindings[$name]) }
+        } elseif ($name -ceq $optionalWalName) {
+            continue
         } else {
             $merged.Add($line)
         }
     }
     foreach ($name in @(Get-RestoreLocalEnvironmentKeys)) {
         if ($written.Add($name)) { $merged.Add($bindings[$name]) }
+    }
+    if ($bindings.ContainsKey($optionalWalName) -and $written.Add($optionalWalName)) {
+        $merged.Add($bindings[$optionalWalName])
     }
     [IO.File]::WriteAllLines($Restored, $merged, $Utf8NoBom)
     Assert-CanonicalCredentialBindings $Restored
@@ -2456,7 +2699,7 @@ function Assert-RestoreSettingsRemovedFromDataVolume {
         '--volume', 'oscar_postgres_data:/data:ro', (Get-PostgresImage), '-seu')
 }
 
-function Confirm-CleanRestoredPostgresRuntime([UInt64]$ExpectedTimeline, [UInt64]$ExpectedFailedCount) {
+function Confirm-CleanRestoredPostgresRuntime([UInt64]$ExpectedTimeline, [string]$ExpectedEpochId) {
     $status = @((Invoke-Psql "SELECT CASE WHEN pg_is_in_recovery() THEN '1' ELSE '0' END||'|'||timeline_id FROM pg_control_checkpoint();") -split '\|')
     [UInt64]$timeline = 0
     if ($status.Count -ne 2 -or $status[0] -cne '0' -or
@@ -2469,11 +2712,12 @@ function Confirm-CleanRestoredPostgresRuntime([UInt64]$ExpectedTimeline, [UInt64
         Fail "Restored PostgreSQL retained recovery settings after its cleanup restart: $settings"
     }
 
-    $stats = @((Invoke-Psql "SELECT failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;") -split '\|')
-    [UInt64]$failed = 0
-    if ($stats.Count -ne 2 -or -not [UInt64]::TryParse($stats[0], [ref]$failed) -or
-        $failed -ne $ExpectedFailedCount -or $stats[1] -cne '0') {
-        Fail "PostgreSQL WAL archival health changed during the recovery-settings cleanup restart: $($stats -join '|')"
+    if ((Invoke-Psql 'SHOW archive_mode;') -cne 'off') {
+        Fail 'Restored PostgreSQL enabled external WAL archiving after its clean restart.'
+    }
+    $receipt = Invoke-Psql "SELECT state FROM oscar_backup_epoch WHERE id='$ExpectedEpochId'::uuid;"
+    if ($receipt -cne 'VERIFIED') {
+        Fail 'The post-promotion VERIFIED receipt did not survive checkpoint and clean restart.'
     }
 }
 
@@ -2491,58 +2735,48 @@ function Confirm-RestoredPostgresTimeline(
         Fail "Restored PostgreSQL did not promote onto a fresh timeline (source=$SourceTimeline, status=$status)."
     }
 
-    $stats = @((Invoke-Psql "SELECT archived_count||'|'||failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;") -split '\|')
-    [UInt64]$archivedBefore = 0
-    [UInt64]$failedBefore = 0
-    if ($stats.Count -ne 3 -or -not [UInt64]::TryParse($stats[0], [ref]$archivedBefore) -or
-        -not [UInt64]::TryParse($stats[1], [ref]$failedBefore) -or $stats[2] -cne '0') {
-        Fail 'PostgreSQL reported a WAL archival failure during restore promotion.'
+    if ((Invoke-Psql 'SHOW archive_mode;') -cne 'off') {
+        Fail 'Restored PostgreSQL must keep archive_mode off; external WAL archives are not part of schema-v1 or schema-v2 restore.'
     }
 
     # Recreate the authenticated VERIFIED row missing from the historical base
-    # backup, then prove that semantic write can be archived on the promoted
-    # timeline without colliding with preserved pre-restore WAL.
+    # backup. This is the post-promotion semantic write whose durability is
+    # proved by a checkpoint and the clean restart below.
     Set-VerifiedBackupEpochReceipt $Root $Id ([string]$Epoch.backupEpochId) ([string]$Epoch.postgresLsn)
-    $segment = Invoke-Psql 'SELECT pg_walfile_name(pg_switch_wal());'
-    if ($segment -notmatch '^[0-9A-F]{24}$' -or [Convert]::ToUInt64($segment.Substring(0, 8), 16) -ne $currentTimeline) {
-        Fail "Post-restore WAL segment did not use the promoted timeline: $segment"
+    if ((Invoke-Psql "SELECT state FROM oscar_backup_epoch WHERE id='$([string]$Epoch.backupEpochId)'::uuid;") -cne 'VERIFIED') {
+        Fail 'Restored PostgreSQL did not commit the post-promotion VERIFIED receipt.'
     }
     [void](Invoke-Psql 'CHECKPOINT;')
-    $history = ('{0:X8}.history' -f $currentTimeline)
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-        $currentStats = @((Invoke-Psql "SELECT archived_count||'|'||failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;") -split '\|')
-        [UInt64]$archivedNow = 0
-        [UInt64]$failedNow = 0
-        if ($currentStats.Count -ne 3 -or -not [UInt64]::TryParse($currentStats[0], [ref]$archivedNow) -or
-            -not [UInt64]::TryParse($currentStats[1], [ref]$failedNow) -or $failedNow -ne $failedBefore -or $currentStats[2] -cne '0') {
-            Fail "PostgreSQL WAL archival failed after restore promotion (segment=$segment)."
-        }
-        $segmentPath = Join-Path $WalArchiveDirectory $segment
-        $historyPath = Join-Path $WalArchiveDirectory $history
-        if ($archivedNow -gt $archivedBefore -and
-            (Test-Path -LiteralPath $segmentPath -PathType Leaf) -and
-            (Test-Path -LiteralPath $historyPath -PathType Leaf) -and
-            ((Get-Item -LiteralPath $segmentPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
-            ((Get-Item -LiteralPath $historyPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
-            Clear-RestoreRecoverySettings
-            return [pscustomobject]@{
-                Timeline = $currentTimeline
-                FailedCount = $failedNow
-            }
-        }
-        Start-Sleep -Seconds 1
+    Clear-RestoreRecoverySettings
+    return [pscustomobject]@{
+        Timeline = $currentTimeline
+        EpochId = [string]$Epoch.backupEpochId
     }
-    Fail "PostgreSQL did not durably archive the promoted timeline history and test segment ($history, $segment)."
 }
 
 function Restore-Backup([string]$Id, [string]$Confirmation) {
-    Assert-Administrator; Assert-Configured; Assert-BackupKey
+    Assert-Administrator; Assert-Configured; Assert-BackupModeEnabled; Assert-BackupKey
     if (-not (Test-BackupId $Id) -or $Confirmation -cne $Id) { Fail "Restore is destructive. Supply -BackupId ID -Confirm ID with the same valid backup ID." }
     Assert-DeploymentVolumeOwnership
     $root = Join-Path $BackupDirectory $Id
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { Fail "Backup does not exist: $root" }
+    $currentId = Read-CurrentBackupId -AllowMissing
+    if ($currentId -and $currentId -cne $Id) {
+        Fail "Restore target $Id is not the authenticated CURRENT backup ($currentId)."
+    }
+    Invoke-SingleBackupRecoveryCleanup
     Assert-RestoreCompatibility $root
-    Confirm-Backup $Id
+    Confirm-Backup $Id -ReadOnly
+    $restoreEpochInfo = Read-ValidatedBackupEpoch $root $Id
+    if ([int]$restoreEpochInfo.SchemaVersion -eq 2) {
+        if ($currentId -cne $Id) { Fail 'Schema-version-2 restore requires its authenticated CURRENT pointer.' }
+        Confirm-Backup $Id -ReadOnly -RequireAcceptance
+    } else {
+        # Legacy schema-v1 recovery points predate CURRENT. Preserve explicit
+        # verification/restore compatibility while never merging their external
+        # WAL tar; pg_basebackup --wal-method=stream is the recovery source.
+        Confirm-Backup $Id
+    }
     Assert-RestoreCompatibility $root
     Assert-DeploymentVolumeOwnership
     $restoreTemp = Join-Path $ScriptRoot ".restore-secrets-$([Guid]::NewGuid().ToString('N'))"
@@ -2552,25 +2786,16 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
     Protect-DockerStorageDirectory $restoreTemp 'ReadWrite'
     Protect-PrivateDirectory $restoreStage
     Copy-Item -LiteralPath (Join-Path $root 'postgres') -Destination $restoreStage -Recurse
-    $walMergeStage = Join-Path $restoreStage 'wal-merge'
-    New-Item -ItemType Directory -Path $walMergeStage | Out-Null
-    foreach ($name in @('oscar-state.tar.gz', 'archive.tar.gz', 'wal-archive.tar.gz')) {
+    foreach ($name in @('oscar-state.tar.gz', 'archive.tar.gz')) {
         Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $restoreStage $name)
     }
     Protect-DockerStorageDirectory $restoreStage 'ReadOnly'
-    Protect-DockerStorageDirectory $walMergeStage 'ReadWrite'
     try {
         $image = "oscar:$RequiredReleaseVersion"
         $decryptSecrets = 'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -'
         Invoke-DockerShellInput $decryptSecrets @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${root}:/backup:ro", '--volume', "${restoreTemp}:/restore", '--volume', "${BackupKeyFile}:/backup-key.txt:ro", $image, '-seu')
         Prepare-RestoredDeploymentCredentials $restoreTemp $ScriptRoot
-        # Complete the authenticated WAL collision/type preflight and
-        # append-only merge before a safety copy, service stop, or replacement
-        # of any live deployment state. A collision therefore fails with all
-        # replaceable state untouched.
-        Assert-StorageRootIdentities
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '999:999', '--entrypoint', '/usr/local/bin/oscar-merge-wal-restore', '--volume', "${WalArchiveDirectory}:/wal-archive", '--volume', "${walMergeStage}:/wal-merge", '--volume', "$(Join-Path $restoreStage 'wal-archive.tar.gz'):/restore-wal.tar.gz:ro", (Get-PostgresImage), '/restore-wal.tar.gz', '/wal-archive', '/wal-merge')
-        Assert-StorageRootIdentities
+        Assert-StorageRootIdentities -IncludeBackup
     } catch {
         Remove-Item -LiteralPath $restoreTemp -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $restoreStage -Recurse -Force -ErrorAction SilentlyContinue
@@ -2595,7 +2820,7 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
         Invoke-DockerShellInput $restoreState @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', 'oscar_oscar_state:/state', '--volume', "$(Join-Path $restoreStage 'oscar-state.tar.gz'):/restore-state.tar.gz:ro", $image, '-seu')
         $restoreArchive = 'find /archive -mindepth 1 -maxdepth 1 ! -name .oscar-storage-root -exec rm -rf -- {} +; tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /archive -xzf /restore-archive.tar.gz'
         Invoke-DockerShellInput $restoreArchive @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sh', '--volume', "${ArchiveDirectory}:/archive", '--volume', "$(Join-Path $restoreStage 'archive.tar.gz'):/restore-archive.tar.gz:ro", $image, '-seu')
-        Assert-StorageRootIdentities
+        Assert-StorageRootIdentities -IncludeBackup
         Install-PreparedDeploymentCredentials $restoreTemp $ScriptRoot
         Assert-DeploymentVolumeOwnership
     } finally {
@@ -2606,7 +2831,7 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
     try {
         Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'postgres')
         $restoredPostgresRunning = $true
-        $restoreEpoch = Get-Content -LiteralPath (Join-Path $root 'epoch.json') -Raw | ConvertFrom-Json
+        $restoreEpoch = $restoreEpochInfo.Epoch
         if (-not (Test-Uuid ([string]$restoreEpoch.backupEpochId)) -or
             ([string]$restoreEpoch.postgresLsn) -notmatch '^[0-9A-F]+/[0-9A-F]+$') {
             Fail 'Authenticated restore epoch fields are invalid.'
@@ -2617,7 +2842,7 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
         Assert-RestoreSettingsRemovedFromDataVolume
         Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'postgres')
         $restoredPostgresRunning = $true
-        Confirm-CleanRestoredPostgresRuntime ([UInt64]$restoreProof.Timeline) ([UInt64]$restoreProof.FailedCount)
+        Confirm-CleanRestoredPostgresRuntime ([UInt64]$restoreProof.Timeline) ([string]$restoreProof.EpochId)
         $restoredPostgresRunning = $false
         Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'oscar', 'gateway')
     } catch {
@@ -3132,7 +3357,6 @@ OSCAR storage administration (Administrator PowerShell)
 
   oscar.bat backup
   oscar.bat backup-verify -BackupId ID
-  oscar.bat backup-prune [-Keep COUNT]
   oscar.bat restore -BackupId ID -Confirm ID
   oscar.bat archive status
   oscar.bat archive verify
@@ -3143,6 +3367,7 @@ OSCAR storage administration (Administrator PowerShell)
   oscar.bat archive purge -StoreKey KEY -IdScope INT -Plan UUID -Token TOKEN
   oscar.bat archive export -StoreKey KEY -IdScope INT -Generation UUID -Destination PATH
 
+Single-backup mode commits one authenticated CURRENT snapshot; backup-prune is retired.
 Restore and archive purge are destructive and require explicit confirmation.
 '@ | Write-Host
 }
@@ -3152,11 +3377,21 @@ try {
         if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
             Fail 'The PowerShell OSCAR storage launcher is supported only on Windows; use the Bash launcher on Ubuntu 24.04.'
         }
-        Assert-Administrator; Assert-Configured; Enter-StorageAdminLock
+        Assert-Administrator; Assert-Configured
+        if ($Command -in @('backup', 'backup-verify', 'backup-prune', 'restore')) { Assert-BackupModeEnabled }
+        if ($Command -eq 'backup-prune') {
+            Fail 'backup-prune is retired in OSCAR_BACKUP_MODE=single; a successful backup atomically commits CURRENT and then removes only authenticated non-current snapshots.'
+        }
+        Enter-StorageAdminLock
     }
     if ($Command -eq 'backup-verify') {
         Assert-OfflineBackupDirectory
-    } elseif ($Command -notin @('help', 'prepare-directories')) {
+        Assert-StorageRootIdentity $BackupDirectory 'backup'
+    } elseif ($Command -in @('backup', 'restore')) {
+        Assert-StorageRootsReady -IncludeBackup
+        Assert-StorageRootIdentities -IncludeBackup
+        Assert-DeploymentVolumeOwnership
+    } elseif ($Command -eq 'archive') {
         Assert-StorageRootsReady
         Assert-StorageRootIdentities
         Assert-DeploymentVolumeOwnership

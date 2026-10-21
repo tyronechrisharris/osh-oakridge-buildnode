@@ -1,10 +1,12 @@
 # OSCAR 3.9.2 backup, restore, and recovery
 
-OSCAR 3.9.2 provides a coordinated backup of the PostgreSQL cluster, application state, cold
-archive, archived WAL, release configuration, and encrypted deployment credentials. A checksum and
-`pg_verifybackup` pass is required before the backup is accepted. With OSCAR quiesced, creation also
-requires every active cold-archive object to exist, match its catalog checksum, and pass filesystem
-reconciliation before PostgreSQL or archive snapshots begin.
+OSCAR 3.9.2 can create one coordinated recovery snapshot of the PostgreSQL cluster, application
+state, primary Parquet cold tier, release configuration, and encrypted deployment credentials.
+Fresh installations default to `OSCAR_BACKUP_MODE=disabled`; backup creation, verification, restore,
+and the retired prune command remain unavailable until an administrator explicitly changes the
+deployment to `single` mode through `init` or `upgrade`. A checksum and `pg_verifybackup` pass is
+required before a snapshot is accepted. With OSCAR quiesced, creation also requires every active
+cold-tier object to exist, match its catalog checksum, and pass filesystem reconciliation.
 
 This runbook uses only commands implemented by the release launchers. Read it completely and carry
 out a restore drill on an isolated test host before relying on a deployment for production recovery.
@@ -13,15 +15,14 @@ hosts; macOS deployment and storage operations fail closed.
 
 ## What a coordinated backup contains
 
-Each backup is stored under `${OSCAR_BACKUP_DIR}/<backup-id>`, where the ID has the form
-`YYYYMMDDTHHMMSSZ-<eight hex characters>`.
+The current snapshot is stored under `${OSCAR_BACKUP_DIR}/<backup-id>`, where the ID has the form
+`YYYYMMDDTHHMMSSZ-<eight hex characters>`. Schema v2 is the format created by this release.
 
 | Object | Contents |
 | --- | --- |
 | `postgres/` | Plain-format `pg_basebackup` of the complete PostgreSQL cluster, with required WAL streamed into the backup |
 | `oscar-state.tar.gz` | Mutable `/var/lib/oscar` application state, including saved SensorHub configuration, journal, daily files, videos/JPEGs, reports, and adjudication artifacts; excludes the separately captured archive path, reproducible transient DuckDB scratch at `/var/lib/oscar/duckdb-tmp`, any legacy embedded backup mountpoint, and the verified image-owned links (`lib`, `web`, `rules`, `documentation`, `trusted_certificates`, `config`, and `logback.xml`) that the restored image recreates |
 | `archive.tar.gz` | Complete configured `/var/lib/oscar/archive` data tree, excluding the host-local `.oscar-storage-root` identity |
-| `wal-archive.tar.gz` | Snapshot of `/var/lib/postgresql/wal-archive`, excluding the host-local `.oscar-storage-root` identity |
 | `deployment-secrets.tar.gz.enc` | `.env`, `secrets/`, and `tls/`, encrypted with AES-256-CBC and PBKDF2 using the external backup key |
 | `release-config.tar.gz` | Non-secret Compose, image-build, sample environment, and release documentation files |
 | `epoch.json` | Backup UUID, backup ID, UTC creation time, OSCAR version, PostgreSQL LSN, archive root, and creation state |
@@ -29,11 +30,33 @@ Each backup is stored under `${OSCAR_BACKUP_DIR}/<backup-id>`, where the ID has 
 | `image-inventory.txt` | Exact Compose image names, immutable local image IDs, repository-digest provenance, and required OSCAR/PostGIS release labels used to create the recovery point |
 | `SHA256SUMS` | SHA-256 of every authenticated core payload file present before verification (excludes itself, its authentication tag, the later `VERIFIED` marker, and the post-verification `JOURNAL_CONFIRMED` sidecar) |
 | `SHA256SUMS.hmac` | HMAC-SHA-256 authentication of `SHA256SUMS`, using the external backup key; this authenticates the complete checksum inventory and every payload it names |
-| `VERIFIED` | Atomically replaced UTC marker written only after quiesced live archive/catalog reconciliation, authenticated checksums, `pg_verifybackup`, strict archive-member validation, and epoch validation establish a valid recovery point |
-| `JOURNAL_CONFIRMED` | Optional post-verification audit sidecar written only after the exact `VERIFIED` recovery point has authorized the stopped live daily-file journal; it binds the backup ID and state-archive hash with its own HMAC. It is intentionally outside `SHA256SUMS`, and its absence or corruption warns without invalidating the authenticated recovery core |
+| `VERIFIED` | Atomically replaced UTC core-verification marker written only after quiesced live archive/catalog reconciliation, authenticated checksums, `pg_verifybackup`, strict archive-member validation, and epoch validation establish a valid authenticated core candidate |
+| `JOURNAL_CONFIRMED` | Required schema-v2 acceptance sidecar written only after the exact `VERIFIED` core has authorized the stopped live daily-file journal; it binds the backup ID and state-archive hash with its own HMAC. It is intentionally outside `SHA256SUMS`: an absent or corrupt receipt only warns during read-only core verification, but the candidate cannot become `CURRENT` or be restored as an accepted schema-v2 recovery point without a valid receipt |
+
+Schema v2 deliberately has no `wal-archive.tar.gz`. `pg_basebackup --wal-method=stream` places every
+WAL file needed to reach the online-backup endpoint in `postgres/pg_wal`, and `pg_verifybackup`
+checks that self-contained database payload. A schema-v2 checksum manifest containing
+`wal-archive.tar.gz` is rejected. For compatibility, an authenticated schema-v1 recovery point must
+contain its historical `wal-archive.tar.gz`; verification authenticates that exact format rather
+than silently reinterpreting it as v2. Restore does not merge or read the external payload because
+the base backup's streamed `postgres/pg_wal` is sufficient.
+
+The backup root also contains `CURRENT`, the authenticated commit pointer for the one-snapshot
+model. It has exactly these four LF-terminated lines:
+
+```text
+format=oscar-current-backup
+version=1
+backup_id=<backup-id>
+hmac_sha256=<base64 HMAC-SHA-256>
+```
+
+The HMAC covers the first three lines, including each terminating LF, using
+`${OSCAR_BACKUP_KEY_FILE}`. A snapshot directory is not current merely because it is newest or has a
+`VERIFIED` marker; `CURRENT` is authoritative.
 
 When PostgreSQL is available, its live catalog first receives a best-effort `CREATED`
-`oscar_backup_epoch` receipt after the backup directory is finalized. Acceptance then requires an
+`oscar_backup_epoch` receipt after the backup directory is finalized. Core verification then requires an
 exact collision-safe `VERIFIED` receipt before the filesystem `VERIFIED` marker is allowed to
 remain. The receipt binds the manifest path, epoch checksum, LSN, and the count, exact byte length,
 and SHA-256 of the ordered generation set authenticated in `archive-generation-ids.txt`; later
@@ -42,7 +65,7 @@ HMAC-authenticated backup file and are not duplicated in a PostgreSQL `uuid[]` f
 This keeps validation memory bounded and prevents backup receipts from adding multi-megabyte TOAST
 rows to every later database backup. Offline verification omits the live catalog receipt, while a
 running PostgreSQL service must first pass the deployment-volume ownership fence before either the
-acceptance marker or catalog can be changed. Disaster recovery remains possible when the original
+core-verification marker or catalog can be changed. Disaster recovery remains possible when the original
 database is unavailable.
 
 ### Items to protect separately
@@ -67,25 +90,26 @@ secret system, offline escrow, or two independently controlled encrypted copies.
 
 ## Recovery objectives and consistency
 
-The backup command briefly stops the HTTPS gateway and OSCAR application, leaving PostgreSQL online
-for `pg_basebackup`. It captures the current LSN, switches WAL, and takes the self-contained database
-base backup. PostgreSQL is then stopped while the command rejects partial WAL and snapshots the
-now-stable WAL archive alongside application state and the cold archive. PostgreSQL resumes before
-the best-effort catalog receipt and structural verification; the gateway and application remain
-stopped through acceptance. After atomically accepting the recovery point with `VERIFIED`, it
-records backup protection only for immutable
-daily-file lane/days whose CSV, manifest, and exact sealed-segment inventory are present in the
-authenticated snapshot. Services that were running are restarted only after that gate succeeds.
-This creates a coordinated application quiescence point without an unsafe copy of a live PostgreSQL
-data directory.
+The backup command briefly stops the HTTPS gateway and OSCAR application while leaving PostgreSQL
+online for a streamed, self-contained `pg_basebackup`. It then snapshots application state and the
+Parquet cold tier, authenticates every payload, and verifies the staged recovery point read-only.
+After the staged directory is durably published and receives its `VERIFIED` core marker, the
+launcher authorizes backup protection only for immutable daily-file lane/days whose CSV, manifest,
+and exact sealed-segment inventory are present in that authenticated core. It then writes and
+validates `JOURNAL_CONFIRMED`; only that receipt completes schema-v2 acceptance. The launcher next
+atomically replaces authenticated `CURRENT`; that pointer replacement is the commit point. Only
+afterward may it remove a previous non-current verified snapshot. Services that were running are
+restarted after the acceptance gates. A failure before the pointer switch leaves the prior current
+snapshot authoritative; a failure afterward leaves the new snapshot authoritative and defers stale
+cleanup to a later locked command.
 
 Every storage-administration invocation, including offline-capable `backup-verify`, takes one
-nonblocking deployment-wide lock. A second backup, verification, prune, restore, archive
+nonblocking deployment-wide lock. A second backup, verification, restore, archive
 purge/verification, hold change, or export fails clearly instead of racing the first operation.
 `backup-verify` is exempt only from dependencies on live storage roots, volumes, and the live
-catalog, so it can authenticate and accept a selected recovery point while the deployment is
-offline; it is not exempt from the deployment lock. Acceptance is a mutation: the command
-atomically publishes or replaces `VERIFIED` and normalizes the accepted backup's permissions. If
+catalog, so it can authenticate and verify a selected core while the deployment is offline; it is
+not exempt from the deployment lock. Verification is a mutation: the command atomically publishes
+or replaces `VERIFIED` and normalizes the verified backup's permissions. If
 an owned live database is available, it also records the exact `VERIFIED` catalog row; ownership is
 checked before that optional catalog write.
 Ubuntu uses a crash-released kernel `flock`; Windows holds a `FileStream` with
@@ -97,17 +121,12 @@ The outage duration depends mostly on application-state and archive size. Measur
 scale. The automated restore returns PostgreSQL to the consistent endpoint included by
 `pg_basebackup` and restores the matching captured files/configuration.
 
-Compose also enables PostgreSQL data checksums for **new** clusters, continuous WAL archiving, a
-five-minute `archive_timeout`, and WAL compression. WAL publication byte-compares an existing name,
-uses a flushed temporary inode plus atomic no-replace hard-link publication, fsyncs the published
-file and directory, and fails hard on any mismatch. A quiesced backup rejects every WAL helper
-`.partial` artifact rather than omitting it. Archived WAL supports both the supported coordinated
-restore endpoint and a database specialist's point-in-time recovery strategy. The 3.9.2 restore
-command creates a one-time `recovery.signal`, uses a confined `restore_command`, selects
-`recovery_target='immediate'` on the base backup's `current` timeline, and promotes to a fresh
-timeline. It does not accept an arbitrary timestamp or LSN. Do not claim arbitrary PITR has been
-tested merely because WAL files exist. Validate the site-specific PITR procedure on an isolated
-copy if recovery between coordinated backup endpoints is required.
+Compose enables PostgreSQL data checksums for **new** clusters and WAL compression, but explicitly
+runs PostgreSQL with `archive_mode=off`. It sets no external archive command or timeout and mounts no
+host WAL directory. OSCAR 3.9.2 supports restore only to the consistency endpoint carried by the
+selected base backup; it does not provide point-in-time recovery to an arbitrary timestamp or LSN.
+The restore promotes the recovered cluster onto a fresh timeline without consulting an external WAL
+archive.
 
 Verification requires exactly one authenticated checksum entry for every top-level recovery
 payload, including `epoch.json`, `archive-generation-ids.txt`, and `image-inventory.txt`. The
@@ -127,39 +146,53 @@ so those exact images can be reloaded after a host loss.
 
 ## Before the first backup
 
-Initialization/upgrade creates the backup encryption key and prepares the three configured host
-roots. Archive and WAL are long-lived service binds; the administrator-owned backup root is not
-mounted into a long-running service. Confirm all services are healthy and that the paths point to
-durable storage:
+Fresh initialization leaves backup mode disabled. To opt in, select a durable secondary-drive path
+and run the supported setup workflow; do not hand-edit the mode around setup validation:
+
+```sh
+sudo bash oscar.sh upgrade --backup-mode single --backup-dir /absolute/secondary/oscar-backups
+```
+
+```powershell
+.\oscar.bat upgrade -BackupMode single -BackupDir D:\oscar-backups
+```
+
+The workflow creates the external key and administrator-owned backup root. The backup root is never
+mounted into a long-running service. PostgreSQL has no external WAL bind. A legacy
+`OSCAR_WAL_ARCHIVE_DIR` value/root may be retained unchanged only to avoid deleting a previous
+deployment's data; schema-v1 authentication uses the payload inside its snapshot and does not read
+that host root. Disabled or v2 operation must not delete legacy data.
+Confirm the selected mode, services, and durable paths:
 
 ```sh
 sudo bash oscar.sh status
-grep -E '^(OSCAR_ARCHIVE_DIR|OSCAR_WAL_ARCHIVE_DIR|OSCAR_BACKUP_DIR|OSCAR_BACKUP_KEY_FILE)=' .env
+grep -E '^(OSCAR_BACKUP_MODE|OSCAR_ARCHIVE_DIR|OSCAR_WAL_ARCHIVE_DIR|OSCAR_BACKUP_DIR|OSCAR_BACKUP_KEY_FILE)=' .env
 ```
 
 Windows:
 
 ```powershell
 .\oscar.bat status
-Get-Content .env | Select-String '^OSCAR_(ARCHIVE|WAL_ARCHIVE|BACKUP|BACKUP_KEY_FILE)'
+Get-Content .env | Select-String '^OSCAR_(BACKUP_MODE|ARCHIVE|WAL_ARCHIVE|BACKUP|BACKUP_KEY_FILE)'
 ```
 
 The Ubuntu storage commands require root; Windows storage commands require Administrator Windows
 PowerShell 5.1 (`powershell.exe`) or the elevated OSCAR menu. Ensure the backup filesystem has room for the PostgreSQL
-base backup, application state, cold archive, and WAL snapshot at the same time. A backup on the
+base backup, application state, and Parquet cold tier at the same time. A backup on the
 same physical disk protects against logical/operator failure, not loss of that disk.
 
-Each archive, WAL, and backup root contains an administrator-owned, no-follow
+Each active managed archive and backup root contains an administrator-owned, no-follow
 `.oscar-storage-root` identity. Its exact version-1 fields bind the root kind and
 `OSCAR_DEPLOYMENT_ID` and record whether setup created the root or explicitly adopted existing
-data. On Ubuntu the archive and WAL root directories are root-owned, use their service group (10001
-or 999), and mode `1770`; the sticky bit prevents the service from unlinking the root-owned marker.
+data. On Ubuntu the archive root is root-owned, uses its assigned service group, and mode `1770`;
+the sticky bit protects the root-owned marker. An existing legacy-WAL tree is preserved byte-for-byte
+but is not created, claimed, mounted, or written by the current profile.
 The backup root is root-owned mode `0700`. Windows rejects reparse points and protects the marker
 with non-inherited administrator/SYSTEM/Administrators ACLs. Every live database/archive command
-and backup prune validates all three identities and both deployment-owned Docker volumes first.
+and backup operation validates the applicable identities and both deployment-owned Docker volumes first.
 Only `backup-verify` is exempt from those live-root and live-volume dependencies because it is an
-offline-capable acceptance operation against the selected backup directory. It still changes the
-selected backup's acceptance marker and permissions; it changes the live catalog only after the
+offline-capable core-verification operation against the selected backup directory. It still changes
+the selected backup's `VERIFIED` marker and permissions; it changes the live catalog only after the
 deployment-volume ownership gate succeeds.
 
 Neither long-running service mounts the backup root. During creation, a network-scoped one-shot
@@ -181,10 +214,11 @@ Windows:
 .\oscar.bat backup
 ```
 
-The command prints the final path and backup ID. A working directory ending in `.partial` is not a
-complete backup. A finalized directory without `VERIFIED` also failed acceptance. Do not rename or
-mark either one into service; preserve the error, correct the cause, and run `backup-verify` or a new
-backup as appropriate.
+The command requires `OSCAR_BACKUP_MODE=single` and prints the final path and backup ID. A working
+directory ending in `.partial` is not a complete backup. A finalized directory without `VERIFIED`,
+or one not named by a valid `CURRENT`, is not the committed current snapshot. Do not rename a partial
+or edit `CURRENT` by hand; preserve the error and run the locked command again after correcting the
+cause.
 
 Before publication, the launcher flushes every staged payload and directory, then invokes the
 image's compiled `renameat2(RENAME_NOREPLACE)` publisher against two names in the same parent.
@@ -194,32 +228,49 @@ provenance and behavior-tests successful publication plus collision preservation
 
 Expected stages are:
 
-1. gateway/OSCAR quiesce if they were running;
-2. active archive-object checksum verification and catalog/filesystem reconciliation while writers
+1. validate `single` mode, storage identities, and any existing authenticated `CURRENT` before
+   mutating services or backup data;
+2. gateway/OSCAR quiesce if they were running;
+3. active archive-object checksum verification and catalog/filesystem reconciliation while writers
    remain quiesced (the already-authenticated root-level `.oscar-storage-root` is host metadata and
    is excluded from the archive-object inventory);
-3. PostgreSQL LSN and WAL switch;
-4. streamed `pg_basebackup`;
-5. PostgreSQL stop followed by application-state, archive, and stable WAL snapshots;
-6. encrypted configuration/secrets and release metadata;
-7. checksum generation, HMAC authentication, private-permission enforcement, and atomic directory
-   finalization;
-8. PostgreSQL resume, best-effort backup-epoch catalog insertion, and full structural verification;
-9. atomic `VERIFIED` acceptance, then offline confirmation of only the published journal lane/days
-   and exact sealed segments captured by this accepted authenticated snapshot; and
-10. service resume and health wait.
+4. streamed `pg_basebackup --wal-method=stream` plus application-state and cold-tier snapshots;
+5. encrypted configuration/secrets and release metadata;
+6. schema-v2 epoch/checksum generation, HMAC authentication, private-permission enforcement, and
+   read-only verification inside `<backup-id>.partial`;
+7. atomic no-replace publication as `<backup-id>` and best-effort backup-epoch catalog insertion;
+8. atomic `VERIFIED` core verification, then offline confirmation of only the published journal
+   lane/days and exact sealed segments captured by that core, followed by the authenticated
+   `JOURNAL_CONFIRMED` receipt that completes schema-v2 acceptance; and
+9. atomic authenticated `CURRENT` replacement, removal of only stale non-current verified
+   snapshots, then service resume and health wait.
 
-With the default `OSCAR_BACKUP_AUTO_PRUNE=true`, successful verification of this newly created backup then retains the newest
-`OSCAR_BACKUP_RETENTION_COUNT=14` verified local backups and prunes archived WAL older than the
-starting WAL of the oldest retained one. Unverified and `.partial` directories are never counted as
-safe recovery points and are not automatically removed.
+There is one logical current snapshot. A second successful backup does not create a retention chain:
+it commits the new snapshot through `CURRENT` and then cleans the prior verified snapshot. Stale
+`.partial`, unverified, unknown, or unauthenticated directories are never selected as current or
+deleted merely because of age. Keep independent off-host copies under site policy; they are not
+managed by the local `CURRENT` pointer.
+
+"One current snapshot" describes steady state, not peak disk use. During replacement the backup
+root must have room for both the old snapshot and the complete new candidate until `CURRENT`
+commits. A crash can also leave a published non-current snapshot or private staging debris. If
+`CURRENT` exists, the next locked storage command authenticates it before reconciling anything. If
+the first schema-v2 backup failed before any `CURRENT` commit, the command independently
+authenticates and retires only those uncommitted schema-v2 candidates; pre-3.9.2 schema-v1 recovery
+points are preserved, including restoration of an interrupted legacy deletion tombstone. An
+authenticated schema-v2 candidate is first durably renamed to the exact
+`.deleting-uncommitted-v2-<backup-id>` form, allowing a later command to safely resume a partially
+completed removal after power loss. A malformed, non-regular, reparse-point, or dangling `CURRENT`
+entry fails closed before any candidate is changed.
 
 The cleanup trap attempts to resume services if a stage fails. Always run `status` after a failed
 backup and inspect both OSCAR and PostgreSQL logs. If structural verification succeeds but the
-journal-confirmation bridge fails, the backup remains a legitimate `VERIFIED` recovery point; the
-command still fails, services are resumed, automatic backup/WAL pruning is skipped, and no
-unconfirmed lane/day becomes segment-deletion eligible. Correct the journal inconsistency or let a
-later successful backup establish the missing protection rather than fabricating a receipt.
+journal-confirmation bridge fails, the published candidate can retain a structurally valid,
+authenticated `VERIFIED` core, but it is not an accepted or restorable schema-v2 recovery point.
+The command still fails, services are resumed, the previous authenticated `CURRENT` remains
+authoritative, and no unconfirmed lane/day becomes segment-deletion eligible. Correct the journal
+inconsistency or let a later successful backup establish the missing protection rather than
+fabricating a receipt.
 
 The confirmation bridge does not relax the backup root's administrator-only protection. It first
 revalidates the exact authenticated `oscar-state.tar.gz` member inventory in a networkless,
@@ -266,27 +317,33 @@ Verification:
   allowed (links, devices, FIFOs, sockets, and unknown types are rejected);
 - confines tar-listing scratch data to a private, root-only `/tmp` tmpfs capped at 256 MiB in the
   otherwise read-only, networkless, capability-free validator container. Scratch exhaustion fails
-  verification before extraction or acceptance and leaves no host-side temporary files;
+  verification before extraction or a `VERIFIED` marker and leaves no host-side temporary files;
 - requires the exact top-level payload inventory and exactly one copy of every mandatory
-  release-config file;
+  release-config file; schema v2 must omit `wal-archive.tar.gz`, while schema v1 must authenticate
+  and include it;
 - streams and validates the bounded canonical archive-generation UUID inventory and uses its
   authenticated count, byte length, and SHA-256 for collision-safe `CREATED`/`VERIFIED` catalog
   receipts; the exact list stays in the recovery point instead of being copied into PostgreSQL;
-- validates the epoch UUID, format/version, immutable `CREATED` state, and exact backup-directory ID; and
+- validates the epoch UUID, exact schema version (`2` for newly created snapshots), immutable
+  `CREATED` state, and exact backup-directory ID; and
 - when PostgreSQL is offline, durably writes and fsyncs a UTC `VERIFIED` marker without a database;
   when it is running, first proves fixed-volume deployment ownership and then requires the exact
   idempotent live `VERIFIED` receipt or removes the marker.
 
 Manual `backup-verify` and the verification performed before `restore` deliberately do **not** add
-new live daily-journal backup confirmations or run retention. This prevents inspection or
-restoration of an older recovery point from mutating current journal eligibility or deleting that
-target. Only creation of a new backup runs the confirmation bridge and automatic pruning; use
-`backup-prune` for an explicit reviewed retention pass. Re-verification proves the authenticated
-snapshot has not changed; the quiesced archive/catalog reconciliation is a mandatory invariant of
-creating that authenticated 3.9.2 snapshot, not a comparison against the current live deployment.
+new live daily-journal backup confirmations or change `CURRENT`. Therefore manual verification
+cannot turn a core-only schema-v2 candidate into an accepted recovery point; a valid authenticated
+`JOURNAL_CONFIRMED` receipt must already exist, and restore additionally requires the matching
+authenticated `CURRENT` pointer. This prevents inspection or restoration of an older copied recovery
+point from mutating current journal eligibility or the committed local snapshot. `backup-prune` is
+retired and performs no deletion.
+Re-verification proves the authenticated snapshot has not changed; the quiesced archive/catalog
+reconciliation is a mandatory invariant of creating that authenticated 3.9.2 snapshot, not a
+comparison against the current live deployment.
 
 For a newly created 3.9.2 backup, successful verification proves authenticated structural integrity
-at that time and confirms the locally configured OSCAR/PostgreSQL utility images can read it. A
+at that time and confirms the locally configured OSCAR/PostgreSQL utility images can read it; it
+does not by itself complete schema-v2 acceptance. A
 directory without `SHA256SUMS.hmac` is rejected rather than promoted into the verified retention
 set. Verification does not prove that an operator can recover the separately escrowed key after an incident, that
 every Compose service image remains available, or that application workflows pass after restore.
@@ -311,10 +368,11 @@ it contains operational records and encrypted—not anonymized—credentials.
 ## Restore a coordinated backup
 
 Restore is destructive to the current PostgreSQL cluster, OSCAR state, cold archive, and active
-deployment credentials. The WAL archive is instead append-only: the authenticated backup snapshot
-is preflighted and merged, every existing valid WAL/history object must remain byte-identical, an
-identical duplicate is accepted, and any conflicting, linked, nonregular, or unsafe object aborts.
-The configured backup root remains the read-only recovery source and is not replaced. Before
+deployment credentials. The configured backup root remains the read-only recovery source and is not
+replaced. A v2 restore uses only WAL streamed into `postgres/pg_wal`; it neither reads nor writes an
+external WAL archive. An authenticated v1 snapshot follows the explicit legacy compatibility path
+and must contain the historical WAL payload required for v1 authentication, but restore ignores
+that payload because streamed `postgres/pg_wal` is sufficient. Before
 stopping or replacing anything,
 the command requires the same valid backup ID twice, authenticates/verifies the backup, validates the
 release-configuration archive, and proves that the current `.env`, backup epoch, and backed-up
@@ -356,8 +414,8 @@ The restore workflow:
 2. validates exact 3.9.2 release identity and local image availability again after verification;
 3. decrypts the backed-up `.env`, `secrets/`, and `tls/` into a private staging directory, merges
    the target-local environment bindings, and validates the entire staged replacement set;
-4. validates the WAL snapshot in private staging and atomically merges only missing objects into
-   the existing WAL root without deleting or replacing any prior WAL/history;
+4. for schema v1 only, authenticates its required legacy WAL payload but does not stage, merge, or
+   use it as a recovery or PITR source;
 5. copies the current `.env`, `secrets/`, and `tls/` into
    `pre-restore-<backup-id>` under the release directory;
 6. stops the gateway, waits for OSCAR's bounded writer/module drain to finish while PostgreSQL is
@@ -366,24 +424,17 @@ The restore workflow:
 8. replaces OSCAR application state and the configured archive tree while skipping each archive's
    `./` root member, preserving the existing Docker volume and bind-mount root metadata (archive
    member metadata is still applied below each root);
-9. preserves and revalidates the target host's archive/WAL root identities rather than extracting,
-   trusting, or chowning a marker from the source backup;
+9. preserves and revalidates the target host's active archive and backup-root identities
+   rather than extracting or trusting a marker from the source backup;
 10. installs the already validated credential set from same-filesystem staging;
 11. prepares PostgreSQL for recovery only through the base backup's consistency endpoint, promotes
-    to a new timeline, reconstructs the exact authenticated `VERIFIED` epoch receipt, forces a WAL
-    switch, and requires both the new timeline-history file and segment to archive without an
-    increase in archiver failures;
+    to a new timeline, reconstructs the exact authenticated `VERIFIED` epoch receipt, and proves a
+    post-promotion write across checkpoint and clean restart while `archive_mode` remains off;
 12. removes the persisted one-time recovery settings, restarts PostgreSQL while OSCAR remains
     stopped, and requires the recovery GUCs to return to defaults with no pending restart; and
 13. starts OSCAR/gateway and waits for complete Compose health.
 
-The WAL preflight performs complete name and type listings followed by one allowlisted sequential
-extraction into private staging. Its archive I/O is therefore bounded by a fixed number of complete
-passes over the snapshot rather than one or more gzip rescans per WAL member. Member type, canonical
-name, duplicate-target, extracted-path-set, live-root, and byte-identical collision checks all still
-finish before any WAL is published or any service is stopped.
-
-Decryption, environment merge, credential-tree validation, and the complete append-only WAL merge all
+Decryption, environment merge, credential-tree validation, and schema-v1 payload authentication
 finish before the safety copy is created, services are stopped, or replaceable data is changed. A malformed encrypted set,
 unsupported file type, link, or unsafe target environment therefore aborts without entering the
 destructive phase.
@@ -394,16 +445,21 @@ A restore recovers source data and credentials, but it does not turn the target 
 host. Before installing the decrypted files, the command takes the following bindings from the
 target's current `.env` and writes them into the restored `.env`:
 
-- `OSCAR_DEPLOYMENT_ID`;
+- `OSCAR_DEPLOYMENT_ID` and `OSCAR_BACKUP_MODE`;
 - `OSCAR_POSTGIS_PLATFORM`, `OSCAR_HTTPS_PORT`, and `OSCAR_HOSTNAME`;
 - the canonical credential bindings described below; and
-- `OSCAR_ARCHIVE_DIR`, `OSCAR_WAL_ARCHIVE_DIR`, and `OSCAR_BACKUP_DIR`.
+- `OSCAR_ARCHIVE_DIR` and `OSCAR_BACKUP_DIR`.
 
-The three storage roots must already be absolute target paths. Every listed binding must occur
+The two active storage roots must already be absolute target paths. Every listed binding must occur
 exactly once and be non-empty, and the target deployment ID must be valid. Restore fails before
 changing the live credential set if those conditions are not met. Other backed-up settings, such as
-backup-retention policy and JVM tuning, travel with the source environment. The release version is
-already required to match exactly.
+JVM tuning, travel with the source environment. The release version is already required to match
+exactly. Preserving the target backup mode prevents recovery media from silently changing the
+site’s opt-in policy.
+
+If the target already has one absolute `OSCAR_WAL_ARCHIVE_DIR` compatibility binding, restore
+preserves it. Otherwise restore removes a source host's legacy-WAL binding instead of importing that
+foreign path. Current restore never reads, mounts, or writes the directory.
 
 This release intentionally supports only these credential locations:
 
@@ -420,8 +476,9 @@ different values from an older deployment, but restore replaces them with the ta
 canonical bindings before accepting the staged set.
 
 This merge keeps named-volume ownership evidence (deployment labels or an exact legacy-adoption
-receipt) aligned with `OSCAR_DEPLOYMENT_ID`, keeps Compose bound to the target archive and WAL
-directories, and retains the target's external backup root.
+receipt) aligned with `OSCAR_DEPLOYMENT_ID`, keeps Compose bound to the target archive, preserves an
+optional target legacy-WAL location, and retains the target's external backup root. PostgreSQL
+does not mount the legacy WAL directory.
 Restore checks volume ownership again
 after installing the merged environment and before starting services. On a same-host restore, the
 source and target local bindings are normally identical, so behavior is unchanged. On a cross-host
@@ -456,7 +513,8 @@ Also verify:
 - the target hostname/port and the certificate presented for that endpoint;
 - `OSCAR_DEPLOYMENT_ID` still matches both named-volume labels, or the exact adoption receipt still
   matches both deliberately retained pre-label volumes;
-- archive, WAL, backup, secret, TLS, and backup-key bindings still name the intended target paths;
+- archive, backup, secret, TLS, backup-key, backup-mode, and any optional legacy-WAL binding still name the
+  intended target policy and paths;
 - SensorHub module/driver status and the expected lane inventory;
 - a recent event lookup by UUID and Event Details rendering;
 - a legacy source video and an exact-five retained JPEG set, where present;
@@ -465,89 +523,43 @@ Also verify:
 - reports and adjudication artifacts;
 - backup epoch/manifest identity and the expected restore endpoint;
 - PostgreSQL is out of recovery on a timeline newer than the base backup, the exact `VERIFIED`
-  receipt exists, prior WAL hashes are unchanged, new history/WAL are present, and no recovery
-  setting/signal remains persisted; and
+  receipt exists, `archive_mode` is off, a post-promotion write survives checkpoint and clean
+  restart, and no recovery setting/signal remains persisted; and
 - database/application logs for checksum, WAL, archive, permission, or missing-object errors.
 
 Run the full emulator-backed OSCAR regression suite before declaring a production recovery
 successful. Record the backup ID, recovery start/end times, accepted data endpoint, checks performed,
 and approver.
 
-## Point-in-time recovery with archived WAL
+## Recovery boundary: no PITR
 
-The release stores WAL segment copies in `${OSCAR_WAL_ARCHIVE_DIR}` and includes a snapshot in each
-coordinated backup. The normal OSCAR restore uses those files only through the online base backup's
-immediate consistency endpoint and then forks a new timeline. For recovery to a timestamp or LSN
-after a base backup, PostgreSQL must instead be
-started from a verified base backup with an appropriate `restore_command`, `recovery.signal`, and
-optional `recovery_target_time` or `recovery_target_lsn`.
+OSCAR 3.9.2 does not continuously archive PostgreSQL WAL and does not support point-in-time recovery.
+The supported target is the consistency endpoint inside one verified coordinated snapshot. Do not
+present a preserved legacy WAL root, a schema-v1 compatibility payload, or the Parquet cold tier as
+a current PITR chain.
 
-That is a PostgreSQL recovery operation, not the normal OSCAR `restore` command. Perform it only by
-a database administrator in an isolated recovery deployment. The administrator must:
+## One current snapshot and off-site copies
 
-1. preserve the original incident system;
-2. verify the base backup and every required WAL segment;
-3. use the PostgreSQL major version shipped by that OSCAR release;
-4. keep the archive and OSCAR state from the coordinated epoch available;
-5. select a target that does not split an externally coordinated application operation; and
-6. run the full post-restore acceptance suite before cutover.
+The local backup root has one authenticated logical current snapshot. `CURRENT`, not modification
+time or directory sort order, selects it. A new backup is built and verified without disturbing the
+old pointer; after the new snapshot is accepted and journal-confirmed, an atomic `CURRENT`
+replacement commits it. Cleanup may then remove the prior non-current verified snapshot. This order
+prevents a failed backup or crash from leaving zero authenticated recovery points.
 
-If a required WAL segment is missing, stop. Do not skip it and present the resulting database as a
-complete point-in-time recovery.
+`backup-prune` is retired. It remains accepted only to print retirement guidance and performs no
+deletion. `OSCAR_BACKUP_RETENTION_COUNT` and `OSCAR_BACKUP_AUTO_PRUNE` are ignored legacy settings
+and are not present in the 3.9.2 template. Never hand-edit `CURRENT` or delete a pointed-to snapshot.
 
-## Backup retention, off-site copies, and WAL pruning
-
-The standard `.env` enables count-based pruning after every successful backup verification:
-
-```dotenv
-OSCAR_BACKUP_RETENTION_COUNT=14
-OSCAR_BACKUP_AUTO_PRUNE=true
-```
-
-The retention pass considers only complete directories with a valid backup ID and `VERIFIED`
-marker. Before deleting anything, it HMAC-authenticates and fully re-runs the offline verifier for
-every candidate in the retention decision. Any corruption aborts with no deletion. It keeps the
-newest configured number of usable recovery points, requires exactly one authenticated
-`postgres/backup_label` checksum entry in the oldest retained backup, verifies that file again, and
-derives the start-WAL boundary from it. The exact backup/WAL deletion set is written and fsynced as
-an HMAC-authenticated, deployment-bound prune intent. Selected backups are renamed to
-`.deleting-*` before removal; a retry resumes only that authenticated set after revalidating every
-still-complete candidate and the retained boundary. WAL is touched only after the oldest retained
-backup passes another full verification. Only regular 24-character WAL segment files older than
-that boundary are removed. Unverified/partial/unknown backups, unknown WAL names, and WAL at or
-after the boundary are never deleted.
-
-Run the same procedure explicitly after a policy change:
-
-```sh
-sudo bash oscar.sh backup-prune --keep 14
-```
-
-```powershell
-.\oscar.bat backup-prune -Keep 14
-```
-
-`--keep`/`-Keep` must be between 1 and 10,000. To suspend automatic deletion while investigating or
-changing policy, set `OSCAR_BACKUP_AUTO_PRUNE=false`; continue monitoring capacity and run an
-explicit reviewed prune later.
-
-Pruning removes the selected recovery-point directories and eligible WAL, but deliberately keeps
-their small `oscar_backup_epoch` rows as audit history. Those rows contain only fixed-size identity,
-LSN, path, count, byte-length, and hash fields—not the UUID list—so they do not recreate the former
-per-backup database-growth problem. A receipt whose directory was pruned is not a usable backup;
-the exact generation inventory and payload existed only in that authenticated recovery point.
-
-Define a policy that retains enough **verified, off-host** coordinated backups to meet recovery
-objectives. The local count is not an off-site policy. If an off-site base backup is expected to
-support PITR later than the WAL snapshot inside its own backup, copy the continuing WAL stream to
-that off-site recovery domain before local pruning can remove it. Do not prune WAL by modification
-date or with generic filesystem lifecycle rules.
+Define a policy that retains enough **verified, off-host** snapshot copies to meet recovery
+objectives. Off-host media are outside the local one-snapshot state machine; copy the complete
+directory, re-run `backup-verify` after returning it to a controlled backup root, and retain its
+separately escrowed key and exact images. This is endpoint recovery, not a WAL/PITR chain.
 
 At minimum:
 
-- create (and therefore automatically verify) a coordinated backup on a documented schedule and
-  before upgrades/policy changes;
-- alert on backup, WAL, archive, OSCAR-state, and PostgreSQL-volume capacity separately;
+- explicitly opt in to `single` mode, then create (and therefore automatically verify) a coordinated
+  snapshot on a documented schedule and before upgrades/policy changes;
+- alert on backup, archive, OSCAR-state, and PostgreSQL-volume capacity separately;
 - copy verified backups and the external key into independent failure domains;
 - perform a full isolated restore at least quarterly and after a storage-format or PostgreSQL major
   change; and
@@ -559,7 +571,7 @@ portable exports. Include those copies in privacy requests and records-destructi
 ## Disaster-recovery boundary
 
 Within its configured paths, OSCAR is fully backupable: database, OSH/app state, daily journal and
-files, media, reports, cold archive, WAL snapshot, configuration, credentials, and TLS material are
+files, media, reports, Parquet cold tier, configuration, credentials, and TLS material are
 included. Recovery still depends on external infrastructure and operational evidence. Preserve the
 release artifact/images, encryption key, host build documentation, DNS/certificate trust plan, and
 restore-test records alongside—but not all in the same failure domain as—the coordinated backup.

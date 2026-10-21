@@ -31,36 +31,38 @@ deployment and storage commands fail closed there.
 
 | Data | Primary location | Owner | Default lifecycle |
 | --- | --- | --- | --- |
-| Recent observations and OSH metadata | PostgreSQL `postgres_data` volume | Tiered OSH database | Eligible detector streams are copied after 30 days and remain hot in the shipping copy-only profile; business records remain in PostgreSQL |
+| Recent observations and OSH metadata | PostgreSQL `postgres_data` volume | Tiered OSH database | Only allowlisted high-volume detector streams become cold-tier eligible after 48 hours; all other observations and business records remain in PostgreSQL |
 | Cold detector observations | `${OSCAR_ARCHIVE_DIR}` bind mount | Tiered OSH database and archive catalog | Immutable Parquet generation plus manifest and schema snapshot |
 | Daily-file source journal | `files/.dailyfile-journal` in `oscar_state` | Daily File Journal service | Per-lane framed segments and publication ledger |
 | Published daily files | `files/dailyfiles` in `oscar_state` | Daily File Journal service | Immutable legacy CSV plus versioned SHA-256 manifest |
-| Current alarm video | `files/videos` in `oscar_state` | Bucket and OSCAR services | Source MP4 until the retention age and successful five-frame conversion |
-| Retained alarm media | `files/videos/retained-media/v1` in `oscar_state` | Retained-media backend | Five JPEGs, manifest, and job ledger; source kept for the configured rollback grace |
+| Current alarm video | `files/videos` in `oscar_state` | Bucket and OSCAR services | Five-JPEG conversion begins on the first eligible lifecycle cycle; source MP4 remains for 24 hours after verified publication |
+| Retained alarm media | `files/videos/retained-media/v1` in `oscar_state` | Retained-media backend | Exactly five JPEGs, manifest, and job ledger |
 | Reports, adjudication artifacts, sitemap | Bucket directories in `oscar_state` | Bucket and OSCAR services | Not deleted by cold-observation or storage-pressure maintenance |
-| PostgreSQL WAL archive | `${OSCAR_WAL_ARCHIVE_DIR}` bind mount | PostgreSQL | Atomically published continuous WAL copies; verified-backup retention removes only segments older than the oldest retained base-backup start WAL |
-| Coordinated backups | Administrator-owned `${OSCAR_BACKUP_DIR}` host root | OSCAR storage CLI | Never mounted into a long-running service; one-shot helpers receive only selected inputs/outputs; creating a new verified backup retains the 14 newest verified backups by default |
+| Legacy PostgreSQL WAL root | Preserved `${OSCAR_WAL_ARCHIVE_DIR}` host path, when present | Administrator legacy data | Not mounted or read by current restore; retained unchanged only to avoid destructive upgrade behavior, not a current PITR chain |
+| Coordinated snapshot | Administrator-owned `${OSCAR_BACKUP_DIR}` host root | OSCAR storage CLI | Disabled by default; `single` mode commits one verified snapshot through authenticated `CURRENT`; never mounted into a long-running service |
 | Container logs | Docker `json-file` storage | Docker | Size-rotated per service by Compose |
 
 Paths beginning with `files/` are relative to OSCAR's persistent application directory inside the
 container. Initialization writes absolute host paths under a stable sibling `oscar-storage`
-directory into `.env`; a clean version-directory upgrade therefore reuses the same archive, WAL,
-and backup trees instead of silently attaching empty replacements. Site-specific alternatives must
+directory into `.env`; a clean version-directory upgrade therefore reuses the same archive and
+backup trees instead of silently attaching empty replacements. A legacy-WAL binding is retained
+only so upgrades preserve an already existing compatibility tree. Site-specific alternatives must
 also be absolute. The OSCAR service mounts only its cold archive at `/var/lib/oscar/archive`;
-recovery media are deliberately not exposed to the long-running application. PostgreSQL mounts
-only its WAL archive; a network-scoped one-shot `pg_basebackup` client receives only the fresh
-staging directory for the recovery point it is creating. The administrator CLI otherwise accesses
+recovery media are deliberately not exposed to the long-running application. PostgreSQL uses
+`archive_mode=off` and has no external WAL bind; a network-scoped one-shot `pg_basebackup` client
+receives only the fresh staging directory for the recovery point it is creating. The administrator CLI otherwise accesses
 backups through narrowly scoped one-shot containers, so no long-running service can modify the
 backup root and none of these large trees is hidden in a Docker named volume.
 
-The three managed host roots are not interchangeable. Archive and WAL are the two long-lived service
-bind roots; the backup root is exposed only to scoped one-shot helpers. Each carries an administrator-owned, no-follow
+The managed host roots are not interchangeable. Archive is the live service bind; backup storage is
+exposed only to scoped one-shot helpers after manual `single`-mode opt-in. A pre-existing WAL root is
+preserved as inactive compatibility data, but current setup does not create or claim it. Each active root carries an administrator-owned, no-follow
 `.oscar-storage-root` version-1 identity binding its root kind to `OSCAR_DEPLOYMENT_ID` and recording
-new creation or explicit legacy adoption. Live storage commands validate all three identities and
+new creation or explicit legacy adoption. Live storage commands validate the applicable identities and
 both deployment-owned named volumes before accessing data; the only exception is genuinely offline
-`backup-verify`. On Ubuntu, archive and WAL roots are root-owned mode `1770` with the corresponding
-service group, so the service can create data but the sticky bit prevents it from replacing the
-root-owned marker. Backup storage is root-only. Backups exclude these host-local identities, and
+`backup-verify` while mode is `single`. On Ubuntu, the archive root is root-owned mode `1770`; the
+sticky bit prevents replacement of the root-owned marker. Backup storage
+is root-only. Backups exclude these host-local identities, and
 restore preserves and revalidates the target identities instead of trusting source markers.
 
 Setup creates the exact named volumes `oscar_oscar_state` and `oscar_postgres_data` and labels new
@@ -69,13 +71,12 @@ invoking Compose. Compose declares those names as external resources, so it does
 relabel, or offer to recreate them. A deliberately adopted pre-label volume is instead bound by its
 deployment-specific adoption receipt and immutable Docker creation time.
 
-PostgreSQL WAL publication uses a flushed temporary inode and an atomic, no-replace hard link for
-the final name, followed by file and directory fsync. A replay of an existing name succeeds only
-when its bytes compare identical; a mismatch or unsafe existing object fails hard so PostgreSQL
-retains and retries the source WAL. Cold-archive writers name work files `<final>.partial`; the WAL
-helper uses `.<wal-name>.partial.<random>`. Reconciliation recognizes the `.partial` token and a
-quiesced coordinated backup rejects every such variant, including links, rather than silently
-excluding incomplete bytes.
+PostgreSQL does not continuously archive WAL in this profile. Schema-v2 snapshots stream all WAL
+needed by the online backup into `postgres/pg_wal`; `pg_verifybackup` validates that range.
+Historical WAL publisher/merge helper files remain packaged only as unchanged contents of the
+legacy release configuration. Verification authenticates a schema-v1 recovery point's required WAL
+payload, but restore ignores it because streamed `postgres/pg_wal` is sufficient; no current flow
+invokes a legacy publisher or merge helper, and OSCAR does not provide PITR.
 
 ## Write and query path
 
@@ -99,12 +100,12 @@ Viewer/OSH query --> PostgreSQL candidates + catalog-authorized Parquet candidat
                     --> overlays/tombstones --> de-duplicate (hot wins) --> order/limit
 ```
 
-Catalog activation makes an `ACTIVE` generation queryable. With the shipping
-`deleteHotAfterArchive=false` setting, its PostgreSQL copy remains indefinitely and the generation
-stays `ACTIVE`. When a site explicitly enables deletion after acceptance, exact hot IDs are removed
-after parity and grace and the generation becomes `SEALED`; both `ACTIVE` and `SEALED` generations
-are online query candidates. Confirmed cold purge first makes a `SEALED` generation `DELETING` and
-non-queryable, then removes its files and ends in the retained audit state `PURGED`.
+Catalog activation makes an `ACTIVE` generation queryable. The shipping profile requires a verified
+hot/cold parity receipt and one full day of overlap before deleting exact generation-owned hot IDs.
+With the 48-hour archive-eligibility age, normal hot removal is therefore about 72 hours after the
+observation, plus hourly scheduling and processing time. The generation then becomes `SEALED`;
+both `ACTIVE` and `SEALED` generations are online query candidates. Confirmed cold purge first makes
+a `SEALED` generation `DELETING` and non-queryable, then removes its files and ends in `PURGED`.
 
 The direct journal and PostgreSQL observation path are deliberately separate. A journal append is
 the durable source for a daily file; a parsed observation remains available to OSH clients. This
@@ -137,6 +138,20 @@ Backup creation and verification stream the bounded list rather than constructin
 UUID array, avoiding unbounded launcher memory and permanent per-backup TOAST growth while retaining
 collision-safe identity and portable inspection.
 
+New recovery points use backup schema v2 and omit the former cumulative WAL archive. They are built
+as `<id>.partial`, verified before publication, and committed only when the launcher atomically
+replaces the four-line HMAC-authenticated `CURRENT` pointer. The previous current snapshot remains
+authoritative until that commit. Schema-v1 media retain an explicit compatibility verifier/restore
+path and are never silently treated as v2.
+The one-snapshot invariant is steady state: replacement temporarily needs space for old and new,
+and the next locked command reconciles non-current or staging debris after a crash by trusting the
+authenticated pointer. If the first schema-v2 attempt failed before any pointer existed, cleanup
+authenticates each published candidate and retires only schema-v2 work; legacy schema-v1 recovery
+points and interrupted legacy deletion tombstones are preserved. Authenticated schema-v2 cleanup
+uses a durable `.deleting-uncommitted-v2-<backup-id>` tombstone so crash recovery can resume removal
+without mistaking a partial directory for an unauthenticated candidate; unsafe `CURRENT` entries
+fail closed before cleanup.
+
 Catalog schema v5 adds durable retention-hold resolution provenance and makes holds part of the
 logical mutation boundary. A removal holds the shared store/per-observation locks, takes a shared
 hold-table lock in the same transaction, and materializes only exact observation holds plus held
@@ -146,7 +161,12 @@ racing a successful hold without loading every generation hold in the store.
 
 ### Parquet cold tier
 
-An hourly background cycle finds the oldest eligible unarchived row before the 30-day cutoff. To
+Parquet is OSCAR's primary cold observation tier, not a backup. It depends on the PostgreSQL catalog,
+overlays, tombstones, and application state and therefore must be captured with those components in
+a coordinated snapshot. Only the five output names allowlisted in the standard configuration are
+cold-tiered; this is not a generic every-table or every-observation export.
+
+An hourly background cycle finds the oldest eligible unarchived row before the 48-hour cutoff. To
 catch up without monopolizing the host, a cycle starts at most 24 generations and stops starting
 new work after 15 minutes by default; an in-progress generation is allowed to finish safely. Each
 normal UTC window is one hour and is halved down to one second if it would exceed
@@ -227,7 +247,8 @@ The full journal contract is maintained in the modules repository at
 
 ### Five-frame retained media
 
-After the configured video retention age (seven days by default), each camera clip is decoded and
+With the standard zero-day retention age, each eligible camera clip is processed on the first
+retained-media lifecycle cycle after publication. It is decoded and
 sampled at `FIRST`, `QUARTER`, `MIDDLE`, `THREE_QUARTERS`, and `LAST`. The five selections must be
 distinct decoded frame ordinals. Each output is an opaque baseline sRGB JPEG; default quality is
 85. Frames are written, forced, decoded and verified independently, then a typed manifest is
@@ -296,9 +317,10 @@ Detector observations, vehicle/alarm images, adjudications, reports, and daily r
 sensitive operational data. Apply the same access, retention, incident-response, and legal-hold
 policy to hot, cold, exported, and backup copies.
 
-- Archive and WAL directories are long-lived service bind mounts. The backup directory is an
-  administrator-owned host root used only through scoped one-shot helpers. Restrict host access to
-  all three and include them in disk encryption, monitoring, and endpoint protection.
+- The archive directory is a long-lived service bind. The opt-in backup directory is an
+  administrator-owned host root used only through scoped one-shot helpers. Preserve any legacy WAL
+  root without mounting it into PostgreSQL. Restrict host access and include the applicable roots in
+  disk encryption, monitoring, and endpoint protection.
 - The retained-media API is authenticated, read-only, enforces the `videos` bucket GET permission,
   and does not expose internal job/catalog paths. It is not a public image server.
 - Deployment credentials and TLS private material are encrypted in a coordinated backup with
@@ -318,8 +340,8 @@ OSCAR 3.9.2 is a substantial storage-profile update. A new installation uses:
 - additional archive ownership metadata on observations and a versioned archive catalog;
 - a required direct daily-file journal for Rapiscan, Aspect, and RS350 drivers;
 - exact-five JPEG retained media rather than keyframe-only MP4 reduction; and
-- PostgreSQL data checksums, WAL archiving, external archive/WAL service bind mounts, and an isolated
-  administrator-owned backup root in the release deployment.
+- PostgreSQL data checksums, `archive_mode=off`, an external Parquet archive bind, and an optional
+  administrator-owned single-snapshot backup root in the release deployment.
 
 The legacy occupancy `videoPaths` field, legacy daily CSV syntax, and OSH identities are retained.
 However, an existing deployment's persistent `config.json` is intentionally not overwritten by

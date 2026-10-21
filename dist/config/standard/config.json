@@ -136,7 +136,7 @@
     "objClass": "com.botts.impl.service.oscar.OSCARServiceConfig",
     "videoRetentionConfig": {
       "objClass": "com.botts.impl.service.oscar.video.VideoRetentionConfig",
-      "timeToRetention": 7,
+      "timeToRetention": 0,
       "videoQueryPeriod": 1,
       "maximumCatchUpHours": 6,
       "lateArrivalOverlapHours": 24,
@@ -225,7 +225,7 @@
         "objClass": "org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig",
         "enabled": true,
         "rootDirectory": "/var/lib/oscar/archive",
-        "hotRetentionDays": 30,
+        "hotRetentionDays": 2,
         "intervalMinutes": 60,
         "maximumGenerationsPerCycle": 24,
         "maximumCycleMinutes": 15,
@@ -238,8 +238,8 @@
         "duckDbSessionAcquireTimeoutSeconds": 30,
         "duckDbTemporaryDirectory": "/var/lib/oscar/duckdb-tmp",
         "deleteBatchSize": 5000,
-        "rollbackGraceDays": 7,
-        "deleteHotAfterArchive": false,
+        "rollbackGraceDays": 1,
+        "deleteHotAfterArchive": true,
         "requireParityReceipt": true,
         "zstdCompressionLevel": 6,
         "outputNames": [

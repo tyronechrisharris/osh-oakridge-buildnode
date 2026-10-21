@@ -3,9 +3,10 @@ set -eu
 
 # Prepare a verified plain pg_basebackup for one safe primary restore. The
 # recovery_target=immediate stops at the online backup end, while the explicit
-# current timeline prevents following a later fork. The confined restore command
-# may supply a required backup WAL file but cannot move the recovery target past
-# consistency. Completion then promotes onto a fresh timeline.
+# current timeline prevents following a later fork. Every supported backup was
+# created with pg_basebackup --wal-method=stream, so required WAL is already in
+# pg_wal. The always-miss restore command proves recovery has no external WAL
+# dependency; completion then promotes onto a fresh timeline.
 data_directory=${1:-/var/lib/postgresql/data}
 case "$data_directory" in /*) ;; *) echo 'ERROR: PostgreSQL data directory must be absolute' >&2; exit 1 ;; esac
 [ -d "$data_directory" ] && [ ! -L "$data_directory" ] || {
@@ -58,7 +59,7 @@ else
 fi
 cat >>"$configuration_temp" <<'EOF'
 # OSCAR one-time restore recovery: stop at this online backup's consistency point.
-restore_command = 'cp /var/lib/postgresql/wal-archive/%f %p'
+restore_command = '/bin/false'
 recovery_target = 'immediate'
 recovery_target_timeline = 'current'
 recovery_target_action = 'promote'

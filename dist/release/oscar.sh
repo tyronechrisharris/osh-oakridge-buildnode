@@ -100,7 +100,6 @@ Enter a command and any options. Examples:
   upgrade
   backup
   backup-verify BACKUP_ID
-  backup-prune --keep 14
   restore --backup BACKUP_ID --confirm BACKUP_ID
   archive status
   archive verify

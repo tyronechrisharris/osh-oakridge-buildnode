@@ -25,6 +25,8 @@ non_interactive=false
 skip_start=false
 adopt_legacy_volumes=false
 adopt_legacy_storage_roots=false
+backup_mode_value=''
+backup_directory_value=''
 prerequisites_mode=auto
 log_service=all
 log_tail=200
@@ -38,13 +40,14 @@ OSCAR deployment administration
       [--tls-mode self-signed|import] [--certificate FILE --private-key FILE]
       [--tls-san DNS_OR_IP]... [--no-auto-network-sans]
       [--add-hosts-entry] [--skip-hosts-entry] [--skip-start]
+      [--backup-mode disabled|single] [--backup-dir ABSOLUTE_PATH]
       [--prerequisites auto|existing|bundled]
   sudo ./oscar.sh check|verify|start|stop|restart|status
   sudo ./oscar.sh upgrade [--adopt-legacy-volumes] [--adopt-legacy-storage-roots]
+      [--backup-mode disabled|single] [--backup-dir ABSOLUTE_PATH]
   sudo ./oscar.sh logs [--service all|oscar|postgres|gateway] [--tail 200] [--follow]
   sudo ./oscar.sh backup
   sudo ./oscar.sh backup-verify BACKUP_ID
-  sudo ./oscar.sh backup-prune [--keep COUNT]
   sudo ./oscar.sh restore --backup BACKUP_ID --confirm BACKUP_ID
   sudo ./oscar.sh archive status|verify
   sudo ./oscar.sh archive hold list
@@ -78,6 +81,8 @@ while (($#)); do
         --skip-start) skip_start=true; shift ;;
         --adopt-legacy-volumes) adopt_legacy_volumes=true; shift ;;
         --adopt-legacy-storage-roots) adopt_legacy_storage_roots=true; shift ;;
+        --backup-mode) backup_mode_value=${2:?missing backup mode}; shift 2 ;;
+        --backup-dir) backup_directory_value=${2:?missing backup directory}; shift 2 ;;
         --prerequisites) prerequisites_mode=${2:?missing prerequisite mode}; shift 2 ;;
         --service) log_service=${2:?missing service}; shift 2 ;;
         --tail) log_tail=${2:?missing tail count}; shift 2 ;;
@@ -88,6 +93,10 @@ while (($#)); do
 done
 
 [[ $prerequisites_mode =~ ^(auto|existing|bundled)$ ]] || fail '--prerequisites must be auto, existing, or bundled.'
+[[ -z $backup_mode_value || $backup_mode_value == disabled || $backup_mode_value == single ]] ||
+    fail '--backup-mode must be disabled or single.'
+[[ -z $backup_directory_value || $backup_directory_value == /* ]] ||
+    fail '--backup-dir must be an absolute path on the selected secondary drive.'
 
 require_admin() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || fail 'Run this command as root (for example, with sudo).'
@@ -325,15 +334,53 @@ get_env_value() {
     awk -F= -v name="$name" '$1 == name { print substr($0, index($0, "=") + 1); exit }' "$env_file"
 }
 
+valid_backup_mode() { [[ $1 == disabled || $1 == single ]]; }
+
+configured_backup_mode() {
+    local mode
+    mode=$(get_env_value OSCAR_BACKUP_MODE)
+    valid_backup_mode "$mode" || fail 'OSCAR_BACKUP_MODE must be exactly disabled or single.'
+    printf '%s' "$mode"
+}
+
+normalize_backup_mode_for_upgrade() {
+    local env_file="$script_dir/.env" count mode
+    count=$(awk -F= '$1 == "OSCAR_BACKUP_MODE" { count++ } END { print count+0 }' "$env_file")
+    if ((count == 0)); then
+        # Every release before this setting continuously prepared backup/WAL
+        # storage. Preserve that operator capability on upgrade; only fresh
+        # installations default to disabled.
+        set_env_value OSCAR_BACKUP_MODE single
+        printf 'Preserved the legacy backup policy as OSCAR_BACKUP_MODE=single.\n'
+        return
+    fi
+    ((count == 1)) || fail 'Upgrade source .env contains duplicate OSCAR_BACKUP_MODE bindings.'
+    mode=$(get_env_value OSCAR_BACKUP_MODE)
+    valid_backup_mode "$mode" || fail 'OSCAR_BACKUP_MODE must be exactly disabled or single.'
+}
+
 require_unique_literal_environment_keys() {
-    local env_file="$script_dir/.env" name count value
+    local env_file="$script_dir/.env" name count value mode required
     [[ -f $env_file && ! -L $env_file ]] || fail 'Deployment .env must be a regular, non-symlink file.'
-    for name in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
+    mode=$(configured_backup_mode)
+    for name in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_MODE OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
         count=$(awk -F= -v name="$name" '$1 == name { count++ } END { print count+0 }' "$env_file")
-        ((count == 1)) || fail "Deployment .env must contain exactly one literal $name binding."
+        required=false
+        case $name in
+            OSCAR_VERSION|OSCAR_DEPLOYMENT_ID|OSCAR_ARCHIVE_DIR|OSCAR_BACKUP_MODE) required=true ;;
+            OSCAR_BACKUP_DIR) [[ $mode == single ]] && required=true ;;
+        esac
+        if $required; then
+            ((count == 1)) || fail "Deployment .env must contain exactly one literal $name binding."
+        else
+            ((count <= 1)) || fail "Deployment .env contains duplicate optional $name bindings."
+            ((count == 1)) || continue
+        fi
         value=$(get_env_value "$name")
         [[ -n $value && $value != *'$'* && $value != *'#'* && $value != *\"* && $value != *\'* &&
            $value != *[[:space:]]* ]] || fail "Deployment .env contains a Compose-interpreted or nonliteral $name value."
+        [[ $name != OSCAR_BACKUP_MODE ]] || valid_backup_mode "$value" ||
+            fail 'OSCAR_BACKUP_MODE must be exactly disabled or single.'
     done
 }
 
@@ -344,7 +391,7 @@ require_unique_literal_environment_keys() {
 require_upgrade_environment_keys() {
     local env_file="$script_dir/.env" name count value
     [[ -f $env_file && ! -L $env_file ]] || fail 'Deployment .env must be a regular, non-symlink file.'
-    for name in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
+    for name in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_MODE OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
         count=$(awk -F= -v name="$name" '$1 == name { count++ } END { print count+0 }' "$env_file")
         if [[ $name == OSCAR_VERSION ]]; then
             ((count == 1)) || fail 'Upgrade source .env must contain exactly one literal OSCAR_VERSION binding.'
@@ -355,18 +402,27 @@ require_upgrade_environment_keys() {
             value=$(get_env_value "$name")
             [[ -n $value && $value != *'$'* && $value != *'#'* && $value != *\"* && $value != *\'* &&
                $value != *[[:space:]]* ]] || fail "Upgrade source .env contains a Compose-interpreted or nonliteral $name value."
+            [[ $name != OSCAR_BACKUP_MODE ]] || valid_backup_mode "$value" ||
+                fail 'OSCAR_BACKUP_MODE must be exactly disabled or single.'
         fi
     done
 }
 
 require_managed_environment_bindings() {
-    local name value
+    local name value mode
     require_unique_literal_environment_keys
     require_canonical_credential_bindings
-    for name in OSCAR_ARCHIVE_DIR OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
+    mode=$(configured_backup_mode)
+    for name in OSCAR_ARCHIVE_DIR; do
         value=$(get_env_value "$name")
         [[ $value == /* ]] || fail "$name must be an absolute stable storage-root path."
     done
+    if [[ $mode == single ]]; then
+        value=$(get_env_value OSCAR_BACKUP_DIR)
+        [[ $value == /* ]] || fail 'OSCAR_BACKUP_DIR must be an absolute stable storage-root path.'
+    fi
+    value=$(get_env_value OSCAR_WAL_ARCHIVE_DIR)
+    [[ -z $value || $value == /* ]] || fail 'A preserved OSCAR_WAL_ARCHIVE_DIR must be an absolute path.'
 }
 
 is_pre_392_release_version() {
@@ -381,6 +437,7 @@ is_pre_392_release_version() {
 normalize_legacy_backup_key_binding() {
     local env_file="$script_dir/.env" source_version source_version_count count
     [[ -f $env_file && ! -L $env_file ]] || fail 'Deployment .env must be a regular file.'
+    [[ $(configured_backup_mode) == single ]] || return 0
     source_version_count=$(awk -F= '$1 == "OSCAR_VERSION" { count++ } END { print count+0 }' "$env_file")
     ((source_version_count == 1)) || return 0
     source_version=$(get_env_value OSCAR_VERSION)
@@ -393,9 +450,11 @@ normalize_legacy_backup_key_binding() {
 }
 
 require_canonical_credential_bindings() {
-    local name expected value count env_file="$script_dir/.env"
+    local name expected value count env_file="$script_dir/.env" mode
     [[ -f $env_file && ! -L $env_file ]] || fail 'Deployment .env must be a regular file.'
+    mode=$(configured_backup_mode)
     while IFS=: read -r name expected; do
+        [[ $name != OSCAR_BACKUP_KEY_FILE || $mode == single ]] || continue
         count=$(awk -F= -v name="$name" '$1 == name { count++ } END { print count+0 }' "$env_file")
         value=$(get_env_value "$name")
         [[ $count == 1 && $value == "$expected" ]] ||
@@ -410,15 +469,16 @@ EOF
 configure_storage_paths() {
     # Storage must outlive a versioned release directory. Persist absolute
     # sibling paths in .env so copying .env into a clean release cannot silently
-    # attach empty archive/WAL/backup directories.
+    # attach empty archive/backup directories. A retired legacy-WAL binding is
+    # preserved byte-for-byte when present but is never created or rewritten.
     local parent stable_root name suffix value legacy_default sibling_default
     parent=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
     stable_root="$parent/oscar-storage"
     while IFS=: read -r name suffix; do
+        [[ $name != OSCAR_BACKUP_DIR || $(configured_backup_mode) == single ]] || continue
         value=$(get_env_value "$name")
         case $name in
             OSCAR_ARCHIVE_DIR) legacy_default=./data/archive ;;
-            OSCAR_WAL_ARCHIVE_DIR) legacy_default=./data/wal-archive ;;
             OSCAR_BACKUP_DIR) legacy_default=./backups ;;
         esac
         sibling_default="../oscar-storage/$suffix"
@@ -433,7 +493,6 @@ configure_storage_paths() {
         fi
     done <<'EOF'
 OSCAR_ARCHIVE_DIR:archive
-OSCAR_WAL_ARCHIVE_DIR:wal-archive
 OSCAR_BACKUP_DIR:backups
 EOF
 }
@@ -837,7 +896,12 @@ base_configured() {
 }
 
 configured() {
-    base_configured && [[ -s $script_dir/secrets/backup-key.txt ]]
+    base_configured || return 1
+    case $(get_env_value OSCAR_BACKUP_MODE) in
+        disabled) return 0 ;;
+        single) [[ -s $script_dir/secrets/backup-key.txt ]] ;;
+        *) return 1 ;;
+    esac
 }
 
 compose() {
@@ -847,7 +911,7 @@ compose() {
         cd "$script_dir"
         env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME -u COMPOSE_ENV_FILES -u COMPOSE_PROFILES \
             -u OSCAR_VERSION -u OSCAR_DEPLOYMENT_ID -u OSCAR_ARCHIVE_DIR -u OSCAR_BACKUP_DIR \
-            -u OSCAR_WAL_ARCHIVE_DIR -u OSCAR_SECRETS_DIR -u OSCAR_TLS_DIR -u OSCAR_BACKUP_KEY_FILE \
+            -u OSCAR_BACKUP_MODE -u OSCAR_WAL_ARCHIVE_DIR -u OSCAR_SECRETS_DIR -u OSCAR_TLS_DIR -u OSCAR_BACKUP_KEY_FILE \
             -u OSCAR_HTTPS_PORT -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
             docker compose --project-name oscar --env-file "$script_dir/.env" --file "$script_dir/compose.yaml" "$@"
     )
@@ -975,11 +1039,20 @@ case "$command_name" in
         resolve_tls_sans "$hostname_value"
         [[ $port_value =~ ^[0-9]+$ ]] && ((port_value >= 1 && port_value <= 65535)) || fail 'Port must be between 1 and 65535.'
         ((port_value != 80)) || fail 'Port 80 is reserved for the HTTP-to-HTTPS redirect.'
+        target_backup_mode=${backup_mode_value:-disabled}
+        if [[ $target_backup_mode == disabled && -n $backup_directory_value ]]; then
+            fail '--backup-dir is valid only when --backup-mode single is selected.'
+        fi
+        if [[ $target_backup_mode == single && -z $backup_directory_value ]]; then
+            fail 'Fresh single-backup mode requires --backup-dir on an operator-selected secondary drive.'
+        fi
         mkdir -p "$script_dir/secrets" "$script_dir/tls"
         allow_docker_desktop_bind_mount_access
         set_env_value OSCAR_VERSION "$(release_version)"
         set_env_value OSCAR_HTTPS_PORT "$port_value"
         set_env_value OSCAR_HOSTNAME "$hostname_value"
+        [[ -z $backup_mode_value ]] || set_env_value OSCAR_BACKUP_MODE "$backup_mode_value"
+        [[ -z $backup_directory_value ]] || set_env_value OSCAR_BACKUP_DIR "$backup_directory_value"
         require_canonical_credential_bindings
         configure_storage_paths
         preflight_fresh_init >/dev/null
@@ -988,7 +1061,9 @@ case "$command_name" in
         [[ -e $script_dir/secrets/oscar-admin-password.txt ]] || write_secret "$script_dir/secrets/oscar-admin-password.txt" "$(read_admin_password)"
         [[ -e $script_dir/secrets/oscar-db-password.txt ]] || write_secret "$script_dir/secrets/oscar-db-password.txt" "$(random_password)"
         [[ -e $script_dir/secrets/postgres-bootstrap-password.txt ]] || write_secret "$script_dir/secrets/postgres-bootstrap-password.txt" "$(random_password)"
-        [[ -e $script_dir/secrets/backup-key.txt ]] || write_secret "$script_dir/secrets/backup-key.txt" "$(random_password)$(random_password)"
+        if [[ $(configured_backup_mode) == single ]]; then
+            [[ -e $script_dir/secrets/backup-key.txt ]] || write_secret "$script_dir/secrets/backup-key.txt" "$(random_password)$(random_password)"
+        fi
         prepare_deployment_images
         bash "$script_dir/oscar-storage.sh" prepare-directories
         initialize_tls "$hostname_value"
@@ -1050,7 +1125,18 @@ case "$command_name" in
         require_docker; base_configured || fail 'This release directory has not been initialized.'
         require_upgrade_environment_keys
         heading 'Upgrade preflight'
+        normalize_backup_mode_for_upgrade
         normalize_legacy_backup_key_binding
+        current_backup_mode=$(configured_backup_mode)
+        target_backup_mode=${backup_mode_value:-$current_backup_mode}
+        if [[ $target_backup_mode == disabled && -n $backup_directory_value ]]; then
+            fail '--backup-dir is valid only when single-backup mode is enabled.'
+        fi
+        if [[ $current_backup_mode == disabled && $target_backup_mode == single && -z $backup_directory_value ]]; then
+            fail 'Enabling single-backup mode requires --backup-dir on an operator-selected secondary drive.'
+        fi
+        [[ -z $backup_mode_value ]] || set_env_value OSCAR_BACKUP_MODE "$backup_mode_value"
+        [[ -z $backup_directory_value ]] || set_env_value OSCAR_BACKUP_DIR "$backup_directory_value"
         require_canonical_credential_bindings
         assert_deployment_volume_ownership "$adopt_legacy_volumes"
         configure_storage_paths
@@ -1058,7 +1144,9 @@ case "$command_name" in
         target_version=$(release_version)
         set_env_value OSCAR_VERSION "$target_version"
         require_managed_environment_bindings
-        [[ -e $script_dir/secrets/backup-key.txt ]] || write_secret "$script_dir/secrets/backup-key.txt" "$(random_password)$(random_password)"
+        if [[ $(configured_backup_mode) == single ]]; then
+            [[ -e $script_dir/secrets/backup-key.txt ]] || write_secret "$script_dir/secrets/backup-key.txt" "$(random_password)$(random_password)"
+        fi
         protect_deployment_files
         printf 'Preparing OSCAR %s\n' "$target_version"
         prepare_deployment_images

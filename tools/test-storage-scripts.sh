@@ -12,6 +12,10 @@ archive_validator="$repo_root/dist/release/validate-storage-archive.sh"
 archive_object_helper="$repo_root/dist/release/docker/oscar/archive-object-helper.sh"
 oscar_dockerfile="$repo_root/dist/release/docker/oscar/Dockerfile"
 oscar_entrypoint="$repo_root/dist/release/docker/oscar/entrypoint.sh"
+standard_config="$repo_root/dist/config/standard/config.json"
+environment_template="$repo_root/dist/release/.env.example"
+linux_launcher="$repo_root/dist/release/oscar.sh"
+windows_launcher="$repo_root/dist/release/oscar.bat"
 test_root=$(mktemp -d "$repo_root/.storage-script-test.XXXXXX")
 
 cleanup() {
@@ -52,6 +56,262 @@ bash -n "$setup_shell_script"
 sh -n "$archive_validator"
 sh -n "$archive_object_helper"
 sh -n "$oscar_entrypoint"
+
+# The 3.9.2 shipping profile is intentionally conservative about backup
+# creation, but aggressive about the two bounded high-volume lifecycles. Keep
+# these exact values visible in a fast source-level test so documentation or
+# packaging cannot silently drift from the approved policy.
+[[ $(grep -Fxc 'OSCAR_BACKUP_MODE=disabled' "$environment_template") == 1 ]] || {
+    printf 'Packaged environment does not default OSCAR_BACKUP_MODE exactly to disabled.\n' >&2
+    exit 1
+}
+for retired_backup_setting in OSCAR_BACKUP_RETENTION_COUNT OSCAR_BACKUP_AUTO_PRUNE; do
+    if grep -Eq "^${retired_backup_setting}=" "$environment_template"; then
+        printf 'Packaged environment still exposes retired setting %s.\n' "$retired_backup_setting" >&2
+        exit 1
+    fi
+done
+node - "$standard_config" <<'NODE'
+const fs = require('node:fs');
+const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const service = config.find(item => item.objClass === 'com.botts.impl.service.oscar.OSCARServiceConfig');
+const database = config.find(item => item.dbConfig?.objClass ===
+    'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig')?.dbConfig;
+const archive = database?.archive;
+const outputs = ['gammaCounts', 'gammaThreshold', 'neutronCounts', 'setupGamma', 'setupNeutron'];
+if (service?.videoRetentionConfig?.timeToRetention !== 0 ||
+    archive?.hotRetentionDays !== 2 || archive?.rollbackGraceDays !== 1 ||
+    archive?.deleteHotAfterArchive !== true ||
+    JSON.stringify(archive?.outputNames) !== JSON.stringify(outputs)) {
+    throw new Error('standard lifecycle defaults no longer encode first-cycle five-JPEG retention, 48-hour cold eligibility, verified 24-hour overlap, and the five-output allowlist');
+}
+NODE
+
+[[ $(grep -Fxc '      - archive_mode=off' "$compose_file") == 1 ]] || {
+    printf 'Compose does not set PostgreSQL archive_mode=off exactly once.\n' >&2
+    exit 1
+}
+for forbidden_wal_compose_text in 'archive_mode=on' 'archive_command=' 'archive_timeout=' '/var/lib/postgresql/wal-archive'; do
+    if grep -Fq -- "$forbidden_wal_compose_text" "$compose_file"; then
+        printf 'Compose still contains retired external-WAL setting %s.\n' "$forbidden_wal_compose_text" >&2
+        exit 1
+    fi
+done
+assert_not_contains '^  backup-prune([[:space:]]|$)' "$linux_launcher"
+assert_not_contains '^echo   backup-prune([[:space:]]|$)' "$windows_launcher"
+
+backup_mode_fixture="$test_root/backup-mode"
+mkdir -p "$backup_mode_fixture"
+cp "$shell_script" "$backup_mode_fixture/oscar-storage.sh"
+cp "$environment_template" "$backup_mode_fixture/.env.example"
+write_backup_mode_environment() {
+    local mode_line=$1
+    cat >"$backup_mode_fixture/.env" <<EOF
+OSCAR_VERSION=3.9.2
+OSCAR_DEPLOYMENT_ID=11111111-1111-4111-8111-111111111111
+OSCAR_ARCHIVE_DIR=$backup_mode_fixture/archive
+$mode_line
+OSCAR_BACKUP_DIR=$backup_mode_fixture/backups
+OSCAR_WAL_ARCHIVE_DIR=$backup_mode_fixture/wal-archive
+OSCAR_SECRETS_DIR=./secrets
+OSCAR_TLS_DIR=./tls
+OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt
+EOF
+}
+for accepted_backup_mode in disabled single; do
+    write_backup_mode_environment "OSCAR_BACKUP_MODE=$accepted_backup_mode"
+    resolved_mode=$(OSCAR_BACKUP_MODE=single bash -c '
+        storage_script=$1
+        set -- help
+        source "$storage_script" >/dev/null
+        assert_managed_environment_bindings
+        configured_backup_mode
+    ' _ "$backup_mode_fixture/oscar-storage.sh")
+    [[ $resolved_mode == "$accepted_backup_mode" ]] || {
+        printf 'Literal backup mode %s was not read exactly from .env.\n' "$accepted_backup_mode" >&2
+        exit 1
+    }
+done
+
+rm -f -- "$backup_mode_fixture/.env"
+[[ $(OSCAR_BACKUP_MODE=single bash -c '
+    storage_script=$1
+    set -- help
+    source "$storage_script" >/dev/null
+    configured_backup_mode
+' _ "$backup_mode_fixture/oscar-storage.sh") == disabled ]] || {
+    printf 'Missing backup mode did not resolve to the fresh-install disabled default.\n' >&2
+    exit 1
+}
+
+for rejected_backup_mode_line in \
+    'OSCAR_BACKUP_MODE=' \
+    'OSCAR_BACKUP_MODE=Disabled' \
+    'OSCAR_BACKUP_MODE=SINGLE' \
+    'OSCAR_BACKUP_MODE=${OSCAR_TEST_MODE}' \
+    'OSCAR_BACKUP_MODE=disabled '; do
+    write_backup_mode_environment "$rejected_backup_mode_line"
+    if bash -c '
+        storage_script=$1
+        set -- help
+        source "$storage_script" >/dev/null
+        assert_managed_environment_bindings
+    ' _ "$backup_mode_fixture/oscar-storage.sh" >/dev/null 2>&1; then
+        printf 'Backup-mode validation accepted nonliteral or noncanonical value: %s\n' "$rejected_backup_mode_line" >&2
+        exit 1
+    fi
+done
+write_backup_mode_environment 'OSCAR_BACKUP_MODE=disabled'
+printf 'OSCAR_BACKUP_MODE=single\n' >>"$backup_mode_fixture/.env"
+if bash -c '
+    storage_script=$1
+    set -- help
+    source "$storage_script" >/dev/null
+    assert_managed_environment_bindings
+' _ "$backup_mode_fixture/oscar-storage.sh" >/dev/null 2>&1; then
+    printf 'Backup-mode validation accepted duplicate OSCAR_BACKUP_MODE bindings.\n' >&2
+    exit 1
+fi
+
+assert_contains '--backup-mode disabled\|single' "$setup_shell_script"
+assert_contains '--backup-dir ABSOLUTE_PATH' "$setup_shell_script"
+assert_contains 'backup\|backup-verify\|backup-prune\|restore\)' "$shell_script"
+write_backup_mode_environment 'OSCAR_BACKUP_MODE=disabled'
+if disabled_backup_error=$(bash -c '
+    storage_script=$1
+    set -- help
+    source "$storage_script" >/dev/null
+    require_single_backup_mode
+' _ "$backup_mode_fixture/oscar-storage.sh" 2>&1); then
+    printf 'Disabled backup mode allowed a protected backup command.\n' >&2
+    exit 1
+fi
+grep -Fq -- '--backup-mode single --backup-dir <absolute-secondary-drive-path>' <<<"$disabled_backup_error" || {
+    printf 'Disabled backup-mode error did not provide exact upgrade opt-in guidance.\n' >&2
+    exit 1
+}
+assert_not_contains '^prune_backups\(\)' "$shell_script"
+assert_contains "backup-prune\) fail 'backup-prune is retired" "$shell_script"
+
+# CURRENT is the authenticated commit point, not a timestamp heuristic. Its
+# HMAC covers exactly the first three newline-terminated lines; the fourth line
+# carries that base64 tag and the file has no additional fields.
+current_fixture="$test_root/current-pointer"
+current_id=20261020T120000Z-1234abcd
+mkdir -p "$current_fixture"
+printf 'pointer-test-key\n' >"$current_fixture/key.txt"
+bash -c '
+    storage_script=$1; fixture=$2; backup_id=$3
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture
+    backup_key_file=$fixture/key.txt
+    fsync_path() { :; }
+    calculate_current_pointer_hmac() {
+        local pointer=$1 key tag
+        key=$(cat "$backup_key_file")
+        tag=$(head -n 3 "$pointer" | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A)
+        [[ $tag =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail "test pointer HMAC failed"
+        printf "%s" "$tag"
+    }
+    write_current_backup_pointer "$backup_id" oscar:test
+    [[ $(validate_current_backup_pointer oscar:test) == "$backup_id" ]]
+' _ "$shell_script" "$current_fixture" "$current_id"
+expected_current_hmac=$(head -n 3 "$current_fixture/CURRENT" |
+    openssl dgst -sha256 -hmac pointer-test-key -binary | openssl base64 -A)
+[[ $(wc -l <"$current_fixture/CURRENT" | tr -d '[:space:]') == 4 &&
+   $(sed -n '1p' "$current_fixture/CURRENT") == format=oscar-current-backup &&
+   $(sed -n '2p' "$current_fixture/CURRENT") == version=1 &&
+   $(sed -n '3p' "$current_fixture/CURRENT") == "backup_id=$current_id" &&
+   $(sed -n '4p' "$current_fixture/CURRENT") == "hmac_sha256=$expected_current_hmac" &&
+   $(portable_mode "$current_fixture/CURRENT") == 600 ]] || {
+    printf 'Bash CURRENT pointer did not match the exact four-line authenticated format.\n' >&2
+    exit 1
+}
+cp "$current_fixture/CURRENT" "$current_fixture/CURRENT.valid"
+sed 's/1234abcd/deadbeef/' "$current_fixture/CURRENT.valid" >"$current_fixture/CURRENT"
+chmod 0600 "$current_fixture/CURRENT"
+if bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture; backup_key_file=$fixture/key.txt
+    calculate_current_pointer_hmac() {
+        local pointer=$1 key
+        key=$(cat "$backup_key_file")
+        head -n 3 "$pointer" | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A
+    }
+    validate_current_backup_pointer oscar:test
+' _ "$shell_script" "$current_fixture" >/dev/null 2>&1; then
+    printf 'Bash CURRENT pointer accepted an unauthenticated backup-ID edit.\n' >&2
+    exit 1
+fi
+mv "$current_fixture/CURRENT.valid" "$current_fixture/CURRENT"
+
+# A schema-v2 directory published before the first CURRENT commit is verified
+# but not accepted. Repeated failures at that point must not accumulate full
+# snapshots. Legacy schema-v1 backups predate CURRENT and must be preserved;
+# an interrupted legacy deletion tombstone is restored when no pointer exists.
+uncommitted_fixture="$test_root/uncommitted-first-backup"
+legacy_final_id=20261018T120000Z-11111111
+legacy_tombstone_id=20261018T130000Z-22222222
+v2_first_id=20261020T120000Z-33333333
+v2_second_id=20261020T130000Z-44444444
+v2_tombstone_id=20261020T140000Z-55555555
+v2_partial_delete_id=20261020T150000Z-66666666
+mkdir -p \
+    "$uncommitted_fixture/$legacy_final_id" \
+    "$uncommitted_fixture/.deleting-$legacy_tombstone_id" \
+    "$uncommitted_fixture/$v2_first_id" \
+    "$uncommitted_fixture/$v2_second_id" \
+    "$uncommitted_fixture/.deleting-$v2_tombstone_id" \
+    "$uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id"
+for backup_path in \
+    "$uncommitted_fixture/$legacy_final_id" \
+    "$uncommitted_fixture/.deleting-$legacy_tombstone_id"; do
+    printf '{\n  "version": 1,\n  "marker": "legacy"\n}\n' >"$backup_path/epoch.json"
+    chmod 0700 "$backup_path"
+done
+for backup_path in \
+    "$uncommitted_fixture/$v2_first_id" \
+    "$uncommitted_fixture/$v2_second_id" \
+    "$uncommitted_fixture/.deleting-$v2_tombstone_id"; do
+    printf '{\n  "version": 2,\n  "marker": "uncommitted"\n}\n' >"$backup_path/epoch.json"
+    chmod 0700 "$backup_path"
+done
+printf 'the authenticated payload was partly removed before a simulated power loss\n' \
+    >"$uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id/remaining-member"
+chmod 0700 "$uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id"
+bash -c '
+    storage_script=$1; fixture=$2
+    set -- help; source "$storage_script" >/dev/null
+    backup_dir=$fixture
+    fsync_path() { :; }
+    verify_backup() {
+        local backup_id=$1 supplied_root=${3:-} root
+        root=${supplied_root:-$backup_dir/$backup_id}
+        [[ -d $root && ! -L $root && -f $root/epoch.json ]] ||
+            fail "test verifier received an unsafe snapshot root"
+        [[ -z $supplied_root || $supplied_root == "$backup_dir/.deleting-$backup_id" ]] ||
+            fail "test verifier received an unexpected override root"
+        [[ $(backup_schema_version "$root") == 1 || $(backup_schema_version "$root") == 2 ]] ||
+            fail "test verifier received an invalid schema"
+    }
+    recover_single_backup_state oscar:test
+    recover_single_backup_state oscar:test
+' _ "$shell_script" "$uncommitted_fixture"
+[[ -d $uncommitted_fixture/$legacy_final_id &&
+   -d $uncommitted_fixture/$legacy_tombstone_id &&
+   ! -e $uncommitted_fixture/.deleting-$legacy_tombstone_id &&
+   ! -e $uncommitted_fixture/$v2_first_id &&
+   ! -e $uncommitted_fixture/$v2_second_id &&
+   ! -e $uncommitted_fixture/.deleting-$v2_tombstone_id &&
+   ! -e $uncommitted_fixture/.deleting-uncommitted-v2-$v2_partial_delete_id &&
+   ! -e $uncommitted_fixture/CURRENT ]] || {
+    printf 'Bash first-backup recovery did not preserve v1 and retire only uncommitted schema-v2 snapshots.\n' >&2
+    exit 1
+}
+assert_contains 'cleanup_uncommitted_schema_v2_snapshots "\$image"' "$shell_script"
+assert_contains '\$supplied_root == "\$backup_dir/\.deleting-\$backup_id"' "$shell_script"
+assert_contains '\.deleting-uncommitted-v2-' "$shell_script"
 
 # Generated TLS must cover the configured name plus every explicit LAN or
 # Tailscale address, deduplicate repeated entries, and label IP/DNS SANs
@@ -311,7 +571,8 @@ assert_contains "subject_type='OBSERVATION'" "$shell_script"
 assert_contains 'overlay_row\.generation_id=item\.generation_id' "$shell_script"
 assert_contains 'DailyFileBackupConfirmationCli' "$shell_script"
 assert_contains "state IN \('ACTIVE','DELETING'\)" "$shell_script"
-assert_contains '\[\[ -f \$path/VERIFIED && ! -L \$path/VERIFIED \]\]' "$shell_script"
+assert_contains '^cleanup_snapshot_sidecar_temps\(\)' "$shell_script"
+assert_contains 'Backup acceptance temporary must be administrator-owned with mode 0600' "$shell_script"
 assert_contains 'validate_storage_directories' "$shell_script"
 assert_contains 'prepare_restored_credentials_exact' "$shell_script"
 assert_contains 'install_prepared_credentials_exact' "$shell_script"
@@ -560,6 +821,7 @@ bash -c '
     set -- help
     source "$setup_script" >/dev/null
     script_dir=$fixture
+    normalize_backup_mode_for_upgrade
     normalize_legacy_backup_key_binding
     require_canonical_credential_bindings
 ' _ "$setup_shell_script" "$legacy_binding_bash" >/dev/null
@@ -574,6 +836,7 @@ for unsafe_fixture in "$legacy_custom_bash" "$legacy_duplicate_bash" "$current_m
         set -- help
         source "$setup_script" >/dev/null
         script_dir=$fixture
+        normalize_backup_mode_for_upgrade
         normalize_legacy_backup_key_binding
         require_canonical_credential_bindings
     ' _ "$setup_shell_script" "$unsafe_fixture" >/dev/null 2>&1; then
@@ -611,6 +874,7 @@ bash -c '
         [[ $1 == volume && $2 == inspect ]]
     }
     require_upgrade_environment_keys
+    normalize_backup_mode_for_upgrade
     normalize_legacy_backup_key_binding
     require_canonical_credential_bindings
     assert_deployment_volume_ownership true
@@ -619,7 +883,7 @@ bash -c '
     set_env_value OSCAR_VERSION 3.9.2
     require_managed_environment_bindings
 ' _ "$setup_shell_script" "$legacy_upgrade_path_bash" >/dev/null
-for binding in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_DIR OSCAR_WAL_ARCHIVE_DIR; do
+for binding in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_MODE OSCAR_BACKUP_DIR; do
     [[ $(grep -c "^${binding}=" "$legacy_upgrade_path_bash/.env") == 1 ]] || {
         printf 'Bash legacy upgrade did not normalize exactly one %s binding.\n' "$binding" >&2
         exit 1
@@ -914,7 +1178,7 @@ identity_release="$identity_fixture/release"
 identity_roots="$identity_fixture/roots"
 mkdir -p "$identity_release" "$identity_roots/archive" "$identity_roots/backups" "$identity_roots/wal"
 printf 'legacy archive payload\n' >"$identity_roots/archive/existing.parquet"
-printf 'OSCAR_DEPLOYMENT_ID=%s\n' "$deployment_id" >"$identity_release/.env"
+printf 'OSCAR_DEPLOYMENT_ID=%s\nOSCAR_BACKUP_MODE=single\n' "$deployment_id" >"$identity_release/.env"
 bash -c '
     storage_script=$1; release_root=$2; roots=$3
     set -- help
@@ -947,10 +1211,10 @@ bash -c '
     exit 1
 }
 archive_root_mode=$(portable_mode "$identity_roots/archive")
-wal_root_mode=$(portable_mode "$identity_roots/wal")
 backup_root_mode=$(portable_mode "$identity_roots/backups")
-[[ $archive_root_mode == 1770 && $wal_root_mode == 1770 && $backup_root_mode == 700 ]] || {
-    printf 'Bash storage roots do not have sticky service-writer/private backup modes.\n' >&2
+[[ $archive_root_mode == 1770 && $backup_root_mode == 700 &&
+   ! -e $identity_roots/wal/.oscar-storage-root ]] || {
+    printf 'Bash active storage roots do not have sticky service-writer/private backup modes, or setup claimed retired WAL storage.\n' >&2
     exit 1
 }
 
@@ -1055,6 +1319,7 @@ OSCAR_HOSTNAME=restore-target.example
 OSCAR_SECRETS_DIR=./secrets
 OSCAR_TLS_DIR=./tls
 OSCAR_ARCHIVE_DIR=$test_root/target-storage/archive
+OSCAR_BACKUP_MODE=single
 OSCAR_WAL_ARCHIVE_DIR=$test_root/target-storage/wal
 OSCAR_BACKUP_DIR=$test_root/target-storage/backups
 OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt
@@ -1071,6 +1336,7 @@ OSCAR_HOSTNAME=backup-source.example
 OSCAR_SECRETS_DIR=/source/release-secrets
 OSCAR_TLS_DIR=/source/release-tls
 OSCAR_ARCHIVE_DIR=/source/storage/archive
+OSCAR_BACKUP_MODE=disabled
 OSCAR_WAL_ARCHIVE_DIR=/source/storage/wal
 OSCAR_BACKUP_DIR=/source/storage/backups
 OSCAR_BACKUP_KEY_FILE=/source/keys/backup-key.txt
@@ -1102,6 +1368,7 @@ for expected_binding in \
     'OSCAR_SECRETS_DIR=./secrets' \
     'OSCAR_TLS_DIR=./tls' \
     "OSCAR_ARCHIVE_DIR=$test_root/target-storage/archive" \
+    'OSCAR_BACKUP_MODE=single' \
     "OSCAR_WAL_ARCHIVE_DIR=$test_root/target-storage/wal" \
     "OSCAR_BACKUP_DIR=$test_root/target-storage/backups" \
     'OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt'; do
@@ -1189,68 +1456,26 @@ fi
     exit 1
 }
 
-# A WAL collision must abort before the safety copy, service stop, or any live
-# database/state/archive replacement. The merge helper is append-only, so it is
-# safe to run as the final preflight while the current deployment remains live.
-wal_preflight_id=20261017T131000Z-deadbeef
-wal_preflight_root="$credential_live/wal-preflight-backups/$wal_preflight_id"
-wal_preflight_payload="$test_root/valid-restored-credentials-bash"
-wal_preflight_destructive="$test_root/UNSAFE-WAL-PREFLIGHT-DESTRUCTIVE"
-mkdir -p "$wal_preflight_root/postgres" "$wal_preflight_payload/secrets" "$wal_preflight_payload/tls"
-cp "$credential_live/.env" "$wal_preflight_payload/.env"
-printf 'replacement\n' >"$wal_preflight_payload/secrets/source.key"
-printf 'replacement\n' >"$wal_preflight_payload/tls/source.crt"
-for payload_name in oscar-state.tar.gz archive.tar.gz wal-archive.tar.gz; do
-    printf 'staged %s\n' "$payload_name" >"$wal_preflight_root/$payload_name"
-done
-if bash -c '
-    storage_script=$1; destination=$2; backups=$3; backup_id=$4; payload=$5; destructive=$6
-    set -- help; source "$storage_script" >/dev/null
-    script_dir=$destination; backup_dir=$backups; wal_archive_dir=$destination/wal
-    backup_key_file=$destination/secrets/backup-key.txt
-    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
-    assert_deployment_volume_ownership() { :; }; require_restore_compatibility() { :; }
-    verify_backup() { :; }; assert_storage_root_identities() { :; }
-    postgres_image() { printf "%s" postgres:test; }; chown() { :; }
-    compose() { : >"$destructive"; }
-    docker() {
-        local argument restore_path
-        for argument in "$@"; do
-            case $argument in
-                *:/restore)
-                    restore_path=${argument%:/restore}
-                    cp "$payload/.env" "$restore_path/.env"
-                    cp -R "$payload/secrets" "$payload/tls" "$restore_path/"
-                    return 0
-                    ;;
-            esac
-        done
-        if [[ " $* " == *" /usr/local/bin/oscar-merge-wal-restore "* ]]; then
-            return 73
-        fi
-        : >"$destructive"
-    }
-    restore_backup --backup "$backup_id" --confirm "$backup_id"
-' _ "$shell_script" "$credential_live" "${wal_preflight_root%/$wal_preflight_id}" \
-    "$wal_preflight_id" "$wal_preflight_payload" "$wal_preflight_destructive" >/dev/null 2>&1; then
-    printf 'Bash restore ignored a WAL collision preflight failure.\n' >&2
-    exit 1
-fi
-[[ ! -e $wal_preflight_destructive && ! -e $credential_live/pre-restore-$wal_preflight_id ]] || {
-    printf 'Bash restore mutated replaceable deployment state before WAL collision preflight completed.\n' >&2
+# New backups and restores are self-contained in postgres/pg_wal. Legacy WAL
+# helpers remain packaged solely so authenticated schema-v1 media can still be
+# inspected/restored; the schema-v2 create/restore paths never stage or merge a
+# cumulative WAL tar and PostgreSQL never receives the legacy host root.
+shell_create_body=$(awk '/^create_backup\(\)/,/^verify_backup\(\)/' "$shell_script")
+shell_verify_body=$(awk '/^verify_backup\(\)/,/^require_restore_compatibility\(\)/' "$shell_script")
+shell_restore_body=$(awk '/^restore_backup\(\)/,/^archive_status\(\)/' "$shell_script")
+[[ $(grep -Fc '"version": 2' <<<"$shell_create_body") == 1 &&
+   $(grep -Fc -- '--wal-method=stream' <<<"$shell_create_body") -ge 1 &&
+   $(grep -Fc 'wal-archive.tar.gz' <<<"$shell_create_body") == 0 &&
+   $(grep -Fc 'wal_archive_dir' <<<"$shell_create_body") == 0 &&
+   $(grep -Fc 'epoch_schema_version == 1 && wal_entries == 1' <<<"$shell_verify_body") == 1 &&
+   $(grep -Fc 'epoch_schema_version == 2 && wal_entries == 0' <<<"$shell_verify_body") == 1 &&
+   $(grep -Fc 'wal-archive.tar.gz' <<<"$shell_restore_body") == 0 &&
+   $(grep -Fc 'oscar-merge-wal-restore' <<<"$shell_restore_body") == 0 ]] || {
+    printf 'Bash schema-v2 create/restore flow still depends on cumulative external WAL.\n' >&2
     exit 1
 }
 
 ps_restore_body=$(awk '/^function Restore-Backup\(/,/^function Show-ArchiveStatus/' "$powershell_script")
-ps_merge_line=$(grep -n -m1 'oscar-merge-wal-restore' <<<"$ps_restore_body" | cut -d: -f1)
-ps_safety_line=$(grep -n -m1 'pre-restore-' <<<"$ps_restore_body" | cut -d: -f1)
-ps_stop_line=$(grep -n -m1 '^[[:space:]]*Stop-DeploymentOrdered$' <<<"$ps_restore_body" | cut -d: -f1)
-[[ -n $ps_merge_line && -n $ps_safety_line && -n $ps_stop_line &&
-   $ps_merge_line -lt $ps_safety_line && $ps_merge_line -lt $ps_stop_line ]] || {
-    printf 'PowerShell restore does not complete WAL merge preflight before safety copy and service stop.\n' >&2
-    exit 1
-}
-shell_restore_body=$(awk '/^restore_backup\(\)/,/^archive_status\(\)/' "$shell_script")
 [[ $(grep -Fc 'tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /state -xzf /restore-state.tar.gz' <<<"$shell_restore_body") == 1 &&
    $(grep -Fc 'tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /archive -xzf /restore-archive.tar.gz' <<<"$shell_restore_body") == 1 &&
    $(grep -Fc 'tar --no-same-owner --no-overwrite-dir --strip-components=1 -C /state -xzf /restore-state.tar.gz' <<<"$ps_restore_body") == 1 &&
@@ -1507,6 +1732,7 @@ acceptance_id=20261017T120000Z-1234abcd
 release_version=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }' "$repo_root/dist/release/.env.example")
 acceptance_root="$test_root/acceptance/backups/$acceptance_id"
 mkdir -p "$acceptance_root"
+chmod 0700 "$acceptance_root"
 printf 'authenticated OSCAR state fixture\n' >"$acceptance_root/oscar-state.tar.gz"
 for recovery_payload in archive.tar.gz deployment-secrets.tar.gz.enc image-inventory.txt release-config.tar.gz wal-archive.tar.gz; do
     printf 'authenticated %s fixture\n' "$recovery_payload" >"$acceptance_root/$recovery_payload"
@@ -1569,7 +1795,7 @@ bash -c '
     calculate_journal_confirmation_hmac() { printf "%s" AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; }
     psql_admin() { :; }
     verify_backup "$backup_id"
-' _ "$shell_script" "$test_root/acceptance/backups" "$test_root/acceptance/backup-key.txt" "$acceptance_id" >/dev/null 2>&1
+' _ "$shell_script" "$test_root/acceptance/backups" "$test_root/acceptance/backup-key.txt" "$acceptance_id" >/dev/null
 [[ -f $acceptance_root/VERIFIED && ! -L $acceptance_root/VERIFIED ]] || {
     printf 'Bash audit-sidecar corruption incorrectly blocked authenticated core recovery acceptance.\n' >&2
     exit 1
@@ -2199,58 +2425,21 @@ bash -c '
 assert_contains '\$objects = @\(Invoke-PsqlLines' "$powershell_script"
 assert_contains 'foreach \(\$line in \$objects\)' "$powershell_script"
 
-# Retention decisions are based on fully reverified usable recovery points. A
-# single corrupt candidate must prevent intent creation and every deletion.
-prune_fixture="$test_root/prune-preflight-bash"
-mkdir -p "$prune_fixture/backups" "$prune_fixture/wal"
-for backup_id in 20261017T130000Z-11111111 20261017T140000Z-22222222 20261017T150000Z-33333333; do
-    mkdir -p "$prune_fixture/backups/$backup_id"
-    printf 'verified\n' >"$prune_fixture/backups/$backup_id/VERIFIED"
-done
-if bash -c '
-    storage_script=$1; fixture=$2
-    set -- help; source "$storage_script" >/dev/null
-    backup_dir=$fixture/backups; wal_archive_dir=$fixture/wal
-    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
-    oscar_image() { printf oscar:test; }; require_local_image() { :; }
-    verify_backup() {
-        printf "%s\n" "$1" >>"$fixture/verified-before-failure"
-        [[ $1 != 20261017T140000Z-22222222 ]] || return 42
-    }
-    authenticated_backup_label_boundary() { printf 000000010000000000000010; }
-    write_prune_intent() { : >"$fixture/UNSAFE-INTENT"; }
-    finish_prune_intent() { : >"$fixture/UNSAFE-DELETE"; }
-    prune_backups --keep 2
-' _ "$shell_script" "$prune_fixture" >/dev/null 2>&1; then
-    printf 'Bash backup prune ignored a corrupt verified candidate.\n' >&2
-    exit 1
-fi
-[[ ! -e $prune_fixture/UNSAFE-INTENT && ! -e $prune_fixture/UNSAFE-DELETE &&
-   $(find "$prune_fixture/backups" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]') == 3 ]] || {
-    printf 'Bash backup prune changed data before all-candidate verification succeeded.\n' >&2
+# The old retention engine is gone. Cleanup of an established single snapshot
+# is reachable only after authenticated CURRENT verification and revalidates
+# both the pointer and current recovery point. The separate no-CURRENT path
+# above can retire only authenticated, uncommitted schema-v2 candidates.
+cleanup_body=$(awk '/^cleanup_noncurrent_backup_snapshots\(\)/,/^cleanup_abandoned_single_backup_staging\(\)/' "$shell_script")
+[[ $(grep -Fc 'validate_current_backup_pointer' <<<"$cleanup_body") -ge 1 &&
+   $(grep -Fc 'verify_backup "$current_id" read-only' <<<"$cleanup_body") == 1 &&
+   $(grep -Fc 'CURRENT backup cannot be a deletion candidate' <<<"$cleanup_body") == 1 ]] || {
+    printf 'Bash single-snapshot cleanup is not guarded by authenticated CURRENT verification.\n' >&2
     exit 1
 }
-
-bash -c '
-    storage_script=$1; fixture=$2
-    set -- help; source "$storage_script" >/dev/null
-    backup_dir=$fixture/backups; wal_archive_dir=$fixture/wal
-    require_admin() { :; }; require_configured() { :; }; require_backup_key() { :; }
-    oscar_image() { printf oscar:test; }; require_local_image() { :; }
-    verify_backup() { printf "%s\n" "$1" >>"$fixture/verified-success"; }
-    authenticated_backup_label_boundary() {
-        [[ $1 == "$fixture/backups/20261017T140000Z-22222222" ]]
-        printf 000000010000000000000010
-    }
-    write_prune_intent() { cp "$1" "$fixture/captured-intent"; }
-    finish_prune_intent() { :; }
-    prune_backups --keep 2
-' _ "$shell_script" "$prune_fixture" >/dev/null
-[[ $(wc -l <"$prune_fixture/verified-success" | tr -d '[:space:]') == 3 &&
-   $(grep -Fxc 'retention=2' "$prune_fixture/captured-intent") == 1 &&
-   $(grep -Fxc 'oldest_retained=20261017T140000Z-22222222' "$prune_fixture/captured-intent") == 1 &&
-   $(grep -Fxc 'delete_backup=20261017T130000Z-11111111' "$prune_fixture/captured-intent") == 1 ]] || {
-    printf 'Bash backup prune did not retain two newest fully verified recovery points.\n' >&2
+create_commit_line=$(grep -n -m1 'write_current_backup_pointer "$backup_id"' <<<"$shell_create_body" | cut -d: -f1)
+create_cleanup_line=$(grep -n -m1 'cleanup_noncurrent_backup_snapshots "$backup_id"' <<<"$shell_create_body" | cut -d: -f1)
+[[ -n $create_commit_line && -n $create_cleanup_line && $create_commit_line -lt $create_cleanup_line ]] || {
+    printf 'Bash backup cleanup can run before CURRENT commits.\n' >&2
     exit 1
 }
 
@@ -2525,7 +2714,7 @@ if command -v pwsh >/dev/null 2>&1; then
             $BackupDirectory = Join-Path $ArchiveDirectory "backups"
             $WalArchiveDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "storage-roots/wal"
             try {
-                Assert-StorageRootShapes
+                Assert-StorageRootShapes -IncludeBackup
                 throw "PowerShell accepted overlapping managed storage roots"
             } catch {
                 if ($_.Exception.Message -eq "PowerShell accepted overlapping managed storage roots") { throw }
@@ -2605,6 +2794,7 @@ if command -v pwsh >/dev/null 2>&1; then
                 "OSCAR_SECRETS_DIR=./secrets",
                 "OSCAR_TLS_DIR=./tls",
                 "OSCAR_ARCHIVE_DIR=$targetArchive",
+                "OSCAR_BACKUP_MODE=single",
                 "OSCAR_WAL_ARCHIVE_DIR=$targetWal",
                 "OSCAR_BACKUP_DIR=$targetBackups",
                 "OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt",
@@ -2619,6 +2809,7 @@ if command -v pwsh >/dev/null 2>&1; then
                 "OSCAR_SECRETS_DIR=C:\source\release-secrets",
                 "OSCAR_TLS_DIR=C:\source\release-tls",
                 "OSCAR_ARCHIVE_DIR=/source/storage/archive",
+                "OSCAR_BACKUP_MODE=disabled",
                 "OSCAR_WAL_ARCHIVE_DIR=/source/storage/wal",
                 "OSCAR_BACKUP_DIR=/source/storage/backups",
                 "OSCAR_BACKUP_KEY_FILE=C:\source\keys\backup-key.txt",
@@ -3052,6 +3243,7 @@ if command -v pwsh >/dev/null 2>&1; then
             }
             [IO.File]::WriteAllLines((Join-Path $ScriptRoot ".env"), @(
                 "OSCAR_VERSION=3.9.2", "OSCAR_DEPLOYMENT_ID=$deployment",
+                "OSCAR_BACKUP_MODE=single",
                 "OSCAR_ARCHIVE_DIR=$ArchiveDirectory", "OSCAR_BACKUP_DIR=$BackupDirectory",
                 "OSCAR_WAL_ARCHIVE_DIR=$WalArchiveDirectory", "OSCAR_SECRETS_DIR=./secrets",
                 "OSCAR_TLS_DIR=./tls", "OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt"
@@ -3165,70 +3357,197 @@ if command -v pwsh >/dev/null 2>&1; then
                 throw "PowerShell failed archive export did not resume OSCAR and remove its fresh partial"
             }
 
-            $pruneBase = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "prune-preflight-powershell"
-            $BackupDirectory = Join-Path $pruneBase "backups"
-            $WalArchiveDirectory = Join-Path $pruneBase "wal"
-            [IO.Directory]::CreateDirectory($BackupDirectory) | Out-Null
-            [IO.Directory]::CreateDirectory($WalArchiveDirectory) | Out-Null
-            $pruneIds = @(
-                "20261017T130000Z-11111111", "20261017T140000Z-22222222", "20261017T150000Z-33333333")
-            foreach ($id in $pruneIds) {
-                $directory = Join-Path $BackupDirectory $id
-                [IO.Directory]::CreateDirectory($directory) | Out-Null
-                [IO.File]::WriteAllText((Join-Path $directory "VERIFIED"), "verified")
+            function Assert-BackupModeEnabled {}
+            try {
+                Remove-ExpiredBackups 2
+                throw "PowerShell accepted the retired backup-prune operation"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell accepted the retired backup-prune operation") { throw }
+                if ($_.Exception.Message -notlike "*backup-prune is retired*") {
+                    throw "PowerShell backup-prune retirement guidance changed unexpectedly"
+                }
             }
+            exit 0
+        '
+
+    STORAGE_SCRIPT_TEST_ROOT="$test_root" STORAGE_SCRIPT_PATH="$powershell_script" \
+        pwsh -NoLogo -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            . $env:STORAGE_SCRIPT_PATH -Command help *> $null
+
+            $BackupDirectory = Join-Path $env:STORAGE_SCRIPT_TEST_ROOT "single-recovery-no-current-powershell"
+            [IO.Directory]::CreateDirectory($BackupDirectory) | Out-Null
+            $confirmBackupImplementation = ${function:Confirm-Backup}
+            $moveDurableNoReplaceImplementation = ${function:Move-DurableNoReplace}
             function Assert-Administrator {}
             function Assert-Configured {}
             function Assert-BackupKey {}
-            function Assert-LocalImage([string]$Image) {}
-            function Confirm-Backup([string]$Id, [switch]$ConfirmJournal, [switch]$ReadOnly) {
-                Add-Content -LiteralPath (Join-Path $pruneBase "verified-before-failure") -Value $Id
-                if ($Id -ceq "20261017T140000Z-22222222") { throw "deliberate corrupt backup" }
-            }
-            function Get-AuthenticatedBackupLabelBoundary([string]$Root) { return "000000010000000000000010" }
-            function Write-PruneIntent(
-                [int]$Retention, [string]$OldestRetained, [string]$WalBoundary,
-                [string[]]$DeleteBackups, [string[]]$DeleteWal) {
-                [IO.File]::WriteAllText((Join-Path $pruneBase "UNSAFE-INTENT"), "called")
-            }
-            function Complete-PruneIntent { [IO.File]::WriteAllText((Join-Path $pruneBase "UNSAFE-DELETE"), "called") }
+            function Assert-BackupModeEnabled {}
+            function Assert-StorageRootIdentity([string]$Root, [string]$Kind) {}
+            function Assert-BackupCleanupAcl([string]$Path, [string]$Description) {}
+            function Sync-DurableMetadata([string]$Path) {}
+
+            $rootOverrideProbeId = "20261020T110000Z-00000000"
+            $rootOverrideProbe = Join-Path $BackupDirectory ".deleting-$rootOverrideProbeId"
             try {
-                Remove-ExpiredBackups 2
-                throw "PowerShell backup prune ignored a corrupt verified candidate"
+                & $confirmBackupImplementation -Id $rootOverrideProbeId -ReadOnly -RootOverride $rootOverrideProbe
+                throw "PowerShell accepted a missing deletion snapshot"
             } catch {
-                if ($_.Exception.Message -eq "PowerShell backup prune ignored a corrupt verified candidate") { throw }
+                if ($_.Exception.Message -notlike "Backup does not exist:*") {
+                    throw "PowerShell did not permit the confined read-only deletion snapshot root"
+                }
             }
-            if ((Test-Path -LiteralPath (Join-Path $pruneBase "UNSAFE-INTENT")) -or
-                (Test-Path -LiteralPath (Join-Path $pruneBase "UNSAFE-DELETE")) -or
-                @(Get-ChildItem -LiteralPath $BackupDirectory -Directory).Count -ne 3) {
-                throw "PowerShell backup prune changed data before all-candidate verification succeeded"
+            try {
+                & $confirmBackupImplementation -Id $rootOverrideProbeId -RootOverride $rootOverrideProbe
+                throw "PowerShell permitted a writable deletion snapshot root"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell permitted a writable deletion snapshot root") { throw }
+                if ($_.Exception.Message -notlike "Backup verification root is not a confined*") {
+                    throw "PowerShell writable deletion-root rejection changed unexpectedly"
+                }
             }
 
-            function Confirm-Backup([string]$Id, [switch]$ConfirmJournal, [switch]$ReadOnly) {
-                Add-Content -LiteralPath (Join-Path $pruneBase "verified-success") -Value $Id
+            $script:AuthenticatedRecoveryCandidates = New-Object System.Collections.Generic.List[string]
+            function Confirm-Backup(
+                [string]$Id,
+                [switch]$ReadOnly,
+                [string]$RootOverride,
+                [switch]$RequireAcceptance
+            ) {
+                if (-not $ReadOnly -or $RequireAcceptance) {
+                    throw "No-CURRENT recovery did not request read-only candidate authentication"
+                }
+                $root = [IO.Path]::GetFullPath($RootOverride)
+                $expectedFinal = [IO.Path]::GetFullPath((Join-Path $BackupDirectory $Id))
+                $expectedDeleting = [IO.Path]::GetFullPath((Join-Path $BackupDirectory ".deleting-$Id"))
+                if ($root -cne $expectedFinal -and $root -cne $expectedDeleting) {
+                    throw "No-CURRENT recovery authenticated an unconfined candidate root: $root"
+                }
+                $script:AuthenticatedRecoveryCandidates.Add("$Id|$([IO.Path]::GetFileName($root))")
             }
-            function Get-AuthenticatedBackupLabelBoundary([string]$Root) {
-                if ((Split-Path -Leaf $Root) -cne "20261017T140000Z-22222222") { throw "wrong retained boundary backup" }
-                return "000000010000000000000010"
+            function Read-ValidatedBackupEpoch([string]$Root, [string]$Id) {
+                $schemaPath = Join-Path $Root "schema-version.txt"
+                if (-not (Test-Path -LiteralPath $schemaPath -PathType Leaf)) {
+                    throw "Fixture candidate was classified before authentication: $Root"
+                }
+                return [pscustomobject]@{ SchemaVersion = [int][IO.File]::ReadAllText($schemaPath) }
             }
-            $script:CapturedRetention = 0; $script:CapturedOldest = ""; $script:CapturedDeletes = @()
-            function Write-PruneIntent(
-                [int]$Retention, [string]$OldestRetained, [string]$WalBoundary,
-                [string[]]$DeleteBackups, [string[]]$DeleteWal) {
-                $script:CapturedRetention = $Retention
-                $script:CapturedOldest = $OldestRetained
-                $script:CapturedDeletes = @($DeleteBackups)
+            function New-RecoveryCandidate([string]$Name, [int]$SchemaVersion) {
+                $root = Join-Path $BackupDirectory $Name
+                [IO.Directory]::CreateDirectory($root) | Out-Null
+                [IO.File]::WriteAllText((Join-Path $root "schema-version.txt"), [string]$SchemaVersion)
             }
-            function Complete-PruneIntent {}
-            Remove-ExpiredBackups 2
-            if (@(Get-Content -LiteralPath (Join-Path $pruneBase "verified-success")).Count -ne 3 -or
-                $script:CapturedRetention -ne 2 -or
-                $script:CapturedOldest -cne "20261017T140000Z-22222222" -or
-                $script:CapturedDeletes.Count -ne 1 -or
-                $script:CapturedDeletes[0] -cne "20261017T130000Z-11111111") {
-                throw "PowerShell backup prune did not retain two newest fully verified recovery points"
+            $script:RecoveryMoveDestinations = New-Object System.Collections.Generic.List[string]
+            function Move-DurableNoReplace([string]$Source, [string]$Destination) {
+                $script:RecoveryMoveDestinations.Add([IO.Path]::GetFileName($Destination))
+                & $moveDurableNoReplaceImplementation -Source $Source -Destination $Destination
             }
-        '
+
+            $danglingCurrentCandidate = "20261020T111000Z-00000001"
+            New-RecoveryCandidate $danglingCurrentCandidate 2
+            $danglingTarget = Join-Path $BackupDirectory ".missing-current-target"
+            $danglingPointer = Join-Path $BackupDirectory "CURRENT"
+            [IO.File]::WriteAllText($danglingTarget, "temporary symlink target")
+            New-Item -ItemType SymbolicLink -Path $danglingPointer -Target $danglingTarget | Out-Null
+            Remove-Item -LiteralPath $danglingTarget -Force
+            $literalPointer = @(Get-ChildItem -LiteralPath $BackupDirectory -Force |
+                Where-Object { $_.Name -ceq "CURRENT" })
+            if ($literalPointer.Count -ne 1 -or
+                ($literalPointer[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                throw "PowerShell dangling-CURRENT fixture did not create a literal reparse entry"
+            }
+            try {
+                Invoke-SingleBackupRecoveryCleanup
+                throw "PowerShell treated a dangling CURRENT reparse entry as absent"
+            } catch {
+                if ($_.Exception.Message -eq "PowerShell treated a dangling CURRENT reparse entry as absent") { throw }
+                if ($_.Exception.Message -notlike "CURRENT backup pointer is a reparse point*") {
+                    throw "PowerShell dangling CURRENT rejection changed unexpectedly"
+                }
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $BackupDirectory $danglingCurrentCandidate) -PathType Container) -or
+                $script:AuthenticatedRecoveryCandidates.Count -ne 0) {
+                throw "PowerShell mutated a backup candidate after a dangling CURRENT reparse entry"
+            }
+            [IO.File]::Delete($danglingPointer)
+            Remove-Item -LiteralPath (Join-Path $BackupDirectory $danglingCurrentCandidate) -Recurse -Force
+
+            $v2FinalA = "20261020T120000Z-11111111"
+            $v2FinalB = "20261020T130000Z-22222222"
+            $v2Tombstone = "20261020T140000Z-33333333"
+            $v1Final = "20261020T150000Z-44444444"
+            $v1Tombstone = "20261020T160000Z-55555555"
+            $v2UncommittedTombstone = "20261020T170000Z-66666666"
+            New-RecoveryCandidate $v2FinalA 2
+            New-RecoveryCandidate $v2FinalB 2
+            New-RecoveryCandidate ".deleting-$v2Tombstone" 2
+            New-RecoveryCandidate $v1Final 1
+            New-RecoveryCandidate ".deleting-$v1Tombstone" 1
+            $partialUncommittedTombstone = Join-Path $BackupDirectory ".deleting-uncommitted-v2-$v2UncommittedTombstone"
+            [IO.Directory]::CreateDirectory($partialUncommittedTombstone) | Out-Null
+            [IO.File]::WriteAllText((Join-Path $partialUncommittedTombstone "partially-removed-payload"), "fragment")
+
+            Invoke-SingleBackupRecoveryCleanup
+            foreach ($retired in @(
+                    $v2FinalA, $v2FinalB, ".deleting-$v2Tombstone",
+                    ".deleting-uncommitted-v2-$v2Tombstone",
+                    ".deleting-uncommitted-v2-$v2UncommittedTombstone")) {
+                if (Test-Path -LiteralPath (Join-Path $BackupDirectory $retired)) {
+                    throw "PowerShell retained an authenticated schema-version-2 failed-first-backup candidate: $retired"
+                }
+            }
+            foreach ($preserved in @($v1Final, $v1Tombstone)) {
+                if (-not (Test-Path -LiteralPath (Join-Path $BackupDirectory $preserved) -PathType Container)) {
+                    throw "PowerShell did not preserve or restore schema-version-1 backup: $preserved"
+                }
+            }
+            if (Test-Path -LiteralPath (Join-Path $BackupDirectory ".deleting-$v1Tombstone")) {
+                throw "PowerShell left a restored schema-version-1 backup in tombstone form"
+            }
+            $expectedFirstAuthentication = @(
+                "$v2FinalA|$v2FinalA",
+                "$v2FinalB|$v2FinalB",
+                "$v2Tombstone|.deleting-$v2Tombstone",
+                "$v1Final|$v1Final",
+                "$v1Tombstone|.deleting-$v1Tombstone"
+            ) | Sort-Object
+            $actualFirstAuthentication = @($script:AuthenticatedRecoveryCandidates) | Sort-Object
+            if (($actualFirstAuthentication -join "`n") -cne ($expectedFirstAuthentication -join "`n")) {
+                throw "PowerShell did not authenticate every no-CURRENT recovery candidate exactly once"
+            }
+            foreach ($v2Final in @($v2FinalA, $v2FinalB)) {
+                if ($script:RecoveryMoveDestinations -notcontains ".deleting-uncommitted-v2-$v2Final" -or
+                    $script:RecoveryMoveDestinations -contains ".deleting-$v2Final") {
+                    throw "PowerShell did not use the distinct uncommitted-v2 tombstone for a failed-first-backup final"
+                }
+            }
+            if ($script:RecoveryMoveDestinations -notcontains ".deleting-uncommitted-v2-$v2Tombstone") {
+                throw "PowerShell did not migrate an authenticated generic schema-version-2 tombstone before removal"
+            }
+            if (@($script:AuthenticatedRecoveryCandidates |
+                    Where-Object { $_.StartsWith("$v2UncommittedTombstone|", [StringComparison]::Ordinal) }).Count -ne 0) {
+                throw "PowerShell re-authenticated a partially removed uncommitted-v2 tombstone"
+            }
+
+            Invoke-SingleBackupRecoveryCleanup
+            if (@(Get-ChildItem -LiteralPath $BackupDirectory -Directory -Force |
+                    Where-Object { $_.Name -cmatch "^\\.deleting-" -or $_.Name -in @($v2FinalA, $v2FinalB) }).Count -ne 0) {
+                throw "PowerShell repeated no-CURRENT cleanup left retired schema-version-2 recovery debris"
+            }
+            if ($script:AuthenticatedRecoveryCandidates.Count -ne 7 -or
+                @($script:AuthenticatedRecoveryCandidates | Where-Object { $_ -ceq "$v1Final|$v1Final" }).Count -ne 2 -or
+                @($script:AuthenticatedRecoveryCandidates | Where-Object { $_ -ceq "$v1Tombstone|$v1Tombstone" }).Count -ne 1) {
+                throw "PowerShell repeated no-CURRENT cleanup did not re-authenticate only preserved schema-version-1 backups"
+            }
+            foreach ($preserved in @($v1Final, $v1Tombstone)) {
+                if (-not (Test-Path -LiteralPath (Join-Path $BackupDirectory $preserved) -PathType Container)) {
+                    throw "PowerShell repeated no-CURRENT cleanup removed a schema-version-1 backup: $preserved"
+                }
+            }
+            if (Test-Path -LiteralPath (Join-Path $BackupDirectory "CURRENT")) {
+                throw "PowerShell no-CURRENT recovery unexpectedly created or changed CURRENT"
+            }
+        ' >/dev/null
 
     legacy_binding_powershell="$test_root/legacy-binding-powershell"
     legacy_custom_powershell="$test_root/legacy-binding-custom-powershell"
@@ -3268,6 +3587,7 @@ if command -v pwsh >/dev/null 2>&1; then
             }
 
             $ScriptRoot = $env:LEGACY_BINDING_FIXTURE
+            [void](Initialize-UpgradeBackupMode)
             Initialize-LegacyBackupKeyBinding
             Assert-CanonicalCredentialBindings
             $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
@@ -3275,6 +3595,7 @@ if command -v pwsh >/dev/null 2>&1; then
             if ($matches.Count -ne 1) { throw "PowerShell did not add exactly one canonical legacy backup-key binding" }
 
             $ScriptRoot = $env:LEGACY_CUSTOM_FIXTURE
+            [void](Initialize-UpgradeBackupMode)
             Initialize-LegacyBackupKeyBinding
             Expect-BindingFailure "custom backup-key binding"
             $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
@@ -3282,6 +3603,7 @@ if command -v pwsh >/dev/null 2>&1; then
             if ($matches.Count -ne 1) { throw "PowerShell overwrote a custom backup-key binding" }
 
             $ScriptRoot = $env:LEGACY_DUPLICATE_FIXTURE
+            [void](Initialize-UpgradeBackupMode)
             Initialize-LegacyBackupKeyBinding
             Expect-BindingFailure "duplicate backup-key bindings"
             $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
@@ -3289,6 +3611,7 @@ if command -v pwsh >/dev/null 2>&1; then
             if ($matches.Count -ne 2) { throw "PowerShell collapsed duplicate backup-key bindings" }
 
             $ScriptRoot = $env:CURRENT_MISSING_FIXTURE
+            [void](Initialize-UpgradeBackupMode)
             Initialize-LegacyBackupKeyBinding
             Expect-BindingFailure "current release missing backup-key binding"
             $matches = @([IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env")) |
@@ -3304,6 +3627,7 @@ if command -v pwsh >/dev/null 2>&1; then
             . $env:STORAGE_SETUP_PATH -Command help *> $null
             $ScriptRoot = $env:LEGACY_UPGRADE_FIXTURE
             Assert-UpgradeableEnvironmentBindings
+            [void](Initialize-UpgradeBackupMode)
             Initialize-LegacyBackupKeyBinding
             Assert-CanonicalCredentialBindings
             function Invoke-ExternalProbe([scriptblock]$Action) { return $true }
@@ -3320,7 +3644,7 @@ if command -v pwsh >/dev/null 2>&1; then
             Set-EnvValue "OSCAR_VERSION" "3.9.2"
             Assert-ManagedEnvironmentBindings
             $lines = [IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env"))
-            foreach ($name in @("OSCAR_VERSION", "OSCAR_DEPLOYMENT_ID", "OSCAR_ARCHIVE_DIR", "OSCAR_BACKUP_DIR", "OSCAR_WAL_ARCHIVE_DIR")) {
+            foreach ($name in @("OSCAR_VERSION", "OSCAR_DEPLOYMENT_ID", "OSCAR_ARCHIVE_DIR", "OSCAR_BACKUP_MODE", "OSCAR_BACKUP_DIR")) {
                 if (@($lines | Where-Object { $_.StartsWith("$name=", [StringComparison]::Ordinal) }).Count -ne 1) {
                     throw "PowerShell legacy upgrade did not normalize exactly one $name binding"
                 }

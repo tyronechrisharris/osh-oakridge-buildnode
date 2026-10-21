@@ -27,7 +27,7 @@ compose() {
         cd "$script_dir"
         env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME -u COMPOSE_ENV_FILES -u COMPOSE_PROFILES \
             -u OSCAR_VERSION -u OSCAR_DEPLOYMENT_ID -u OSCAR_ARCHIVE_DIR -u OSCAR_BACKUP_DIR \
-            -u OSCAR_WAL_ARCHIVE_DIR -u OSCAR_SECRETS_DIR -u OSCAR_TLS_DIR -u OSCAR_BACKUP_KEY_FILE \
+            -u OSCAR_BACKUP_MODE -u OSCAR_WAL_ARCHIVE_DIR -u OSCAR_SECRETS_DIR -u OSCAR_TLS_DIR -u OSCAR_BACKUP_KEY_FILE \
             -u OSCAR_HTTPS_PORT -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
             docker compose --project-name oscar --env-file "$script_dir/.env" --file "$script_dir/compose.yaml" "$@"
     )
@@ -77,20 +77,53 @@ env_value() {
     printf '%s' "${value:-$fallback}"
 }
 
+valid_backup_mode() { [[ $1 == disabled || $1 == single ]]; }
+
+configured_backup_mode() {
+    local mode
+    mode=$(env_value OSCAR_BACKUP_MODE disabled)
+    valid_backup_mode "$mode" || fail 'OSCAR_BACKUP_MODE must be exactly disabled or single.'
+    printf '%s' "$mode"
+}
+
+require_single_backup_mode() {
+    [[ $(configured_backup_mode) == single ]] ||
+        fail 'OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+}
+
 assert_managed_environment_bindings() {
-    local environment_file="$script_dir/.env" name count value
+    local environment_file="$script_dir/.env" name count value mode required
     [[ -f $environment_file && ! -L $environment_file ]] || fail 'Deployment .env must be a regular, non-symlink file.'
-    for name in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_DIR \
+    mode=$(configured_backup_mode)
+    for name in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_MODE OSCAR_BACKUP_DIR \
         OSCAR_WAL_ARCHIVE_DIR OSCAR_SECRETS_DIR OSCAR_TLS_DIR OSCAR_BACKUP_KEY_FILE; do
         count=$(awk -F= -v name="$name" '$1 == name { count++ } END { print count+0 }' "$environment_file")
-        ((count == 1)) || fail "Deployment .env must contain exactly one literal $name binding."
+        required=false
+        case $name in
+            OSCAR_VERSION|OSCAR_DEPLOYMENT_ID|OSCAR_ARCHIVE_DIR|OSCAR_BACKUP_MODE|OSCAR_SECRETS_DIR|OSCAR_TLS_DIR) required=true ;;
+            OSCAR_BACKUP_DIR|OSCAR_BACKUP_KEY_FILE) [[ $mode == single ]] && required=true ;;
+        esac
+        if $required; then
+            ((count == 1)) || fail "Deployment .env must contain exactly one literal $name binding."
+        else
+            ((count <= 1)) || fail "Deployment .env contains duplicate optional $name bindings."
+            ((count == 1)) || continue
+        fi
         value=$(awk -F= -v name="$name" '$1 == name { print substr($0, index($0, "=") + 1); exit }' "$environment_file")
         [[ -n $value && $value != *'$'* && $value != *'#'* && $value != *\"* && $value != *\'* &&
            $value != *[[:space:]]* ]] ||
             fail "Deployment .env contains a Compose-interpreted or nonliteral $name value."
+        [[ $name != OSCAR_BACKUP_MODE ]] || valid_backup_mode "$value" ||
+            fail 'OSCAR_BACKUP_MODE must be exactly disabled or single.'
         case $name in
-            OSCAR_ARCHIVE_DIR|OSCAR_BACKUP_DIR|OSCAR_WAL_ARCHIVE_DIR)
+            OSCAR_ARCHIVE_DIR)
                 [[ $value == /* ]] || fail "$name must be an absolute stable storage-root path."
+                ;;
+            OSCAR_BACKUP_DIR)
+                [[ $mode != single || $value == /* ]] || fail "$name must be an absolute stable storage-root path."
+                ;;
+            OSCAR_WAL_ARCHIVE_DIR)
+                [[ $value == /* ]] || fail "A preserved $name must be an absolute path."
                 ;;
         esac
     done
@@ -219,27 +252,30 @@ assert_safe_creatable_directory_path() {
     done
 }
 
-validate_storage_directories() {
-    local archive_real backup_real wal_real
+validate_archive_directory() {
+    local archive_real
     validate_storage_path_shape OSCAR_ARCHIVE_DIR "$archive_dir"
-    validate_storage_path_shape OSCAR_BACKUP_DIR "$backup_dir"
-    validate_storage_path_shape OSCAR_WAL_ARCHIVE_DIR "$wal_archive_dir"
-    [[ -d $archive_dir && -d $backup_dir && -d $wal_archive_dir ]] ||
-        fail 'Configured storage directories are missing; run OSCAR init/upgrade preparation first.'
+    [[ -d $archive_dir ]] ||
+        fail 'Configured archive directory is missing; run OSCAR init/upgrade preparation first.'
     assert_no_symlink_components "$archive_dir"
-    assert_no_symlink_components "$backup_dir"
-    assert_no_symlink_components "$wal_archive_dir"
     archive_real=$(realpath "$archive_dir") || fail "Cannot resolve archive directory: $archive_dir"
+    archive_dir=$archive_real
+}
+
+validate_storage_directories() {
+    local archive_real backup_real
+    validate_archive_directory
+    validate_storage_path_shape OSCAR_BACKUP_DIR "$backup_dir"
+    [[ -d $backup_dir ]] ||
+        fail 'Configured backup directory is missing; run OSCAR init/upgrade preparation first.'
+    assert_no_symlink_components "$backup_dir"
+    archive_real=$archive_dir
     backup_real=$(realpath "$backup_dir") || fail "Cannot resolve backup directory: $backup_dir"
-    wal_real=$(realpath "$wal_archive_dir") || fail "Cannot resolve WAL archive directory: $wal_archive_dir"
-    if path_contains "$archive_real" "$backup_real" || path_contains "$backup_real" "$archive_real" ||
-       path_contains "$archive_real" "$wal_real" || path_contains "$wal_real" "$archive_real" ||
-       path_contains "$backup_real" "$wal_real" || path_contains "$wal_real" "$backup_real"; then
-        fail 'Archive, backup, and WAL archive directories must be distinct and must not contain one another.'
+    if path_contains "$archive_real" "$backup_real" || path_contains "$backup_real" "$archive_real"; then
+        fail 'Archive and backup directories must be distinct and must not contain one another.'
     fi
     archive_dir=$archive_real
     backup_dir=$backup_real
-    wal_archive_dir=$wal_real
 }
 
 file_owner_id() {
@@ -339,7 +375,10 @@ assert_storage_root_identity() {
 assert_storage_root_identities() {
     assert_storage_root_identity "$archive_dir" archive
     assert_storage_root_identity "$backup_dir" backup
-    assert_storage_root_identity "$wal_archive_dir" wal-archive
+}
+
+assert_archive_root_identity() {
+    assert_storage_root_identity "$archive_dir" archive
 }
 
 write_storage_root_identity() {
@@ -614,7 +653,10 @@ validate_release_config_archive() {
 }
 
 validate_backup_archive_members() {
-    local root=$1 image=$2
+    local root=$1 image=$2 schema_version=${3:-1}
+    if [[ $schema_version != 1 && $schema_version != 2 ]]; then
+        fail "Unsupported OSCAR backup schema version: $schema_version"
+    fi
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --tmpfs "$validator_scratch_tmpfs" --env TMPDIR=/tmp --workdir / --user 0 --entrypoint sh \
         --volume "$root:/backup:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
@@ -623,13 +665,22 @@ validate_backup_archive_members() {
         trap '\''rm -f -- "$secret_archive"'\'' EXIT HUP INT TERM
         openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt \
             -in /backup/deployment-secrets.tar.gz.enc -out "$secret_archive"
-        sh /validator/validate-storage-archive.sh \
-            oscar-state /backup/oscar-state.tar.gz \
-            cold-archive /backup/archive.tar.gz \
-            wal-archive /backup/wal-archive.tar.gz \
-            release-config /backup/release-config.tar.gz \
-            deployment-secrets "$secret_archive"
-    '
+        schema=$1
+        if [ "$schema" = 1 ]; then
+            sh /validator/validate-storage-archive.sh \
+                oscar-state /backup/oscar-state.tar.gz \
+                cold-archive /backup/archive.tar.gz \
+                wal-archive /backup/wal-archive.tar.gz \
+                release-config /backup/release-config.tar.gz \
+                deployment-secrets "$secret_archive"
+        else
+            sh /validator/validate-storage-archive.sh \
+                oscar-state /backup/oscar-state.tar.gz \
+                cold-archive /backup/archive.tar.gz \
+                release-config /backup/release-config.tar.gz \
+                deployment-secrets "$secret_archive"
+        fi
+    ' validator "$schema_version"
 }
 
 write_verified_marker() (
@@ -786,6 +837,10 @@ backup_epoch_version() {
     awk -F'"' '/"oscarVersion"/ { print $4; exit }' "$1/epoch.json"
 }
 
+backup_schema_version() {
+    awk -F'[: ,]+' '/"version"/ { print $3; exit }' "$1/epoch.json"
+}
+
 write_checksum_hmac() {
     local root=$1 image=$2 tag
     tag=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
@@ -817,6 +872,309 @@ verify_checksum_hmac() {
             openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A
         ')
     [[ $actual == "$expected" ]] || fail 'Backup authentication failed; SHA256SUMS or a backup payload may have been altered.'
+}
+
+calculate_current_pointer_hmac() {
+    local pointer=$1 image=$2 tag
+    [[ -f $pointer && ! -L $pointer ]] || fail 'CURRENT pointer payload is missing or unsafe.'
+    tag=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+        --workdir / --user 0 --entrypoint sh --volume "$pointer:/current:ro" \
+        --volume "$backup_key_file:/backup-key.txt:ro" "$image" -eu -c '
+            key=$(cat /backup-key.txt)
+            head -n 3 /current | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A
+        ')
+    [[ $tag =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail 'Could not authenticate the CURRENT backup pointer.'
+    printf '%s' "$tag"
+}
+
+validate_current_backup_pointer() {
+    local pointer="$backup_dir/CURRENT" image=${1:-$(oscar_image)} expected actual backup_id owner mode
+    [[ -f $pointer && ! -L $pointer ]] || fail 'The single-backup CURRENT pointer is missing or unsafe.'
+    owner=$(file_owner_id "$pointer") || fail 'Cannot inspect CURRENT pointer ownership.'
+    mode=$(file_mode "$pointer") || fail 'Cannot inspect CURRENT pointer permissions.'
+    [[ $owner == ${EUID:-$(id -u)} && $mode == 600 ]] ||
+        fail 'The CURRENT backup pointer must be administrator-owned with mode 0600.'
+    [[ $(wc -l <"$pointer" | tr -d '[:space:]') == 4 &&
+       $(sed -n '1p' "$pointer") == format=oscar-current-backup &&
+       $(sed -n '2p' "$pointer") == version=1 &&
+       $(sed -n '3p' "$pointer") =~ ^backup_id=[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ &&
+       $(sed -n '4p' "$pointer") =~ ^hmac_sha256=[A-Za-z0-9+/]{43}=$ ]] ||
+        fail 'The CURRENT backup pointer is malformed.'
+    backup_id=$(storage_identity_value "$pointer" backup_id)
+    valid_backup_id "$backup_id" || fail 'The CURRENT backup pointer contains an invalid backup ID.'
+    expected=$(storage_identity_value "$pointer" hmac_sha256)
+    actual=$(calculate_current_pointer_hmac "$pointer" "$image")
+    [[ $actual == "$expected" ]] || fail 'The CURRENT backup pointer authentication failed.'
+    printf '%s' "$backup_id"
+}
+
+write_current_backup_pointer() {
+    local backup_id=$1 image=$2 pointer="$backup_dir/CURRENT" temporary tag
+    valid_backup_id "$backup_id" || fail 'Cannot publish an invalid CURRENT backup ID.'
+    temporary=$(mktemp "$backup_dir/.CURRENT.tmp.XXXXXX")
+    {
+        printf 'format=oscar-current-backup\n'
+        printf 'version=1\n'
+        printf 'backup_id=%s\n' "$backup_id"
+    } >"$temporary"
+    chown "${EUID:-$(id -u)}" "$temporary"
+    chmod 0600 "$temporary"
+    fsync_path "$temporary"
+    tag=$(calculate_current_pointer_hmac "$temporary" "$image")
+    printf 'hmac_sha256=%s\n' "$tag" >>"$temporary"
+    fsync_path "$temporary"
+    mv -f -- "$temporary" "$pointer"
+    fsync_path "$backup_dir"
+    [[ $(validate_current_backup_pointer "$image") == "$backup_id" ]] ||
+        fail 'The committed CURRENT pointer did not identify the new recovery point.'
+}
+
+cleanup_snapshot_sidecar_temps() {
+    local root=$1 path name owner mode
+    assert_private_backup_snapshot_directory "$root"
+    while IFS= read -r -d '' path; do
+        name=${path##*/}
+        case $name in
+            .VERIFIED.*|.JOURNAL_CONFIRMED.*)
+                [[ $name =~ ^\.(VERIFIED|JOURNAL_CONFIRMED)\.[A-Za-z0-9]{6}$ ]] ||
+                    fail "Malformed backup acceptance temporary was preserved: $path"
+                [[ -f $path && ! -L $path ]] ||
+                    fail "Backup acceptance temporary is unsafe: $path"
+                owner=$(file_owner_id "$path") || fail "Cannot inspect backup acceptance temporary owner: $path"
+                mode=$(file_mode "$path") || fail "Cannot inspect backup acceptance temporary permissions: $path"
+                [[ $owner == ${EUID:-$(id -u)} && $mode == 600 ]] ||
+                    fail "Backup acceptance temporary must be administrator-owned with mode 0600: $path"
+                rm -f -- "$path"
+                fsync_path "$root"
+                ;;
+        esac
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+}
+
+cleanup_noncurrent_backup_snapshots() {
+    local current_id=$1 image=$2 path name deleting owner mode backup_id
+    [[ $(validate_current_backup_pointer "$image") == "$current_id" ]] ||
+        fail 'Refusing snapshot cleanup without an authenticated CURRENT pointer.'
+    cleanup_snapshot_sidecar_temps "$backup_dir/$current_id"
+    verify_backup "$current_id" read-only
+    while IFS= read -r -d '' path; do
+        [[ -n $path ]] || continue
+        name=${path##*/}
+        if [[ $name =~ ^\.deleting-uncommitted-v2-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$ ]]; then
+            backup_id=${BASH_REMATCH[1]}
+            [[ $backup_id != "$current_id" ]] || fail 'CURRENT backup cannot be an uncommitted-v2 deletion candidate.'
+            [[ ! -e $backup_dir/$backup_id && ! -L $backup_dir/$backup_id ]] ||
+                fail "Both live and uncommitted-v2 deletion snapshots exist: $backup_id"
+            [[ -d $path && ! -L $path ]] || fail "Uncommitted-v2 deletion tombstone is unsafe: $path"
+            owner=$(file_owner_id "$path") || fail "Cannot inspect uncommitted-v2 deletion tombstone owner: $path"
+            mode=$(file_mode "$path") || fail "Cannot inspect uncommitted-v2 deletion tombstone permissions: $path"
+            [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+                fail "Uncommitted-v2 deletion tombstone must be administrator-owned with mode 0700: $path"
+            rm -rf -- "$path"
+            fsync_path "$backup_dir"
+            continue
+        fi
+        if [[ $name == .deleting-uncommitted-v2-* ]]; then
+            fail "Malformed uncommitted-v2 deletion tombstone was preserved: $path"
+        fi
+        if [[ $name =~ ^\.deleting-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$ ]]; then
+            [[ ${BASH_REMATCH[1]} != "$current_id" ]] || fail 'CURRENT backup cannot be a deletion candidate.'
+            [[ -d $path && ! -L $path ]] || fail "Backup deletion tombstone is unsafe: $path"
+            owner=$(file_owner_id "$path") || fail "Cannot inspect backup deletion tombstone owner: $path"
+            mode=$(file_mode "$path") || fail "Cannot inspect backup deletion tombstone permissions: $path"
+            [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+                fail "Backup deletion tombstone must be administrator-owned with mode 0700: $path"
+            rm -rf -- "$path"
+            fsync_path "$backup_dir"
+            continue
+        fi
+        if [[ $name == .deleting-* && $name != .deleting-partial-* ]]; then
+            fail "Malformed backup deletion tombstone was preserved: $path"
+        fi
+        if [[ $name =~ ^[0-9]{8}T ]] && ! valid_backup_id "$name"; then
+            fail "Malformed backup snapshot candidate was preserved: $path"
+        fi
+        valid_backup_id "$name" || continue
+        [[ $name != "$current_id" ]] || continue
+        # Publication occurs only after the immutable core passes its complete
+        # verifier. A crash before CURRENT can therefore leave an authenticated
+        # final directory without a VERIFIED/JOURNAL_CONFIRMED sidecar. Verify
+        # that core again, then retire it so interrupted attempts cannot grow
+        # the supposedly single-snapshot store without bound.
+        cleanup_snapshot_sidecar_temps "$path"
+        verify_backup "$name" read-only
+        deleting="$backup_dir/.deleting-$name"
+        [[ ! -e $deleting && ! -L $deleting ]] || fail "Backup deletion staging path already exists: $deleting"
+        mv -- "$path" "$deleting"
+        fsync_path "$backup_dir"
+        rm -rf -- "$deleting"
+        fsync_path "$backup_dir"
+    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+}
+
+cleanup_uncommitted_schema_v2_snapshots() {
+    local image=$1 path name backup_id final deleting owner mode schema_version
+    while IFS= read -r -d '' path; do
+        [[ -n $path ]] || continue
+        name=${path##*/}
+        if [[ $name =~ ^\.deleting-uncommitted-v2-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$ ]]; then
+            backup_id=${BASH_REMATCH[1]}
+            final="$backup_dir/$backup_id"
+            [[ ! -e $final && ! -L $final ]] ||
+                fail "Both live and uncommitted-v2 deletion snapshots exist without CURRENT: $backup_id"
+            [[ -d $path && ! -L $path ]] || fail "Uncommitted-v2 deletion tombstone is unsafe: $path"
+            owner=$(file_owner_id "$path") || fail "Cannot inspect uncommitted-v2 deletion tombstone owner: $path"
+            mode=$(file_mode "$path") || fail "Cannot inspect uncommitted-v2 deletion tombstone permissions: $path"
+            [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+                fail "Uncommitted-v2 deletion tombstone must be administrator-owned with mode 0700: $path"
+            # This distinct name is written only after complete authentication
+            # and schema-v2 classification. Its payload may be incomplete after
+            # a power loss during recursive removal, so resume from the durable
+            # name and protected directory rather than trying to reauthenticate
+            # already deleted members.
+            rm -rf -- "$path"
+            fsync_path "$backup_dir"
+            continue
+        fi
+        if [[ $name == .deleting-uncommitted-v2-* ]]; then
+            fail "Malformed uncommitted-v2 deletion tombstone was preserved: $path"
+        fi
+        if [[ $name =~ ^\.deleting-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})$ ]]; then
+            backup_id=${BASH_REMATCH[1]}
+            final="$backup_dir/$backup_id"
+            [[ ! -e $final && ! -L $final ]] ||
+                fail "Both live and deleting backup snapshots exist without CURRENT: $backup_id"
+            [[ -d $path && ! -L $path ]] || fail "Backup deletion tombstone is unsafe: $path"
+            owner=$(file_owner_id "$path") || fail "Cannot inspect backup deletion tombstone owner: $path"
+            mode=$(file_mode "$path") || fail "Cannot inspect backup deletion tombstone permissions: $path"
+            [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+                fail "Backup deletion tombstone must be administrator-owned with mode 0700: $path"
+            cleanup_snapshot_sidecar_temps "$path"
+            verify_backup "$backup_id" read-only "$path"
+            schema_version=$(backup_schema_version "$path")
+            if [[ $schema_version == 1 ]]; then
+                # A pre-3.9.2 prune could have crashed after renaming a legacy
+                # backup. With no authenticated CURRENT, restore that recovery
+                # point rather than guessing that deletion was still intended.
+                mv -- "$path" "$final"
+                fsync_path "$backup_dir"
+            else
+                deleting="$backup_dir/.deleting-uncommitted-v2-$backup_id"
+                [[ ! -e $deleting && ! -L $deleting ]] ||
+                    fail "Uncommitted-v2 deletion staging path already exists: $deleting"
+                mv -- "$path" "$deleting"
+                fsync_path "$backup_dir"
+                rm -rf -- "$deleting"
+                fsync_path "$backup_dir"
+            fi
+            continue
+        fi
+        if [[ $name == .deleting-* && $name != .deleting-partial-* ]]; then
+            fail "Malformed backup deletion tombstone was preserved: $path"
+        fi
+        if [[ $name =~ ^[0-9]{8}T ]] && ! valid_backup_id "$name"; then
+            fail "Malformed backup snapshot candidate was preserved: $path"
+        fi
+        valid_backup_id "$name" || continue
+        deleting="$backup_dir/.deleting-$name"
+        [[ ! -e $deleting && ! -L $deleting ]] ||
+            fail "Both live and deleting backup snapshots exist without CURRENT: $name"
+        [[ ! -e $backup_dir/.deleting-uncommitted-v2-$name &&
+           ! -L $backup_dir/.deleting-uncommitted-v2-$name ]] ||
+            fail "Both live and uncommitted-v2 deletion snapshots exist without CURRENT: $name"
+        cleanup_snapshot_sidecar_temps "$path"
+        verify_backup "$name" read-only
+        schema_version=$(backup_schema_version "$path")
+        # Schema-v1 directories predate CURRENT and remain explicit recovery
+        # points. A schema-v2 directory without CURRENT is a fully verified but
+        # uncommitted first-backup attempt and must not accumulate on retries.
+        [[ $schema_version == 2 ]] || continue
+        deleting="$backup_dir/.deleting-uncommitted-v2-$name"
+        mv -- "$path" "$deleting"
+        fsync_path "$backup_dir"
+        rm -rf -- "$deleting"
+        fsync_path "$backup_dir"
+    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+}
+
+cleanup_abandoned_single_backup_staging() {
+    local path name backup_id deleting owner mode
+    while IFS= read -r -d '' path; do
+        name=${path##*/}
+        case $name in
+            .journal-confirm-*|.restore-payload-*)
+                [[ $name =~ ^\.(journal-confirm|restore-payload)-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})\.[A-Za-z0-9]{6}$ ]] ||
+                    fail "Malformed backup recovery scratch entry was preserved: $path"
+                [[ -d $path && ! -L $path ]] || fail "Backup recovery scratch entry is unsafe: $path"
+                owner=$(file_owner_id "$path") || fail "Cannot inspect backup recovery scratch owner: $path"
+                mode=$(file_mode "$path") || fail "Cannot inspect backup recovery scratch permissions: $path"
+                [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+                    fail "Backup recovery scratch must be administrator-owned with mode 0700: $path"
+                rm -rf -- "$path"
+                fsync_path "$backup_dir"
+                ;;
+            .CURRENT.tmp.*)
+                [[ $name =~ ^\.CURRENT\.tmp\.[A-Za-z0-9]{6}$ ]] ||
+                    fail "Malformed CURRENT staging entry was preserved: $path"
+                [[ -f $path && ! -L $path ]] || fail "Abandoned CURRENT staging entry is unsafe: $path"
+                owner=$(file_owner_id "$path") || fail "Cannot inspect abandoned CURRENT staging owner: $path"
+                mode=$(file_mode "$path") || fail "Cannot inspect abandoned CURRENT staging permissions: $path"
+                [[ $owner == ${EUID:-$(id -u)} && $mode == 600 ]] ||
+                    fail "Abandoned CURRENT staging entry must be administrator-owned with mode 0600: $path"
+                rm -f -- "$path"
+                fsync_path "$backup_dir"
+                ;;
+            *.partial)
+                backup_id=${name%.partial}
+                valid_backup_id "$backup_id" || fail "Malformed backup partial was preserved: $path"
+                [[ -d $path && ! -L $path ]] || fail "Abandoned backup staging entry is unsafe: $path"
+                owner=$(file_owner_id "$path") || fail "Cannot inspect abandoned backup staging owner: $path"
+                mode=$(file_mode "$path") || fail "Cannot inspect abandoned backup staging permissions: $path"
+                [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+                    fail "Abandoned backup staging entry must be administrator-owned with mode 0700: $path"
+                deleting="$backup_dir/.deleting-partial-$backup_id"
+                [[ ! -e $deleting && ! -L $deleting ]] ||
+                    fail "Abandoned backup deletion staging path already exists: $deleting"
+                mv -- "$path" "$deleting"
+                fsync_path "$backup_dir"
+                rm -rf -- "$deleting"
+                fsync_path "$backup_dir"
+                ;;
+            .deleting-partial-*)
+                backup_id=${name#.deleting-partial-}
+                valid_backup_id "$backup_id" || fail "Malformed deleting backup partial was preserved: $path"
+                [[ -d $path && ! -L $path ]] || fail "Abandoned backup deletion staging entry is unsafe: $path"
+                owner=$(file_owner_id "$path") || fail "Cannot inspect abandoned backup deletion staging owner: $path"
+                mode=$(file_mode "$path") || fail "Cannot inspect abandoned backup deletion staging permissions: $path"
+                [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+                    fail "Abandoned backup deletion staging entry must be administrator-owned with mode 0700: $path"
+                rm -rf -- "$path"
+                fsync_path "$backup_dir"
+                ;;
+            .CURRENT.tmp*) fail "Malformed CURRENT staging entry was preserved: $path" ;;
+        esac
+    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -print0)
+}
+
+recover_single_backup_state() {
+    local pointer="$backup_dir/CURRENT" image=$1 current_id
+    if [[ -e $pointer || -L $pointer ]]; then
+        current_id=$(validate_current_backup_pointer "$image")
+        cleanup_noncurrent_backup_snapshots "$current_id" "$image"
+    else
+        cleanup_uncommitted_schema_v2_snapshots "$image"
+    fi
+    cleanup_abandoned_single_backup_staging
+}
+
+assert_private_backup_snapshot_directory() {
+    local root=$1 owner mode
+    [[ ${root%/*} == "$backup_dir" && -d $root && ! -L $root ]] ||
+        fail "Backup snapshot must be a direct, non-link directory below the configured backup root: $root"
+    owner=$(file_owner_id "$root") || fail "Cannot inspect backup snapshot owner: $root"
+    mode=$(file_mode "$root") || fail "Cannot inspect backup snapshot permissions: $root"
+    [[ $owner == ${EUID:-$(id -u)} && $mode == 700 ]] ||
+        fail "Backup snapshot must be administrator-owned with mode 0700: $root"
 }
 
 backup_object_path() {
@@ -1008,48 +1366,53 @@ audit_archive_filesystem() (
 
 prepare_storage_directories() {
     require_admin
-    local allow_adoption=false
+    local allow_adoption=false mode root kind marker specification
+    local -a roots
     while (($#)); do
         case $1 in
             --adopt-existing) allow_adoption=true; shift ;;
             *) fail "Unknown prepare-directories option: $1" ;;
         esac
     done
+    mode=$(configured_backup_mode)
     validate_storage_path_shape OSCAR_ARCHIVE_DIR "$archive_dir"
-    validate_storage_path_shape OSCAR_BACKUP_DIR "$backup_dir"
-    validate_storage_path_shape OSCAR_WAL_ARCHIVE_DIR "$wal_archive_dir"
     assert_safe_creatable_directory_path "$archive_dir"
-    assert_safe_creatable_directory_path "$backup_dir"
-    assert_safe_creatable_directory_path "$wal_archive_dir"
-    mkdir -p "$archive_dir" "$backup_dir" "$wal_archive_dir"
-    validate_storage_directories
-    local root kind marker
+    mkdir -p "$archive_dir"
+    roots=("$archive_dir|archive")
+    if [[ $mode == single ]]; then
+        validate_storage_path_shape OSCAR_BACKUP_DIR "$backup_dir"
+        assert_safe_creatable_directory_path "$backup_dir"
+        mkdir -p "$backup_dir"
+        roots+=("$backup_dir|backup")
+        validate_storage_directories
+    else
+        validate_archive_directory
+    fi
     # Reject every unsafe/foreign root before changing ownership or mode on any
     # path. This keeps a mistaken path or swapped volume from being mutated by
     # an adoption attempt.
-    while IFS='|' read -r root kind; do
+    for specification in "${roots[@]}"; do
+        IFS='|' read -r root kind <<<"$specification"
         marker="$root/.oscar-storage-root"
         if [[ -e $marker || -L $marker ]]; then
             assert_storage_root_identity "$root" "$kind"
         elif [[ -n $(find "$root" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
             $allow_adoption || fail "Nonempty $kind storage root is unclaimed. Re-run setup with the explicit legacy-storage-root adoption option after verifying this path: $root"
         fi
-    done <<EOF
-$archive_dir|archive
-$backup_dir|backup
-$wal_archive_dir|wal-archive
-EOF
+    done
     # The release images use stable numeric IDs (OSCAR 10001, PostgreSQL 999).
     # Backup payloads include operational data. Only root may traverse the backup tree.
     chown 0:10001 "$archive_dir"
-    chown 0:999 "$wal_archive_dir"
-    chown 0:0 "$backup_dir"
-    chmod 1770 "$archive_dir" "$wal_archive_dir"
-    chmod 0700 "$backup_dir"
+    chmod 1770 "$archive_dir"
     claim_storage_root "$archive_dir" archive "$allow_adoption"
-    claim_storage_root "$backup_dir" backup "$allow_adoption"
-    claim_storage_root "$wal_archive_dir" wal-archive "$allow_adoption"
-    assert_storage_root_identities
+    if [[ $mode == single ]]; then
+        chown 0:0 "$backup_dir"
+        chmod 0700 "$backup_dir"
+        claim_storage_root "$backup_dir" backup "$allow_adoption"
+        assert_storage_root_identities
+    else
+        assert_archive_root_identity
+    fi
 }
 
 confirm_daily_journal_backup() (
@@ -1132,6 +1495,7 @@ accept_and_confirm_created_backup() {
 
 create_backup() (
     require_admin; require_configured; require_canonical_credential_bindings "$script_dir/.env"
+    require_single_backup_mode
     require_backup_key; assert_deployment_volume_ownership; prepare_storage_directories
     local backup_id timestamp random work final lsn version template_version epoch_id image pg_image postgres_container
     local inventory_receipt generation_count generation_inventory_sha256 generation_inventory_bytes epoch_sha
@@ -1151,17 +1515,15 @@ create_backup() (
     pg_image=$(postgres_image)
     require_local_image "$image"
     require_local_image "$pg_image"
+    recover_single_backup_state "$image"
     mkdir -p "$work/postgres"
     chown 0:0 "$work"
     chmod 0700 "$work"
     chown 999:999 "$work/postgres"
     chmod 0700 "$work/postgres"
-    : >"$work/wal-archive.tar.gz"
     : >"$work/oscar-state.tar.gz"
     : >"$work/archive.tar.gz"
-    chown 999:999 "$work/wal-archive.tar.gz"
     chown 10001:10001 "$work/oscar-state.tar.gz" "$work/archive.tar.gz"
-    chmod 0600 "$work/wal-archive.tar.gz"
     chmod 0600 "$work/oscar-state.tar.gz" "$work/archive.tar.gz"
 
     heading "Creating coordinated backup $backup_id"
@@ -1194,8 +1556,6 @@ create_backup() (
 
     lsn=$(psql_admin --tuples-only --no-align --command "SELECT pg_current_wal_lsn();" | tr -d '[:space:]')
     epoch_id=$(psql_admin --tuples-only --no-align --command "SELECT gen_random_uuid();" | tr -d '[:space:]')
-    psql_admin --command "SELECT pg_switch_wal();" >/dev/null
-
     # The long-running database never receives the backup root. A capability-free
     # one-shot client shares only PostgreSQL's network namespace and receives only
     # the fresh output directory plus the exact bootstrap password file.
@@ -1212,9 +1572,8 @@ create_backup() (
             --dbname="host=127.0.0.1 port=5432 dbname=gis" --format=plain \
             --wal-method=stream --checkpoint=fast
     '
-    # pg_basebackup is self-contained. Stop PostgreSQL after it completes so
-    # archive_command cannot add or rename a WAL object between the partial
-    # scan and tar traversal.
+    # --wal-method=stream makes this recovery point self-contained. No external
+    # cumulative WAL archive is copied into the snapshot.
     compose stop postgres >/dev/null
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
         --user 10001:10001 --entrypoint sh --volume oscar_oscar_state:/state:ro \
@@ -1235,11 +1594,6 @@ create_backup() (
         --user 10001:10001 --entrypoint sh --volume "$archive_dir:/archive:ro" \
         --volume "$work/archive.tar.gz:/output.tar.gz" "$image" -eu -c \
         "tar --exclude='./.oscar-storage-root' -C /archive -czf /output.tar.gz ."
-    docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 999:999 --entrypoint sh --volume "$wal_archive_dir:/wal-archive:ro" \
-        --volume "$work/wal-archive.tar.gz:/output.tar.gz" "$pg_image" -eu -c \
-        "if find /wal-archive -type f -name '*.partial*' -print -quit | grep -q .; then echo 'WAL archive contains a .partial file while backup writers are quiesced.' >&2; exit 1; fi; tar --exclude='./.oscar-storage-root' -C /wal-archive -czf /output.tar.gz ."
-
     : >"$work/deployment-secrets.tar.gz.enc"
     chmod 0600 "$work/deployment-secrets.tar.gz.enc"
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
@@ -1258,7 +1612,7 @@ create_backup() (
     {
         printf '{\n'
         printf '  "format": "oscar-backup-epoch",\n'
-        printf '  "version": 1,\n'
+        printf '  "version": 2,\n'
         printf '  "backupEpochId": "%s",\n' "$epoch_id"
         printf '  "backupId": "%s",\n' "$backup_id"
         printf '  "createdAt": "%s",\n' "${timestamp:0:4}-${timestamp:4:2}-${timestamp:6:2}T${timestamp:9:2}:${timestamp:11:2}:${timestamp:13:2}Z"
@@ -1286,6 +1640,8 @@ create_backup() (
     find "$work" -type d -exec chmod 0700 {} +
     find "$work" -type f -exec chmod 0600 {} +
     durably_flush_tree "$work"
+    # Verify the complete immutable candidate before it becomes discoverable.
+    verify_backup "$backup_id" read-only "$work"
     publish_export_directory "$work" "$final"
     fsync_path "$backup_dir"
     chown 0:0 "$backup_dir"
@@ -1307,6 +1663,10 @@ SQL
     printf 'Backup created: %s\n' "$final"
     printf 'Store %s separately from the backup media; it is required to restore encrypted credentials.\n' "$backup_key_file"
     accept_and_confirm_created_backup "$backup_id" "$final" "$image" "$oscar_state_sha"
+    # CURRENT is the durable commit point. The previous recovery point remains
+    # authoritative until this authenticated single-file replacement succeeds.
+    write_current_backup_pointer "$backup_id" "$image"
+    cleanup_noncurrent_backup_snapshots "$backup_id" "$image"
     if $resume_oscar || $resume_gateway; then
         services=()
         $resume_oscar && services+=(oscar)
@@ -1315,18 +1675,24 @@ SQL
         resume_oscar=false
         resume_gateway=false
     fi
-    if [[ $(env_value OSCAR_BACKUP_AUTO_PRUNE true) == true ]]; then
-        prune_backups --keep "$(env_value OSCAR_BACKUP_RETENTION_COUNT 14)"
-    fi
     trap - EXIT
 )
 
 verify_backup() {
     require_admin; require_configured; require_backup_key
-    local backup_id=${1:?backup id required} verification_mode=${2:-accept} root image pg_image epoch_id epoch_version epoch_backup_id epoch_format epoch_schema_version epoch_state epoch_lsn line expected_hash relative actual_hash object
+    local backup_id=${1:?backup id required} verification_mode=${2:-accept} supplied_root=${3:-} root image pg_image epoch_id epoch_version epoch_backup_id epoch_format epoch_schema_version epoch_state epoch_lsn line expected_hash relative actual_hash object
     local oscar_state_sha='' oscar_state_entries=0 archive_entries=0 generation_entries=0 secret_entries=0 epoch_entries=0 image_entries=0 release_entries=0 wal_entries=0 epoch_key
     valid_backup_id "$backup_id" || fail 'Invalid backup ID.'
-    root="$backup_dir/$backup_id"
+    if [[ -n $supplied_root ]]; then
+        [[ $verification_mode == read-only &&
+           ($supplied_root == "$backup_dir/$backup_id.partial" ||
+            $supplied_root == "$backup_dir/.deleting-$backup_id") ]] ||
+            fail 'A recovery verifier may inspect only its matching private .partial or .deleting directory.'
+        root=$supplied_root
+    else
+        root="$backup_dir/$backup_id"
+    fi
+    assert_private_backup_snapshot_directory "$root"
     [[ -d $root && -s $root/SHA256SUMS ]] || fail "Backup is incomplete: $root"
     heading "Verifying backup $backup_id"
     image=$(oscar_image)
@@ -1357,8 +1723,12 @@ verify_backup() {
             wal-archive.tar.gz) wal_entries=$((wal_entries + 1)) ;;
         esac
     done <"$root/SHA256SUMS"
+    epoch_schema_version=$(backup_schema_version "$root")
+    [[ $epoch_schema_version == 1 || $epoch_schema_version == 2 ]] ||
+        fail 'Backup epoch schema version must be 1 or 2.'
     ((oscar_state_entries == 1 && archive_entries == 1 && generation_entries == 1 && secret_entries == 1 && epoch_entries == 1 &&
-      image_entries == 1 && release_entries == 1 && wal_entries == 1)) ||
+      image_entries == 1 && release_entries == 1 &&
+      ((epoch_schema_version == 1 && wal_entries == 1) || (epoch_schema_version == 2 && wal_entries == 0)))) ||
         fail 'Authenticated checksum manifest must contain each required recovery payload exactly once.'
     validate_archive_generation_inventory "$root" >/dev/null
     # The published backup is deliberately normalized to administrator-owned
@@ -1370,22 +1740,21 @@ verify_backup() {
         --cap-add DAC_READ_SEARCH --workdir / --user 0:0 --entrypoint pg_verifybackup \
         --volume "$root/postgres:/backup:ro" "$pg_image" /backup
     validate_release_config_archive "$root" "$image"
-    validate_backup_archive_members "$root" "$image"
+    validate_backup_archive_members "$root" "$image" "$epoch_schema_version"
     validate_image_inventory "$root" false
     epoch_id=$(awk -F'"' '/"backupEpochId"/ {print $4; exit}' "$root/epoch.json")
     epoch_version=$(backup_epoch_version "$root")
     epoch_backup_id=$(awk -F'"' '/"backupId"/ {print $4; exit}' "$root/epoch.json")
     epoch_format=$(awk -F'"' '/"format"/ {print $4; exit}' "$root/epoch.json")
-    epoch_schema_version=$(awk -F'[: ,]+' '/"version"/ {print $3; exit}' "$root/epoch.json")
     epoch_state=$(awk -F'"' '/"state"/ {print $4; exit}' "$root/epoch.json")
     epoch_lsn=$(awk -F'"' '/"postgresLsn"/ {print $4; exit}' "$root/epoch.json")
-    [[ $(wc -l <"$root/epoch.json" | tr -d '[:space:]') == 12 ]] || fail 'Backup epoch must contain exactly the version-1 field set.'
+    [[ $(wc -l <"$root/epoch.json" | tr -d '[:space:]') == 12 ]] || fail 'Backup epoch must contain exactly the supported field set.'
     for epoch_key in format version backupEpochId backupId createdAt oscarVersion postgresLsn archiveRoot secrets state; do
         [[ $(grep -Ec "^[[:space:]]*\"${epoch_key}\"[[:space:]]*:" "$root/epoch.json") == 1 ]] ||
             fail "Backup epoch must contain exactly one $epoch_key field."
     done
     valid_uuid "$epoch_id" || fail 'Backup epoch manifest is invalid.'
-    [[ $epoch_format == oscar-backup-epoch && $epoch_schema_version == 1 &&
+    [[ $epoch_format == oscar-backup-epoch && ($epoch_schema_version == 1 || $epoch_schema_version == 2) &&
        $epoch_backup_id == "$backup_id" && $epoch_state == CREATED ]] ||
         fail 'Backup epoch identity, format version, or creation state does not match this recovery-point directory.'
     [[ $epoch_version == "$required_release_version" ]] || fail "Backup epoch must identify OSCAR $required_release_version."
@@ -1439,251 +1808,6 @@ require_restore_compatibility() {
     validate_image_inventory "$root" true
 }
 
-authenticated_backup_label_boundary() {
-    local root=$1 line count expected path actual boundary
-    count=$(grep -Ec '^[0-9a-f]{64}  \./postgres/backup_label$' "$root/SHA256SUMS")
-    [[ $count == 1 ]] || fail "Authenticated manifest must contain postgres/backup_label exactly once: $root"
-    line=$(grep -E '^[0-9a-f]{64}  \./postgres/backup_label$' "$root/SHA256SUMS")
-    expected=${line:0:64}
-    path=$(backup_object_path "$root" postgres/backup_label)
-    actual=$(sha256_file "$path")
-    [[ $actual == "$expected" ]] || fail "Authenticated PostgreSQL backup_label checksum mismatch: $root"
-    boundary=$(sed -n 's/.*(file \([0-9A-F]\{24\}\)).*/\1/p' "$path" | head -n 1)
-    [[ $boundary =~ ^[0-9A-F]{24}$ ]] || fail "Could not determine the safe WAL boundary from authenticated backup_label: $root"
-    printf '%s' "$boundary"
-}
-
-calculate_prune_intent_hmac() {
-    local filename=$1 image=$2
-    [[ $filename == .oscar-backup-prune-intent ]] || fail 'Unsafe backup prune intent filename.'
-    docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --workdir / --user 0 --entrypoint sh \
-        --volume "$backup_dir/$filename:/prune-intent:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
-        "$image" -eu -c '
-            key=$(cat /backup-key.txt)
-            openssl dgst -sha256 -hmac "$key" -binary /prune-intent | openssl base64 -A
-        '
-}
-
-verify_prune_intent() {
-    local image=$1 intent="$backup_dir/.oscar-backup-prune-intent" tag_file="$backup_dir/.oscar-backup-prune-intent.hmac"
-    local expected actual deployment_id
-    [[ -f $intent && ! -L $intent && -f $tag_file && ! -L $tag_file ]] ||
-        fail 'Backup prune recovery intent is incomplete or unsafe; no deletion was attempted.'
-    [[ $(file_owner_id "$intent") == ${EUID:-$(id -u)} &&
-       $(file_owner_id "$tag_file") == ${EUID:-$(id -u)} ]] ||
-        fail 'Backup prune recovery intent is not administrator-owned; no deletion was attempted.'
-    expected=$(tr -d '\r\n' <"$tag_file")
-    [[ $expected =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail 'Backup prune recovery intent authentication tag is malformed.'
-    actual=$(calculate_prune_intent_hmac .oscar-backup-prune-intent "$image")
-    [[ $actual == "$expected" ]] || fail 'Backup prune recovery intent authentication failed; no deletion was attempted.'
-    [[ $(grep -Fxc 'format=oscar-backup-prune-intent' "$intent") == 1 &&
-       $(grep -Fxc 'version=1' "$intent") == 1 &&
-       $(grep -Ec '^deployment_id=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$intent") == 1 &&
-       $(grep -Ec '^retention=([1-9][0-9]{0,3}|10000)$' "$intent") == 1 &&
-       $(grep -Ec '^oldest_retained=[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$' "$intent") == 1 &&
-       $(grep -Ec '^wal_boundary=[0-9A-F]{24}$' "$intent") == 1 &&
-       $(grep -Ec '^created_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$intent") == 1 &&
-       $(grep -Evc '^(format=oscar-backup-prune-intent|version=1|deployment_id=[0-9a-f-]+|retention=[0-9]+|oldest_retained=[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}|wal_boundary=[0-9A-F]{24}|created_at=[0-9TZ:-]+|delete_backup=[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}|delete_wal=[0-9A-F]{24})$' "$intent") == 0 ]] ||
-        fail 'Backup prune recovery intent is malformed; no deletion was attempted.'
-    [[ -z $(grep -E '^(delete_backup|delete_wal)=' "$intent" | sort | uniq -d) ]] ||
-        fail 'Backup prune recovery intent contains duplicate deletion entries.'
-    deployment_id=$(env_value OSCAR_DEPLOYMENT_ID '')
-    [[ $(storage_identity_value "$intent" deployment_id) == "$deployment_id" ]] ||
-        fail 'Backup prune recovery intent belongs to another deployment; no deletion was attempted.'
-}
-
-write_prune_intent() {
-    local source=$1 image=$2 intent="$backup_dir/.oscar-backup-prune-intent" tag_file="$backup_dir/.oscar-backup-prune-intent.hmac"
-    local temporary tag_temporary tag
-    [[ ! -e $intent && ! -L $intent && ! -e $tag_file && ! -L $tag_file ]] ||
-        fail 'A backup prune recovery intent already exists and must be recovered before starting another prune.'
-    temporary=$(mktemp "$backup_dir/.oscar-backup-prune-intent.tmp.XXXXXX")
-    tag_temporary=$(mktemp "$backup_dir/.oscar-backup-prune-intent.hmac.tmp.XXXXXX")
-    cp "$source" "$temporary"
-    chown "${EUID:-$(id -u)}" "$temporary" "$tag_temporary"
-    chmod 0600 "$temporary" "$tag_temporary"
-    fsync_path "$temporary"
-    mv "$temporary" "$intent"
-    fsync_path "$backup_dir"
-    tag=$(calculate_prune_intent_hmac .oscar-backup-prune-intent "$image")
-    [[ $tag =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail 'Could not authenticate backup prune recovery intent.'
-    printf '%s\n' "$tag" >"$tag_temporary"
-    fsync_path "$tag_temporary"
-    mv "$tag_temporary" "$tag_file"
-    fsync_path "$backup_dir"
-    verify_prune_intent "$image"
-}
-
-finish_prune_intent() {
-    local image=$1 intent="$backup_dir/.oscar-backup-prune-intent" tag_file="$backup_dir/.oscar-backup-prune-intent.hmac"
-    local oldest boundary id path deleting name actual_boundary
-    verify_prune_intent "$image"
-    oldest=$(storage_identity_value "$intent" oldest_retained)
-    boundary=$(storage_identity_value "$intent" wal_boundary)
-    [[ -d $backup_dir/$oldest && ! -L $backup_dir/$oldest ]] ||
-        fail 'Oldest retained backup named by prune intent is missing; WAL was not touched.'
-    verify_backup "$oldest" read-only
-    actual_boundary=$(authenticated_backup_label_boundary "$backup_dir/$oldest")
-    [[ $actual_boundary == "$boundary" ]] || fail 'Authenticated WAL boundary changed after prune intent was written.'
-
-    # Validate every not-yet-renamed candidate before resuming. A .deleting tree
-    # may be partially removed; the authenticated durable intent is the authority
-    # for finishing only that previously validated deletion.
-    while IFS= read -r id; do
-        [[ -n $id ]] || continue
-        path="$backup_dir/$id"
-        deleting="$backup_dir/.deleting-$id"
-        [[ ! ( -e $path && -e $deleting ) ]] || fail "Both live and deleting backup paths exist for intent candidate: $id"
-        if [[ -e $path || -L $path ]]; then
-            [[ -d $path && ! -L $path ]] || fail "Prune candidate is not a regular directory: $path"
-            verify_backup "$id" read-only
-        fi
-    done < <(sed -n 's/^delete_backup=//p' "$intent")
-
-    # Revalidate every WAL candidate before deleting even the first backup.
-    # Corruption anywhere in the authenticated plan must keep the entire prune
-    # operation side-effect free on its initial pass.
-    while IFS= read -r name; do
-        [[ -n $name ]] || continue
-        path="$wal_archive_dir/$name"
-        deleting="$wal_archive_dir/.deleting-$name"
-        [[ ! (( -e $path || -L $path ) && ( -e $deleting || -L $deleting )) ]] ||
-            fail "Both live and deleting WAL paths exist for intent candidate: $name"
-        if [[ -e $path || -L $path ]]; then
-            [[ -f $path && ! -L $path ]] || fail "WAL prune candidate is not a regular, non-symlink file: $path"
-        fi
-        if [[ -e $deleting || -L $deleting ]]; then
-            [[ -f $deleting && ! -L $deleting ]] || fail "WAL prune recovery candidate is not a regular, non-symlink file: $deleting"
-        fi
-    done < <(sed -n 's/^delete_wal=//p' "$intent")
-
-    while IFS= read -r id; do
-        [[ -n $id ]] || continue
-        path="$backup_dir/$id"
-        deleting="$backup_dir/.deleting-$id"
-        if [[ -e $path ]]; then mv "$path" "$deleting"; fsync_path "$backup_dir"; fi
-        if [[ -e $deleting ]]; then rm -rf -- "$deleting"; fsync_path "$backup_dir"; fi
-        printf '%s deleted authenticated backup %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" >>"$backup_dir/retention.log"
-    done < <(sed -n 's/^delete_backup=//p' "$intent")
-
-    verify_backup "$oldest" read-only
-    actual_boundary=$(authenticated_backup_label_boundary "$backup_dir/$oldest")
-    [[ $actual_boundary == "$boundary" ]] || fail 'Oldest retained backup failed revalidation; WAL was not touched.'
-    while IFS= read -r name; do
-        [[ -n $name ]] || continue
-        path="$wal_archive_dir/$name"
-        deleting="$wal_archive_dir/.deleting-$name"
-        if [[ -e $path ]]; then
-            mv "$path" "$deleting"
-            fsync_path "$wal_archive_dir"
-        fi
-        if [[ -e $deleting ]]; then
-            rm -f -- "$deleting"
-            fsync_path "$wal_archive_dir"
-            printf '%s deleted archived WAL %s (oldest retained start WAL=%s)\n' \
-                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$boundary" >>"$backup_dir/retention.log"
-        fi
-    done < <(sed -n 's/^delete_wal=//p' "$intent")
-    fsync_path "$wal_archive_dir"
-    [[ ! -e $backup_dir/retention.log ]] || fsync_path "$backup_dir/retention.log"
-    rm -f -- "$tag_file"
-    fsync_path "$backup_dir"
-    rm -f -- "$intent"
-    fsync_path "$backup_dir"
-}
-
-recover_or_discard_prune_intent() {
-    local image=$1 intent="$backup_dir/.oscar-backup-prune-intent" tag_file="$backup_dir/.oscar-backup-prune-intent.hmac" orphan
-    local has_intent=false has_tag=false
-    [[ -e $intent || -L $intent ]] && has_intent=true
-    [[ -e $tag_file || -L $tag_file ]] && has_tag=true
-    if $has_intent && $has_tag; then
-        finish_prune_intent "$image"
-        return
-    fi
-    if $has_intent || $has_tag; then
-        $has_intent && orphan=$intent || orphan=$tag_file
-        [[ -f $orphan && ! -L $orphan && $(file_owner_id "$orphan") == ${EUID:-$(id -u)} &&
-           $(file_mode "$orphan") == 600 ]] ||
-            fail 'Incomplete backup prune intent is unsafe; no deletion was attempted.'
-        rm -f -- "$orphan"
-        fsync_path "$backup_dir"
-        printf 'Discarded an incomplete authenticated-prune publication; no backup or WAL payload was deleted.\n'
-    fi
-}
-
-prune_backups() {
-    require_admin; require_configured; require_backup_key
-    local keep=$(env_value OSCAR_BACKUP_RETENTION_COUNT 14)
-    while (($#)); do
-        case $1 in --keep) keep=${2:?missing retention count}; shift 2 ;; *) fail "Unknown backup-prune option: $1" ;; esac
-    done
-    [[ $keep =~ ^[1-9][0-9]*$ && $keep -le 10000 ]] || fail 'Backup retention count must be between 1 and 10000.'
-    local verified=() delete_ids=() wal_names=() path backup_id index earliest_id boundary name image intent_source
-    local verified_count=0 delete_count=0 wal_count=0
-    image=$(oscar_image)
-    require_local_image "$image"
-    recover_or_discard_prune_intent "$image"
-    while IFS= read -r path; do
-        backup_id=${path##*/}
-        valid_backup_id "$backup_id" || continue
-        if [[ -f $path/VERIFIED && ! -L $path/VERIFIED ]]; then
-            verified+=("$path")
-            verified_count=$((verified_count + 1))
-        fi
-    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -type d -print | sort -r)
-
-    # Read-only preflight: every recovery point participating in the retention
-    # decision must authenticate and pass the complete offline verifier before
-    # an intent is persisted or any path is renamed.
-    if ((verified_count)); then
-        for path in "${verified[@]}"; do verify_backup "${path##*/}" read-only; done
-    else
-        printf 'No authenticated, verified backups exist; WAL archive was not pruned.\n'
-        return
-    fi
-    if ((verified_count > keep)); then
-        for ((index=keep; index<verified_count; index++)); do
-            delete_ids+=("${verified[index]##*/}")
-            delete_count=$((delete_count + 1))
-        done
-    fi
-    index=$(( verified_count < keep ? verified_count - 1 : keep - 1 ))
-    earliest_id=${verified[index]##*/}
-    boundary=$(authenticated_backup_label_boundary "$backup_dir/$earliest_id")
-    while IFS= read -r path; do
-        name=${path##*/}
-        [[ $name =~ ^[0-9A-F]{24}$ ]] || continue
-        [[ -f $path && ! -L $path ]] || fail "WAL prune candidate is not a regular, non-symlink file: $path"
-        if [[ $name < $boundary ]]; then
-            wal_names+=("$name")
-            wal_count=$((wal_count + 1))
-        fi
-    done < <(find "$wal_archive_dir" -mindepth 1 -maxdepth 1 -print)
-    if ((delete_count == 0 && wal_count == 0)); then
-        printf 'Backup retention complete; %s authenticated recovery point(s) remain and no WAL was eligible.\n' "$verified_count"
-        return
-    fi
-    intent_source=$(mktemp "${TMPDIR:-/tmp}/oscar-prune-intent.XXXXXX")
-    {
-        printf 'format=oscar-backup-prune-intent\nversion=1\n'
-        printf 'deployment_id=%s\n' "$(env_value OSCAR_DEPLOYMENT_ID '')"
-        printf 'retention=%s\noldest_retained=%s\nwal_boundary=%s\n' "$keep" "$earliest_id" "$boundary"
-        printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        if ((delete_count)); then
-            for backup_id in "${delete_ids[@]}"; do printf 'delete_backup=%s\n' "$backup_id"; done
-        fi
-        if ((wal_count)); then
-            for name in "${wal_names[@]}"; do printf 'delete_wal=%s\n' "$name"; done
-        fi
-    } >"$intent_source"
-    write_prune_intent "$intent_source" "$image"
-    rm -f -- "$intent_source"
-    finish_prune_intent "$image"
-    printf 'Backup retention complete; kept %s newest authenticated recovery point(s). WAL history required by the oldest retained backup was preserved.\n' "$keep"
-}
-
 restore_local_environment_keys() {
     printf '%s\n' \
         OSCAR_DEPLOYMENT_ID \
@@ -1693,7 +1817,7 @@ restore_local_environment_keys() {
         OSCAR_SECRETS_DIR \
         OSCAR_TLS_DIR \
         OSCAR_ARCHIVE_DIR \
-        OSCAR_WAL_ARCHIVE_DIR \
+        OSCAR_BACKUP_MODE \
         OSCAR_BACKUP_DIR \
         OSCAR_BACKUP_KEY_FILE
 }
@@ -1736,7 +1860,7 @@ merge_restored_environment() {
             fail "Target .env has an empty $name binding; restore was not installed."
         }
         case $name in
-            OSCAR_ARCHIVE_DIR|OSCAR_WAL_ARCHIVE_DIR|OSCAR_BACKUP_DIR)
+            OSCAR_ARCHIVE_DIR|OSCAR_BACKUP_DIR)
                 [[ $value == /* ]] || {
                     rm -f -- "$bindings" "$temporary"
                     fail "Target $name must be an absolute path before restore: $value"
@@ -1745,12 +1869,25 @@ merge_restored_environment() {
         esac
         awk -F= -v name="$name" '$1 == name { print; exit }' "$target" >>"$bindings"
     done < <(restore_local_environment_keys)
+    count=$(awk -F= '$1 == "OSCAR_WAL_ARCHIVE_DIR" { count++ } END { print count+0 }' "$target")
+    ((count <= 1)) || {
+        rm -f -- "$bindings" "$temporary"
+        fail 'Target .env contains duplicate OSCAR_WAL_ARCHIVE_DIR bindings before restore.'
+    }
+    if ((count == 1)); then
+        value=$(awk -F= '$1 == "OSCAR_WAL_ARCHIVE_DIR" { print substr($0, index($0, "=") + 1); exit }' "$target")
+        [[ $value == /* ]] || {
+            rm -f -- "$bindings" "$temporary"
+            fail "Target OSCAR_WAL_ARCHIVE_DIR must be an absolute path before restore: $value"
+        }
+        awk -F= '$1 == "OSCAR_WAL_ARCHIVE_DIR" { print; exit }' "$target" >>"$bindings"
+    fi
     value=$(awk -F= '$1 == "OSCAR_DEPLOYMENT_ID" { print substr($0, index($0, "=") + 1); exit }' "$bindings")
     valid_deployment_id "$value" || {
         rm -f -- "$bindings" "$temporary"
         fail 'Target OSCAR_DEPLOYMENT_ID is invalid; restore was not installed.'
     }
-    awk -F= '
+    awk -F= -v optional_name=OSCAR_WAL_ARCHIVE_DIR '
         NR == FNR {
             name=$1
             local_value[name]=$0
@@ -1763,6 +1900,7 @@ merge_restored_environment() {
                 if (!written[name]++) print local_value[name]
                 next
             }
+            if (name == optional_name) next
             print
         }
         END {
@@ -1838,7 +1976,7 @@ assert_restore_settings_removed_from_data_volume() {
 }
 
 confirm_clean_restored_postgres_runtime() {
-    local expected_timeline=$1 expected_failed_count=$2 status recovery timeline settings stats failed recent_failure
+    local expected_timeline=$1 expected_epoch_id=$2 status recovery timeline settings archive_mode receipt
     status=$(psql_admin --quiet --tuples-only --no-align --command \
         "SELECT CASE WHEN pg_is_in_recovery() THEN '1' ELSE '0' END||'|'||timeline_id FROM pg_control_checkpoint();")
     IFS='|' read -r recovery timeline <<<"$status"
@@ -1850,17 +1988,17 @@ confirm_clean_restored_postgres_runtime() {
     [[ $settings == '4|1' ]] ||
         fail "Restored PostgreSQL retained recovery settings after its cleanup restart: $settings"
 
-    stats=$(psql_admin --quiet --tuples-only --no-align --command \
-        "SELECT failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;")
-    IFS='|' read -r failed recent_failure <<<"$stats"
-    [[ $failed == "$expected_failed_count" && $recent_failure == 0 ]] ||
-        fail "PostgreSQL WAL archival health changed during the recovery-settings cleanup restart: $stats"
+    archive_mode=$(psql_admin --quiet --tuples-only --no-align --command 'SHOW archive_mode;' | tr -d '[:space:]')
+    [[ $archive_mode == off ]] || fail "Restored PostgreSQL unexpectedly enabled continuous WAL archiving: $archive_mode"
+    receipt=$(psql_admin --quiet --tuples-only --no-align --command \
+        "SELECT state FROM oscar_backup_epoch WHERE id='$expected_epoch_id'::uuid;" | tr -d '[:space:]')
+    [[ $receipt == VERIFIED ]] ||
+        fail 'The post-promotion VERIFIED receipt did not survive checkpoint and clean restart.'
 }
 
 prove_restored_postgres_timeline() {
     local source_timeline=$1 root=$2 backup_id=$3 epoch_id=$4 postgres_lsn=$5
-    local status recovery current stats archived_before failed_before failed_since_start
-    local segment segment_timeline history stats_now archived_now failed_now failed_now_since_start attempt
+    local status recovery current receipt
     [[ $source_timeline =~ ^[1-9][0-9]{0,9}$ ]] || fail 'Restore helper returned an invalid source PostgreSQL timeline.'
 
     status=$(psql_admin --quiet --tuples-only --no-align --command \
@@ -1869,49 +2007,24 @@ prove_restored_postgres_timeline() {
     [[ $recovery == 0 && $current =~ ^[1-9][0-9]{0,9}$ && $current -gt $source_timeline ]] ||
         fail "Restored PostgreSQL did not promote onto a fresh timeline (source=$source_timeline, status=$status)."
 
-    stats=$(psql_admin --quiet --tuples-only --no-align --command \
-        "SELECT archived_count||'|'||failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;")
-    IFS='|' read -r archived_before failed_before failed_since_start <<<"$stats"
-    [[ $archived_before =~ ^[0-9]+$ && $failed_before =~ ^[0-9]+$ && $failed_since_start == 0 ]] ||
-        fail 'PostgreSQL reported a WAL archival failure during restore promotion.'
-
     # Reconstruct the authenticated backup-verification catalog row that could
     # not be present in the base backup itself.  This semantic post-promotion
-    # write is deliberately made before switching WAL so the archival proof
-    # also proves the reconstructed receipt reached the new timeline.
+    # write is deliberately made before checkpointing so the clean-restart
+    # proof covers a semantic commit on the new timeline.
     upsert_verified_backup_epoch "$root" "$backup_id" "$epoch_id" "$postgres_lsn"
-    segment=$(psql_admin --quiet --tuples-only --no-align --command \
-        'SELECT pg_walfile_name(pg_switch_wal());')
-    [[ $segment =~ ^[0-9A-F]{24}$ ]] || fail "PostgreSQL returned an invalid post-restore WAL filename: $segment"
-    segment_timeline=$((16#${segment:0:8}))
-    [[ $segment_timeline -eq $current ]] ||
-        fail "Post-restore WAL segment did not use the promoted timeline: $segment"
+    receipt=$(psql_admin --quiet --tuples-only --no-align --command \
+        "SELECT state FROM oscar_backup_epoch WHERE id='$epoch_id'::uuid;" | tr -d '[:space:]')
+    [[ $receipt == VERIFIED ]] || fail 'Restored PostgreSQL did not commit the post-promotion VERIFIED receipt.'
     psql_admin --quiet --command 'CHECKPOINT;' >/dev/null
-    history=$(printf '%08X.history' "$current")
-
-    for attempt in {1..30}; do
-        stats_now=$(psql_admin --quiet --tuples-only --no-align --command \
-            "SELECT archived_count||'|'||failed_count||'|'||CASE WHEN coalesce(last_failed_time >= pg_postmaster_start_time(),false) THEN '1' ELSE '0' END FROM pg_stat_archiver;")
-        IFS='|' read -r archived_now failed_now failed_now_since_start <<<"$stats_now"
-        [[ $failed_now == "$failed_before" && $failed_now_since_start == 0 ]] ||
-            fail "PostgreSQL WAL archival failed after restore promotion (segment=$segment)."
-        if [[ $archived_now =~ ^[0-9]+$ && $archived_now -gt $archived_before &&
-              -f $wal_archive_dir/$segment && ! -L $wal_archive_dir/$segment &&
-              -f $wal_archive_dir/$history && ! -L $wal_archive_dir/$history ]]; then
-            clear_restore_recovery_settings
-            restored_promoted_timeline=$current
-            restored_archiver_failed_count=$failed_now
-            return 0
-        fi
-        sleep 1
-    done
-    fail "PostgreSQL did not durably archive the promoted timeline history and test segment ($history, $segment)."
+    clear_restore_recovery_settings
+    restored_promoted_timeline=$current
 }
 
 restore_backup() (
     require_admin; require_configured; require_backup_key
+    require_single_backup_mode
     local backup_id='' confirmation='' source_timeline restore_epoch_id restore_postgres_lsn restore_temp restore_stage
-    local restored_promoted_timeline='' restored_archiver_failed_count=''
+    local restored_promoted_timeline='' image current_id='' schema_version oscar_state_sha marker owner mode
     while (($#)); do
         case $1 in
             --backup) backup_id=${2:?missing backup id}; shift 2 ;;
@@ -1922,10 +2035,40 @@ restore_backup() (
     valid_backup_id "$backup_id" || fail 'A valid --backup ID is required.'
     [[ $confirmation == "$backup_id" ]] || fail "Restore is destructive. Re-run with --confirm $backup_id"
     assert_deployment_volume_ownership
+    image=$(oscar_image)
+    require_local_image "$image"
+    if [[ -e $backup_dir/CURRENT || -L $backup_dir/CURRENT ]]; then
+        current_id=$(validate_current_backup_pointer)
+        [[ $current_id == "$backup_id" ]] ||
+            fail 'Restore may use only the authenticated recovery point named by CURRENT.'
+    fi
+    recover_single_backup_state "$image"
     local root="$backup_dir/$backup_id"
     [[ -d $root ]] || fail "Backup does not exist: $root"
     require_restore_compatibility "$root"
-    verify_backup "$backup_id"
+    verify_backup "$backup_id" read-only
+    schema_version=$(backup_schema_version "$root")
+    if [[ $schema_version == 2 ]]; then
+        [[ $current_id == "$backup_id" ]] ||
+            fail 'Schema-version-2 restore requires its authenticated CURRENT pointer.'
+        marker="$root/VERIFIED"
+        [[ -f $marker && ! -L $marker ]] ||
+            fail 'Accepted schema-version-2 backup is missing a safe VERIFIED marker.'
+        owner=$(file_owner_id "$marker") || fail 'Cannot inspect the VERIFIED marker owner.'
+        mode=$(file_mode "$marker") || fail 'Cannot inspect the VERIFIED marker permissions.'
+        [[ $owner == ${EUID:-$(id -u)} && $mode == 600 &&
+           $(wc -l <"$marker" | tr -d '[:space:]') == 1 &&
+           $(sed -n '1p' "$marker") =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+            fail 'The schema-version-2 VERIFIED marker is malformed or unsafe.'
+        oscar_state_sha=$(awk '$2 == "./oscar-state.tar.gz" { print $1; exit }' "$root/SHA256SUMS")
+        [[ $oscar_state_sha =~ ^[0-9a-f]{64}$ ]] ||
+            fail 'Authenticated OSCAR-state checksum is missing from the recovery point.'
+        validate_journal_confirmation_receipt "$root" "$backup_id" "$oscar_state_sha" "$image"
+    else
+        # Schema v1 predates CURRENT/JOURNAL_CONFIRMED. Its immutable core must
+        # still pass the complete v1 verifier before acceptance and restore.
+        verify_backup "$backup_id"
+    fi
     require_restore_compatibility "$root"
     assert_deployment_volume_ownership
 
@@ -1933,10 +2076,10 @@ restore_backup() (
     restore_stage=$(mktemp -d "$backup_dir/.restore-payload-$backup_id.XXXXXX")
     restored_postgres_running=false
     chmod 0700 "$restore_temp" "$restore_stage"
-    mkdir "$restore_stage/postgres" "$restore_stage/wal-merge"
+    mkdir "$restore_stage/postgres"
     cp -a "$root/postgres/." "$restore_stage/postgres/"
-    cp -a "$root/oscar-state.tar.gz" "$root/archive.tar.gz" "$root/wal-archive.tar.gz" "$restore_stage/"
-    chown -R 999:999 "$restore_stage/postgres" "$restore_stage/wal-merge" "$restore_stage/wal-archive.tar.gz"
+    cp -a "$root/oscar-state.tar.gz" "$root/archive.tar.gz" "$restore_stage/"
+    chown -R 999:999 "$restore_stage/postgres"
     chown 10001:10001 "$restore_stage/oscar-state.tar.gz" "$restore_stage/archive.tar.gz"
     find "$restore_stage" -type d -exec chmod 0700 {} +
     find "$restore_stage" -type f -exec chmod 0600 {} +
@@ -1953,19 +2096,6 @@ restore_backup() (
         "oscar:$required_release_version" -eu -c \
         'openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/backup-key.txt -in /backup/deployment-secrets.tar.gz.enc | tar -C /restore -xzf -'
     prepare_restored_credentials_exact "$restore_temp" "$script_dir"
-
-    # Merge the authenticated WAL snapshot before making a safety copy,
-    # stopping services, or replacing any live state. The helper performs a
-    # complete collision/type preflight before append-only publication, so a
-    # mismatched live name aborts while all replaceable deployment data is
-    # untouched.
-    assert_storage_root_identities
-    docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 999:999 --entrypoint /usr/local/bin/oscar-merge-wal-restore \
-        --volume "$wal_archive_dir:/wal-archive" --volume "$restore_stage/wal-merge:/wal-merge" \
-        --volume "$restore_stage/wal-archive.tar.gz:/restore-wal.tar.gz:ro" "$(postgres_image)" \
-        /restore-wal.tar.gz /wal-archive /wal-merge
-    assert_storage_root_identities
 
     local safety="$script_dir/pre-restore-$backup_id"
     heading "Restoring backup $backup_id"
@@ -2005,7 +2135,7 @@ restore_backup() (
     assert_restore_settings_removed_from_data_volume
     compose up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 postgres
     restored_postgres_running=true
-    confirm_clean_restored_postgres_runtime "$restored_promoted_timeline" "$restored_archiver_failed_count"
+    confirm_clean_restored_postgres_runtime "$restored_promoted_timeline" "$restore_epoch_id"
     restored_postgres_running=false
     compose up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 oscar gateway
     trap - EXIT
@@ -2640,7 +2770,6 @@ OSCAR storage administration
 
   backup
   backup-verify <backup-id>
-  backup-prune [--keep COUNT]
   restore --backup <backup-id> --confirm <backup-id>
   archive status
   archive verify
@@ -2657,15 +2786,27 @@ EOF
 
 case $storage_command in
     help|-h|--help) ;;
+    backup|backup-verify|backup-prune|restore)
+        require_supported_storage_host
+        require_admin
+        require_configured
+        require_single_backup_mode
+        acquire_storage_admin_lock
+        ;;
     *) require_supported_storage_host; require_admin; require_configured; acquire_storage_admin_lock ;;
 esac
 
 case $storage_command in
     help|-h|--help|prepare-directories) ;;
     backup-verify) validate_offline_backup_directory ;;
-    *)
+    backup|restore)
         validate_storage_directories
         assert_storage_root_identities
+        assert_deployment_volume_ownership
+        ;;
+    archive)
+        validate_archive_directory
+        assert_archive_root_identity
         assert_deployment_volume_ownership
         ;;
 esac
@@ -2673,7 +2814,7 @@ esac
 case $storage_command in
     backup) create_backup ;;
     backup-verify) verify_backup "${1:-}" ;;
-    backup-prune) prune_backups "$@" ;;
+    backup-prune) fail 'backup-prune is retired in single-backup mode; each successful backup atomically replaces CURRENT and then retires the previous snapshot.' ;;
     restore) restore_backup "$@" ;;
     prepare-directories) prepare_storage_directories "$@" ;;
     archive)

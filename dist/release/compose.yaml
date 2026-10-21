@@ -129,20 +129,13 @@ services:
       - -c
       - wal_compression=on
       - -c
-      - archive_mode=on
-      - -c
-      - archive_timeout=300s
-      - -c
-      - archive_command=/usr/local/bin/oscar-archive-wal "%p" "%f" /var/lib/postgresql/wal-archive
+      - archive_mode=off
       - -c
       - track_io_timing=on
       - -c
       - shared_preload_libraries=pg_stat_statements
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - type: bind
-        source: ${OSCAR_WAL_ARCHIVE_DIR:-../oscar-storage/wal-archive}
-        target: /var/lib/postgresql/wal-archive
     read_only: true
     tmpfs:
       - /tmp

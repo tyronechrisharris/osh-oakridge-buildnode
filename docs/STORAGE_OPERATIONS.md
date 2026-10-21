@@ -1,7 +1,7 @@
 # OSCAR 3.9.2 storage operations
 
-This is the administrator runbook for OSCAR's PostgreSQL hot store, Parquet cold tier, direct daily
-journal, retained media, WAL archive, and coordinated backups. Commands assume the extracted 3.9.2
+This is the administrator runbook for OSCAR's PostgreSQL hot store, primary Parquet cold tier,
+direct daily journal, retained media, and optional single coordinated snapshot. Commands assume the extracted 3.9.2
 release directory is the current directory.
 
 For design rationale see [Storage architecture](STORAGE_ARCHITECTURE.md). For exact state
@@ -19,7 +19,7 @@ fallback.
    permanent data loss is authorized and a verified backup is retained.
 2. Never edit `.open`/`.seg` journal files, published daily CSVs/manifests, retained-media internals,
    Parquet files, or generation manifests in place.
-3. Run `archive verify` before enabling hot deletion, exporting evidence, or creating a cold purge
+3. Run `archive verify` before relying on hot deletion, exporting evidence, or creating a cold purge
    plan.
 4. Use `archive dry-run` and its one-time token for cold deletion. Do not substitute `rm`, Explorer,
    storage-array expiration, or a generic object-store lifecycle.
@@ -48,7 +48,7 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Daily-file cleanup work limit | 50 lane/day attempts per invocation | Bounds both the midnight attempt and each hourly manifest-gated retry while an outage backlog converges oldest-first |
 | Database `idProviderType` | `SEQUENTIAL` | Required for exact, race-free archive ownership |
 | Database batch | 10,000 rows / 1 s | Bounded insert transaction and commit period |
-| Archive hot retention | 30 days | Age before eligible detector streams are copied to cold storage |
+| Archive hot retention | 2 days | Age before the five allowlisted high-volume detector streams are copied to cold storage |
 | Archive interval | 60 min | Background cycle frequency |
 | Archive catch-up bound | 24 generations / 15 min | Stops starting new generations at the first bound; in-progress publication completes safely |
 | Maximum generation | 2,000,000 rows / 2 GiB estimated uncompressed bytes | A UTC window is halved down to one second while either cap is exceeded; an irreducible prefix fails closed with hot rows retained |
@@ -56,15 +56,24 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | DuckDB session admission | 2 process-wide / 30 s wait | Fairly bounds the aggregate native-memory/CPU/spill multiplier; excess work fails busy and can be retried instead of opening an unbounded connection |
 | DuckDB spill | 4 GiB per operation in `/var/lib/oscar/duckdb-tmp` | Each connection gets a mode-0700 private child that is removed on close; scratch must be disjoint from the immutable archive and is excluded from backup |
 | Parquet compression | ZSTD level 6 | Cold-storage size/CPU tradeoff |
-| Archive rollback grace | 7 days | Minimum active overlap after parity before hot deletion |
-| `deleteHotAfterArchive` | `false` | Copy-only rollout; no archived hot rows are removed |
-| Video retention age | 7 days | Age before source video is converted to retained evidence |
+| Archive rollback grace | 1 day | Verified hot/cold overlap after activation before exact hot-row deletion |
+| `deleteHotAfterArchive` | `true` | Deletes only generation-owned eligible rows after parity and overlap, normally about 72 hours after observation plus scheduling |
+| Video retention age | 0 days | Processes a source video on the first eligible lifecycle cycle |
 | Retained evidence | exactly 5 JPEGs, quality 85 | First, quarter, middle, three-quarter, and last decoded frames |
 | Source-video rollback grace | 24 h | MP4 preserved after a successful five-frame publication |
 | Storage pressure | trigger 85%, target 80% | Removes only eligible cataloged media sets |
 | Pressure minimum age | 10 min | Prevents immediate removal of newly published sets |
-| Verified local backup retention | 14 backups | A newly created and verified backup prunes older verified backups by count |
-| Automatic backup pruning | `true` | Runs only after creating a new backup and also prunes WAL older than the oldest retained base-backup start boundary |
+| Backup mode | `disabled` | Backup creation, verification, restore, and retired prune command require explicit `single` opt-in |
+| Local recovery snapshots | 1 authenticated current snapshot | New schema-v2 snapshot commits through `CURRENT`; prior verified snapshot is cleaned only after commit |
+
+The one-snapshot value is steady state. Creating its replacement temporarily requires capacity for
+the old snapshot and the complete new candidate until authenticated `CURRENT` commits. A crash may
+leave non-current or private staging debris; the next locked storage command reconciles it using
+authenticated `CURRENT` before proceeding. Before the first `CURRENT` exists, cleanup instead
+authenticates and retires only uncommitted schema-v2 candidates and preserves/restores schema-v1
+recovery points. It durably marks an authenticated uncommitted schema-v2 candidate as
+`.deleting-uncommitted-v2-<backup-id>` before recursive removal, so restart can safely resume a
+partially completed cleanup; an unsafe or dangling `CURRENT` entry stops cleanup without mutation.
 
 `delegateObservationLifecycleToDatabase=true` disables the old occupancy-gated high-volume purge so
 the tiered database owns gamma/neutron lifecycle. It does not disable connection-status maintenance
@@ -76,46 +85,51 @@ the file shipped in the ZIP became active.
 
 ## New installation and storage paths
 
-For a new 3.9.2 production system, put these `.env` paths on durable filesystems with monitoring and
-backup:
+For a new 3.9.2 production system, keep the live archive on durable monitored storage. Backup mode
+is disabled until an administrator deliberately selects a secondary-drive backup path:
 
 ```dotenv
 OSCAR_ARCHIVE_DIR=/absolute/path/to/oscar-storage/archive
-OSCAR_WAL_ARCHIVE_DIR=/absolute/path/to/oscar-storage/wal-archive
+OSCAR_BACKUP_MODE=disabled
 OSCAR_BACKUP_DIR=/absolute/path/to/oscar-storage/backups
 OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt
 ```
 
-The three absolute storage roots are managed host paths, not backup payload placement instructions.
-Archive and WAL are long-lived service bind mounts. The administrator-owned backup root is never
-mounted into a long-running service and is exposed only to narrowly scoped one-shot helpers.
+The absolute storage roots are managed host paths, not backup payload placement instructions.
+Archive is the live service bind. PostgreSQL runs with `archive_mode=off`, no archive command, and no
+external WAL bind. An existing `OSCAR_WAL_ARCHIVE_DIR` binding is retained only as an inactive
+compatibility location; fresh deployments do not add one. After `single` opt-in, the administrator-owned backup root is never mounted
+into a long-running service and is exposed only to narrowly scoped one-shot helpers.
 During either same-host or cross-host restore, OSCAR preserves those target roots along with the
 target deployment ID, platform, and HTTPS endpoint while it restores source data, credentials, TLS
-material, and portable configuration. A backup created under another host's archive/WAL/backup
-roots therefore cannot redirect the target after restore.
+material, and portable configuration. A backup created under another host's storage paths therefore
+cannot redirect the target after restore.
 
-The credential settings shown above are different: `./secrets`, `./tls`, and
-`./secrets/backup-key.txt` are the only supported bindings because backup, safety-copy, and atomic
-install operations use those release-relative locations. Setup/upgrade, backup, and restore reject
-custom values before starting services or changing data. See [Backup and restore](BACKUP_RESTORE.md#same-host-and-cross-host-environment-policy).
+The credential settings shown above are different: `./secrets` and `./tls` are always canonical;
+when `single` is selected, `./secrets/backup-key.txt` is canonical too. Backup, safety-copy, and
+atomic install operations use those release-relative locations. Setup/upgrade, backup, and restore
+reject custom active values before starting services or changing data. See [Backup and restore](BACKUP_RESTORE.md#same-host-and-cross-host-environment-policy).
 
 Initialization converts the shipped sibling defaults into absolute paths under an `oscar-storage`
-directory next to the versioned release directory, persists those absolute values in `.env`, creates
-the directories, assigns the stable container UIDs used by the release, creates an external backup
-key, initializes a new PostgreSQL cluster with data checksums, and starts the services. A site may
-set different absolute paths before initialization. Custom relative paths are rejected because they
-would resolve against a different directory after a clean-release upgrade.
+directory next to the versioned release directory and persists those absolute values in `.env`.
+Fresh `disabled` mode creates only the service-owned archive root; it does not create the backup
+root, backup key, or legacy-WAL compatibility root. Explicit `single` mode additionally creates the
+administrator-owned backup root and generates the external backup key. Neither mode creates,
+mounts, or writes the retired legacy-WAL compatibility root; an existing root is preserved
+unchanged. Both modes initialize a new PostgreSQL cluster with data checksums and start
+the services. A site may select different absolute paths through the supported setup options.
+Custom relative paths are rejected because they would resolve against a different directory after
+a clean-release upgrade.
 
-When moving to a later release, copy the existing `.env`; do not replace its three absolute storage
-roots with the new `.env.example` values. The new release will therefore mount the same archive and
-WAL paths and continue using the same external backup root even when it is extracted into a
-different sibling directory. Confirm the archive/WAL sources with `docker compose config`, then
-confirm the backup root directly from the single `OSCAR_BACKUP_DIR` entry in `.env` before starting
-the upgrade.
+When moving to a later release, copy the existing `.env`; do not replace its absolute storage roots
+or backup-mode policy with the new `.env.example` values. The new release will reuse the archive,
+preserve legacy WAL and backup data, and continue using the selected external backup root even when
+it is extracted into a different sibling directory. Confirm that Compose mounts only the archive,
+then confirm `OSCAR_BACKUP_MODE` and `OSCAR_BACKUP_DIR` directly from `.env` before upgrading.
 
-Each configured storage root must be a dedicated directory at least two path components below its
-filesystem/volume root. The archive, backup, and WAL roots must not equal, contain, or overlap one
-another; none may be inside or broad enough to contain the versioned release directory, and none
+Each active storage root must be a dedicated directory at least two path components below its
+filesystem/volume root. The archive and backup roots must not equal, contain, or overlap one
+another; neither may be inside or broad enough to contain the versioned release directory, and neither
 may contain the administrator's home/profile directory. Existing path components must not be
 symbolic links, junctions, or reparse points. Both
 launchers enforce these rules before privileged storage work and again after initialization creates
@@ -126,21 +140,21 @@ The Ubuntu launcher resolves its own release directory to a physical path and re
 launcher file before reading deployment configuration. The Windows launcher rejects every junction,
 symbolic link, or other reparse point in its launcher/release path and resolves each storage root
 through its nearest existing physical ancestor before containment comparisons. A release-directory
-alias therefore cannot hide an archive, backup, or WAL root located inside the release (or a release
+alias therefore cannot hide an active archive or backup root located inside the release (or a release
 located inside one of those roots).
 
-Each root also has an administrator-owned `.oscar-storage-root` identity with format
-`oscar-storage-root-identity`, version `1`, the deployment UUID, root kind (`archive`, `backup`, or
-`wal-archive`), claim time, and explicit-adoption audit fields. A missing marker on a nonempty root,
+Each active root also has an administrator-owned `.oscar-storage-root` identity with format
+`oscar-storage-root-identity`, version `1`, the deployment UUID, root kind (`archive` or `backup`),
+claim time, and explicit-adoption audit fields. A missing marker on a nonempty active root,
 a foreign deployment UUID, a swapped root kind, unsafe ownership/ACL, or a symlink/reparse-point
-marker is a hard failure. Ubuntu archive and WAL roots are root-owned service-group directories mode
-`1770`, keeping service writes possible while the sticky bit protects the root-owned marker; the
+marker is a hard failure. The Ubuntu archive root is a root-owned service-group directory mode
+`1770`; the sticky bit protects the root-owned marker. The
 backup root is root-only mode `0700`. Windows uses a protected administrator ACL; `docker-users`
 has the read/execute access required by the confined Docker helper and must be treated as a
-Docker-engine-equivalent privileged group. Every live database/archive command and `backup-prune`
-validates all root and Docker-volume identities. `backup-verify` alone may run offline without
-them. It is an acceptance mutation that publishes/replaces `VERIFIED` and normalizes backup
-permissions; any optional live-catalog write is separately volume-ownership-gated.
+Docker-engine-equivalent privileged group. Backup commands require `OSCAR_BACKUP_MODE=single` and
+validate the applicable roots and Docker-volume identities. `backup-verify` may run with services
+offline, but not while the deployment policy is disabled. It publishes/replaces `VERIFIED` and
+normalizes permissions; any optional live-catalog write is separately volume-ownership-gated.
 
 An upgrade may adopt a verified, nonempty legacy root exactly once with
 `--adopt-legacy-storage-roots` on Ubuntu or `-AdoptLegacyStorageRoots` on Windows. Setup records
@@ -191,10 +205,11 @@ Do not erase an old production volume simply to make the 3.9.2 module start.
 
 ## Production rollout
 
-### Phase 1: copy-only archive
+### Phase 1: validate the primary cold tier
 
-Keep `deleteHotAfterArchive=false`, which is the shipping default. Run long enough to create
-multiple generations across representative lane/output rates. Check:
+The shipping profile archives only the five allowlisted high-volume outputs after 48 hours and,
+after successful parity plus a 24-hour overlap, deletes their exact generation-owned hot rows.
+Run long enough to create multiple generations across representative lane/output rates. Check:
 
 ```sh
 sudo bash oscar.sh archive status
@@ -214,20 +229,25 @@ Review parity receipts and failed archive jobs with the queries below.
 
 ### Phase 2: recovery acceptance
 
-Create and verify a coordinated backup, copy it off-host, restore it on an isolated test deployment,
-and run the full OSCAR regression suite. Confirm that the restored archive, journal, daily files,
-media, and mixed-tier queries match the source system. See
+If the site requires OSCAR-managed recovery snapshots, opt in explicitly:
+
+```sh
+sudo bash oscar.sh upgrade --backup-mode single --backup-dir /absolute/secondary/oscar-backups
+```
+
+```powershell
+.\oscar.bat upgrade -BackupMode single -BackupDir D:\oscar-backups
+```
+
+Create and verify the single coordinated snapshot, copy it off-host, restore it on an isolated test
+deployment, and run the full OSCAR regression suite. Confirm that the restored archive, journal,
+daily files, media, and mixed-tier queries match the source system. See
 [Backup and restore](BACKUP_RESTORE.md).
 
-### Phase 3: controlled hot deletion
+### Phase 3: validate hot deletion
 
-Only after Phases 1 and 2 pass, change the running **PostGIS Hot/Cold Database** module's nested
-archive setting to `deleteHotAfterArchive=true` through SensorHub Admin, save the global
-configuration, and restart in a planned window. Preserve `requireParityReceipt=true` and a rollback
-grace suitable for the site.
-
-The next lifecycle cycles delete only exact generation-owned IDs with a successful parity receipt,
-in bounded batches, after grace. Watch PostgreSQL row count, WAL, database size, archive receipts,
+The lifecycle deletes only exact generation-owned IDs with a successful parity receipt, in bounded
+batches, after the one-day grace. Watch PostgreSQL row count, WAL generation, database size, archive receipts,
 query latency, and logs. PostgreSQL may not immediately return deleted heap space to the filesystem;
 normal autovacuum reuses it. Do not run an unplanned `VACUUM FULL`, which takes strong locks and can
 cause a major outage.
@@ -249,11 +269,13 @@ portable/off-site copies.
 | Verify all active archive objects | `sudo bash oscar.sh archive verify` | `.\oscar.bat archive verify` |
 | Coordinated backup | `sudo bash oscar.sh backup` | `.\oscar.bat backup` |
 | Verify backup | `sudo bash oscar.sh backup-verify ID` | `.\oscar.bat backup-verify -BackupId ID` |
-| Prune verified backups/WAL | `sudo bash oscar.sh backup-prune --keep 14` | `.\oscar.bat backup-prune -Keep 14` |
 | List retention holds | `sudo bash oscar.sh archive hold list` | `.\oscar.bat archive hold list` |
 
-The archive and backup commands require a configured deployment. Mutating commands also require
-root/Administrator privileges.
+The archive commands require a configured deployment. Backup, verification, and restore additionally
+require `OSCAR_BACKUP_MODE=single`; disabled mode returns opt-in guidance before any mutation.
+Mutating commands also require root/Administrator privileges. `backup-prune` is retired, hidden from
+launcher menus, and retained only as a no-op compatibility command that explains the one-snapshot
+`CURRENT` model.
 
 The coordinated backup excludes the reserved `/var/lib/oscar/duckdb-tmp` path exactly. Keep that
 default for scratch stored in OSCAR's persistent state. A custom DuckDB temporary parent is valid
@@ -617,7 +639,7 @@ emulator traffic. Verify the current checkpoint first, then provision the lane f
 order was not followed, recreate the disposable database and application state or allow normal
 oldest-first catch-up; checkpoint deletion is not an accepted shortcut.
 
-For an event older than the configured seven-day retention age:
+For an event reached by the first eligible retained-media cycle:
 
 - Event Details should show five labeled still frames per successfully retained camera;
 - each frame endpoint should return `image/jpeg` only to an authenticated user with `videos` GET
@@ -657,10 +679,10 @@ Container CPU and memory snapshot:
 docker stats --no-stream
 ```
 
-Confirm the effective archive and WAL bind sources first. `init` persists absolute paths in `.env`;
-the `source:` entries printed here are authoritative for those two long-lived mounts and must not
-point inside the versioned release directory. `OSCAR_BACKUP_DIR` does not appear as a long-lived
-Compose mount; confirm its single absolute `.env` value separately.
+Confirm the effective archive bind source first. `init` persists absolute paths in `.env`; the
+archive `source:` printed here is authoritative and must not point inside the versioned release
+directory. There must be no PostgreSQL WAL bind. `OSCAR_BACKUP_DIR` also does not appear as a
+long-lived Compose mount; confirm its single absolute `.env` value separately when mode is `single`.
 
 ```sh
 docker compose config
@@ -677,16 +699,15 @@ docker compose exec -T oscar sh -c \
    printf "cold_archive_files="; find /var/lib/oscar/archive -xdev -type f | wc -l; \
    df -h /var/lib/oscar/archive /var/lib/oscar'
 docker compose exec -T postgres sh -c \
-  'du -sh /var/lib/postgresql/data /var/lib/postgresql/wal-archive; df -h /var/lib/postgresql/data /var/lib/postgresql/wal-archive'
+  'du -sh /var/lib/postgresql/data; df -h /var/lib/postgresql/data'
 sudo du -sh -- \
   "$(awk -F= '$1=="OSCAR_ARCHIVE_DIR" {print substr($0,index($0,"=")+1)}' .env)" \
-  "$(awk -F= '$1=="OSCAR_WAL_ARCHIVE_DIR" {print substr($0,index($0,"=")+1)}' .env)" \
   "$(awk -F= '$1=="OSCAR_BACKUP_DIR" {print substr($0,index($0,"=")+1)}' .env)"
 ```
 
 Trend the file counts as well as bytes and inodes. Coordinated-backup archive validation uses a
 bounded 256 MiB private tmpfs; its scratch demand grows with tar member count and path length, not
-with compressed media or WAL bytes. Treat an abrupt cardinality increase as an operational signal,
+with compressed media bytes. Treat an abrupt cardinality increase as an operational signal,
 and run `backup-verify` and an isolated restore against a representative high-watermark backup
 before adopting a materially larger retention window. See
 [Backup and restore](BACKUP_RESTORE.md#verify-a-backup) for the fail-closed limit and response.
@@ -741,7 +762,7 @@ Track at least:
 
 - hot database total/index/table size and dead tuples;
 - archive bytes, generation backlog, export duration/failures, and parity latency;
-- WAL archive growth and archive-command failures;
+- PostgreSQL `pg_wal` pressure, checkpoints, and `archive_mode=off` configuration drift;
 - journal force/publication errors and time since last daily manifest per lane;
 - media conversion success/failure, source-grace backlog, and pressure-deletion results;
 - OSCAR/PostgreSQL CPU, resident memory, disk latency, and filesystem saturation;
@@ -769,7 +790,7 @@ Track at least:
 | Retained-media lane parent cannot be resolved | No new manifest; source and retry state remain | Verify the RPM/camera systems are members of the intended OSH lane and that the deployed PostgreSQL datastore supports `getParent`; do not relabel an existing manifest by hand |
 | Media publication fails | Partial set stays invisible; source preserved; retry ledger records failure | Check FFmpeg, source integrity, filesystem/rename/space; allow idempotent retry |
 | Pressure cleanup cannot reach target | Protected data stays; error is logged | Add capacity or perform approved cold/media retention; never remove journal/adjudication files ad hoc |
-| WAL archive path full/unwritable | PostgreSQL retries archiving and local `pg_wal` can grow | Restore archive path immediately, verify PostgreSQL logs and backup chain; use verified-backup pruning rather than deleting WAL blindly |
+| PostgreSQL reports archiver activity or an external WAL mount | Deployment drifted from the 3.9.2 profile | Stop rollout, preserve legacy data, restore `archive_mode=off`/no-WAL-bind configuration through the supported release, and requalify backup/restore |
 | Backup fails | `.partial` or finalized-but-unverified directory remains; services are resumed where possible | Check `status`, preserve diagnostics, correct the cause, then re-verify or run a new backup |
 | Restore fails | Deployment may remain stopped/partial | Keep producers disconnected; preserve `pre-restore-*`; repair cause and repeat from the same verified backup or escalate |
 | PostgreSQL shutdown errors appear during OSCAR stop/restart | Qualification fails; OSCAR may not complete its database-backed module drain | Use the release `oscar` launcher, which stops gateway, OSCAR, and PostgreSQL sequentially; confirm the media-retention cancellation log completes, preserve logs, and do not substitute an unscoped multi-service Compose stop/restart |
@@ -786,7 +807,7 @@ At least monthly, and before changing retention:
 6. Sample retained media across cameras, including source deletion after grace and legacy fallback.
 7. Review orphaned partials/unregistered files without deleting them until ownership is established.
 8. Verify the newest backup, off-site copy, and encryption-key escrow.
-9. Review WAL/archive/backup growth and the tested recovery chain.
+9. Review PostgreSQL WAL generation, archive/backup growth, and the tested endpoint-recovery snapshot.
 10. Compare CPU, memory, disk latency, WAL, and query latency with the prior baseline.
 11. Record findings, corrective actions, owner, and deadline in the site's operations system.
 

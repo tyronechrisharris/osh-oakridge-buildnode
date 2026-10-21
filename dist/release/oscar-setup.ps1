@@ -19,6 +19,9 @@ param(
     [switch]$SkipStart,
     [switch]$AdoptLegacyVolumes,
     [switch]$AdoptLegacyStorageRoots,
+    [ValidateSet('disabled', 'single')]
+    [string]$BackupMode,
+    [string]$BackupDir,
     [ValidateSet('auto', 'existing', 'bundled')]
     [string]$Prerequisites = 'auto',
     [ValidateSet('all', 'oscar', 'postgres', 'gateway')]
@@ -408,6 +411,22 @@ function Get-ConfiguredEnvValue([string]$Name) {
     return $null
 }
 
+function Get-ValidatedBackupMode([switch]$AllowMissing) {
+    $envPath = Join-Path $ScriptRoot '.env'
+    if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
+        if ($AllowMissing) { return $null }
+        throw 'Deployment .env is missing OSCAR_BACKUP_MODE.'
+    }
+    $matches = @([IO.File]::ReadAllLines($envPath) | Where-Object { $_.StartsWith('OSCAR_BACKUP_MODE=', [StringComparison]::Ordinal) })
+    if ($matches.Count -eq 0 -and $AllowMissing) { return $null }
+    if ($matches.Count -ne 1) { throw 'Deployment .env must contain exactly one literal OSCAR_BACKUP_MODE binding.' }
+    $value = $matches[0].Substring('OSCAR_BACKUP_MODE='.Length)
+    if ($value -cnotin @('disabled', 'single')) {
+        throw 'OSCAR_BACKUP_MODE must be the literal lowercase value disabled or single.'
+    }
+    return $value
+}
+
 function Test-FullyQualifiedDeploymentPath([string]$Value) {
     if (-not $Value -or -not [IO.Path]::IsPathRooted($Value)) { return $false }
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
@@ -425,7 +444,10 @@ function Assert-UniqueLiteralEnvironmentKeys {
         throw 'Deployment .env must be a regular, non-reparse-point file.'
     }
     $lines = [IO.File]::ReadAllLines($envPath)
-    foreach ($name in @('OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR', 'OSCAR_WAL_ARCHIVE_DIR')) {
+    $mode = Get-ValidatedBackupMode
+    $required = @('OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_MODE')
+    if ($mode -ceq 'single') { $required += 'OSCAR_BACKUP_DIR' }
+    foreach ($name in $required) {
         $matches = @($lines | Where-Object { $_.StartsWith("$name=", [StringComparison]::Ordinal) })
         if ($matches.Count -ne 1) { throw "Deployment .env must contain exactly one literal $name binding." }
         $value = $matches[0].Substring($name.Length + 1)
@@ -443,7 +465,7 @@ function Assert-UpgradeableEnvironmentBindings {
         throw 'Deployment .env must be a regular, non-reparse-point file.'
     }
     $lines = [IO.File]::ReadAllLines($envPath)
-    foreach ($name in @('OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR', 'OSCAR_WAL_ARCHIVE_DIR')) {
+    foreach ($name in @('OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR', 'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_BACKUP_MODE')) {
         $matches = @($lines | Where-Object { $_.StartsWith("$name=", [StringComparison]::Ordinal) })
         if ($name -ceq 'OSCAR_VERSION') {
             if ($matches.Count -ne 1) { throw 'Upgrade source .env must contain exactly one literal OSCAR_VERSION binding.' }
@@ -456,6 +478,9 @@ function Assert-UpgradeableEnvironmentBindings {
             if (-not $value -or $interpreted -or @($value.ToCharArray() | Where-Object { [char]::IsWhiteSpace($_) }).Count -ne 0) {
                 throw "Upgrade source .env contains a Compose-interpreted or nonliteral $name value."
             }
+            if ($name -ceq 'OSCAR_BACKUP_MODE' -and $value -cnotin @('disabled', 'single')) {
+                throw 'OSCAR_BACKUP_MODE must be the literal lowercase value disabled or single.'
+            }
         }
     }
 }
@@ -463,13 +488,40 @@ function Assert-UpgradeableEnvironmentBindings {
 function Assert-ManagedEnvironmentBindings {
     Assert-UniqueLiteralEnvironmentKeys
     Assert-CanonicalCredentialBindings
-    foreach ($name in @('OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR', 'OSCAR_WAL_ARCHIVE_DIR')) {
+    $pathNames = @('OSCAR_ARCHIVE_DIR')
+    if ((Get-ValidatedBackupMode) -ceq 'single') { $pathNames += 'OSCAR_BACKUP_DIR' }
+    foreach ($name in $pathNames) {
         $value = Get-ConfiguredEnvValue $name
         if (-not (Test-FullyQualifiedDeploymentPath $value)) { throw "$name must be an absolute stable storage-root path." }
     }
 }
 
+function Initialize-UpgradeBackupMode {
+    $mode = Get-ValidatedBackupMode -AllowMissing
+    if (-not $mode) {
+        Set-EnvValue 'OSCAR_BACKUP_MODE' 'single'
+        Write-Host 'Normalized the legacy deployment to OSCAR_BACKUP_MODE=single so its existing backup policy is preserved.'
+        return 'missing'
+    }
+    return $mode
+}
+
+function Set-RequestedBackupConfiguration([string]$SourceMode, [switch]$Fresh) {
+    $targetMode = if ($BackupMode) { $BackupMode } elseif ($Fresh) { 'disabled' } elseif ($SourceMode -ceq 'missing') { 'single' } else { $SourceMode }
+    if ($targetMode -cnotin @('disabled', 'single')) { throw 'OSCAR_BACKUP_MODE must be disabled or single.' }
+    if ($BackupDir -and $targetMode -cne 'single') { throw '-BackupDir may be used only with -BackupMode single.' }
+    if (($Fresh -and $targetMode -ceq 'single') -or ($SourceMode -ceq 'disabled' -and $targetMode -ceq 'single')) {
+        if (-not $BackupDir) { throw 'Enabling single-backup mode requires -BackupDir with an absolute dedicated backup path.' }
+    }
+    if ($BackupDir) {
+        if (-not (Test-FullyQualifiedDeploymentPath $BackupDir)) { throw '-BackupDir must be an absolute path on a local volume.' }
+        Set-EnvValue 'OSCAR_BACKUP_DIR' ([IO.Path]::GetFullPath($BackupDir))
+    }
+    Set-EnvValue 'OSCAR_BACKUP_MODE' $targetMode
+}
+
 function Initialize-LegacyBackupKeyBinding {
+    if ((Get-ValidatedBackupMode) -cne 'single') { return }
     $envPath = Join-Path $ScriptRoot '.env'
     if (-not (Test-Path -LiteralPath $envPath -PathType Leaf) -or
         ((Get-Item -LiteralPath $envPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -500,8 +552,8 @@ function Assert-CanonicalCredentialBindings {
     $expectedBindings = [ordered]@{
         OSCAR_SECRETS_DIR = './secrets'
         OSCAR_TLS_DIR = './tls'
-        OSCAR_BACKUP_KEY_FILE = './secrets/backup-key.txt'
     }
+    if ((Get-ValidatedBackupMode) -ceq 'single') { $expectedBindings['OSCAR_BACKUP_KEY_FILE'] = './secrets/backup-key.txt' }
     foreach ($entry in $expectedBindings.GetEnumerator()) {
         $matches = @($lines | Where-Object { $_ -match "^$([Regex]::Escape($entry.Key))=" })
         $value = if ($matches.Count -eq 1) { $matches[0].Substring($entry.Key.Length + 1) } else { $null }
@@ -514,13 +566,13 @@ function Assert-CanonicalCredentialBindings {
 function Initialize-StoragePaths {
     # Storage must outlive a versioned release directory. Persist absolute
     # sibling paths in .env so moving to a clean release cannot silently attach
-    # empty archive/WAL/backup directories.
+    # empty archive/backup directories. The retired legacy WAL root is left
+    # byte-for-byte untouched so upgrades never claim or write it.
     $stableRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $ScriptRoot) 'oscar-storage'))
-    $entries = @(
-        @('OSCAR_ARCHIVE_DIR', 'archive', @('./data/archive', '../oscar-storage/archive')),
-        @('OSCAR_WAL_ARCHIVE_DIR', 'wal-archive', @('./data/wal-archive', '../oscar-storage/wal-archive')),
-        @('OSCAR_BACKUP_DIR', 'backups', @('./backups', '../oscar-storage/backups'))
-    )
+    $entries = ,@('OSCAR_ARCHIVE_DIR', 'archive', @('./data/archive', '../oscar-storage/archive'))
+    if ((Get-ValidatedBackupMode) -ceq 'single') {
+        $entries += ,@('OSCAR_BACKUP_DIR', 'backups', @('./backups', '../oscar-storage/backups'))
+    }
     foreach ($entry in $entries) {
         $name = [string]$entry[0]
         $suffix = [string]$entry[1]
@@ -969,9 +1021,12 @@ function Assert-BaseConfigured {
 
 function Assert-Configured {
     Assert-BaseConfigured
-    $backupKey = Join-Path $ScriptRoot 'secrets\backup-key.txt'
-    if (-not (Test-Path -LiteralPath $backupKey -PathType Leaf) -or (Get-Item -LiteralPath $backupKey).Length -eq 0) {
-        throw "Missing required setup file: secrets\backup-key.txt. Run upgrade to initialize $(Get-ReleaseVersion) storage protection."
+    Assert-ManagedEnvironmentBindings
+    if ((Get-ValidatedBackupMode) -ceq 'single') {
+        $backupKey = Join-Path $ScriptRoot 'secrets\backup-key.txt'
+        if (-not (Test-Path -LiteralPath $backupKey -PathType Leaf) -or (Get-Item -LiteralPath $backupKey).Length -eq 0) {
+            throw "Missing required setup file: secrets\backup-key.txt. Run upgrade to initialize $(Get-ReleaseVersion) storage protection."
+        }
     }
 }
 
@@ -1040,7 +1095,7 @@ function Clear-ComposeOverrideEnvironment {
     $saved = @{}
     foreach ($name in @(
         'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME', 'COMPOSE_ENV_FILES', 'COMPOSE_PROFILES',
-        'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_DIR',
+        'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_MODE', 'OSCAR_BACKUP_DIR',
         'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR', 'OSCAR_BACKUP_KEY_FILE',
         'OSCAR_HTTPS_PORT', 'OSCAR_JAVA_OPTS', 'OSCAR_POSTGIS_PLATFORM')) {
         if (Test-Path -LiteralPath "Env:$name") {
@@ -1303,13 +1358,14 @@ OSCAR deployment administration
       [-TlsMode self-signed|import] [-CertificatePath FILE -PrivateKeyPath FILE]
       [-TlsSan DNS_OR_IP[,DNS_OR_IP...]] [-NoAutoNetworkSans]
       [-AddHostsEntry] [-SkipHostsEntry] [-SkipStart]
+      [-BackupMode disabled|single] [-BackupDir ABSOLUTE_PATH]
       [-Prerequisites auto|existing|bundled]
   .\oscar.bat check|verify|start|stop|restart|status
   .\oscar.bat upgrade [-AdoptLegacyVolumes] [-AdoptLegacyStorageRoots]
+      [-BackupMode disabled|single] [-BackupDir ABSOLUTE_PATH]
   .\oscar.bat logs [-Service all|oscar|postgres|gateway] [-Tail 200] [-Follow]
   .\oscar.bat backup
   .\oscar.bat backup-verify -BackupId ID
-  .\oscar.bat backup-prune [-Keep COUNT]
   .\oscar.bat restore -BackupId ID -Confirm ID
   .\oscar.bat archive status|verify
   .\oscar.bat archive hold list
@@ -1362,6 +1418,7 @@ try {
             Set-EnvValue 'OSCAR_VERSION' (Get-ReleaseVersion)
             Set-EnvValue 'OSCAR_HTTPS_PORT' $Port
             Set-EnvValue 'OSCAR_HOSTNAME' $Hostname
+            Set-RequestedBackupConfiguration 'disabled' -Fresh
             Assert-CanonicalCredentialBindings
             Initialize-StoragePaths
             Invoke-FreshInitPreflight
@@ -1374,7 +1431,9 @@ try {
             if (-not (Test-Path -LiteralPath $adminSecretPath)) { Write-SecretFile $adminSecretPath (Read-AdminPassword) }
             if (-not (Test-Path -LiteralPath $databaseSecretPath)) { Write-SecretFile $databaseSecretPath (New-RandomPassword) }
             if (-not (Test-Path -LiteralPath $bootstrapSecretPath)) { Write-SecretFile $bootstrapSecretPath (New-RandomPassword) }
-            if (-not (Test-Path -LiteralPath $backupKeyPath)) { Write-SecretFile $backupKeyPath "$(New-RandomPassword)$(New-RandomPassword)" }
+            if ((Get-ValidatedBackupMode) -ceq 'single' -and -not (Test-Path -LiteralPath $backupKeyPath)) {
+                Write-SecretFile $backupKeyPath "$(New-RandomPassword)$(New-RandomPassword)"
+            }
             Enable-SetupDockerFileAccess
             Prepare-DeploymentImages
             Invoke-StorageCommand 'prepare-directories' $null
@@ -1432,6 +1491,8 @@ try {
             Assert-Docker; Assert-BaseConfigured
             Assert-UpgradeableEnvironmentBindings
             Write-Heading 'Upgrade preflight'
+            $sourceBackupMode = Initialize-UpgradeBackupMode
+            Set-RequestedBackupConfiguration $sourceBackupMode
             Initialize-LegacyBackupKeyBinding
             Assert-CanonicalCredentialBindings
             Assert-DeploymentVolumeOwnership ([bool]$AdoptLegacyVolumes)
@@ -1441,7 +1502,9 @@ try {
             Set-EnvValue 'OSCAR_VERSION' $releaseVersion
             Assert-ManagedEnvironmentBindings
             $backupKeyPath = Join-Path $ScriptRoot 'secrets\backup-key.txt'
-            if (-not (Test-Path -LiteralPath $backupKeyPath)) { Write-SecretFile $backupKeyPath "$(New-RandomPassword)$(New-RandomPassword)" }
+            if ((Get-ValidatedBackupMode) -ceq 'single' -and -not (Test-Path -LiteralPath $backupKeyPath)) {
+                Write-SecretFile $backupKeyPath "$(New-RandomPassword)$(New-RandomPassword)"
+            }
             Protect-DeploymentFiles
             Write-Host "Preparing OSCAR $releaseVersion"
             Prepare-DeploymentImages
