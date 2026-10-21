@@ -236,6 +236,11 @@ driver does not start. If a required append fails, the driver stops its reader i
 continuing without the source record. At day rollover, the service publishes the legacy CSV and a
 SHA-256 manifest atomically and marks the ledger `PUBLISHED` only after both verify.
 
+Journal service readiness is independent of historical backlog size. Current-day crash recovery is
+performed before that lane's first new append; older days are recovered in bounded background
+batches, including for lanes already receiving a newer day. Complete durable publications are not
+re-rendered during a normal restart, avoiding the prior startup CPU/I/O spike and RPM timeout race.
+
 Compatibility observations are removed only for completed local-day windows whose ledger,
 manifest, CSV identity, and current CSV checksum all validate. The exact-midnight cleanup is an
 initial bounded attempt; the hourly maintenance task reruns the same oldest-first catch-up so a

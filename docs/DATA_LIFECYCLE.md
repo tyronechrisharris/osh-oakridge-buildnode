@@ -205,9 +205,14 @@ or skip input after an I/O error.
 
 ### Recovery and day rollover
 
-On startup, the service scans every open segment. It truncates only an incomplete final frame back
-to the last CRC-valid boundary. A complete frame with an invalid length, timestamp, or CRC is
-reported as corruption and prevents silent continuation.
+Startup validates the journal root and metadata without synchronously re-rendering the complete
+historical backlog. Before a lane accepts its first new append, its current open segment is scanned
+and any incomplete final frame is truncated to the last CRC-valid boundary. A complete frame with
+an invalid length, timestamp, or CRC is reported as corruption and prevents silent continuation.
+Older completed days and interrupted deletions are recovered in a bounded 16-lane/day-per-minute
+background pass. This pass also handles older days for actively receiving lanes without holding the
+live writer lock while a large CSV is rendered. Already complete ledger/manifest/CSV publications
+take a metadata fast path and are not regenerated on each restart.
 
 Dates are assigned using the configured IANA `zoneId` (UTC in the standard profile). Each daily
 window is permanently recorded as `[startInclusive, endExclusive)`, so daylight-saving boundaries
