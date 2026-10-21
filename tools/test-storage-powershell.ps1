@@ -245,9 +245,13 @@ try {
         'Windows connected setup does not preserve the configured PostgreSQL build platform.'
     Assert-True (-not $setupSource.Contains('BUILDX_BAKE_ENTITLEMENTS_FS')) `
         'Windows setup disables Bake filesystem checks instead of using bounded build contexts.'
+    # The storage launcher has 17 bounded shell adapters after retiring both
+    # the cumulative WAL-archive tar helper and its prune-intent helper, then
+    # adding the authenticated CURRENT-pointer helper. Keep this exact count so
+    # every future native-shell call still receives an explicit safety review.
     foreach ($astFixture in @(
         @{ Path = $setupScript; ExpectedShellRuns = 2 },
-        @{ Path = $storageScript; ExpectedShellRuns = 18 })) {
+        @{ Path = $storageScript; ExpectedShellRuns = 17 })) {
         $tokens = $null
         $parseErrors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile($astFixture.Path, [ref]$tokens, [ref]$parseErrors)
