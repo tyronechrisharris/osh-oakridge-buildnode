@@ -230,10 +230,14 @@ of memory, two threads, and 4 GiB of spill in a private per-operation directory 
 busy after 30 seconds, bounding the aggregate resource multiplier across exports, verification,
 deletion, and cold queries. OSCAR rejects archive/scratch root overlap and, on POSIX, rejects an
 existing scratch parent unless it is mode `0700`; the Linux deployment container provides the same
-protection on Ubuntu and Windows hosts. Scratch directories are closed and removed per operation
-and are not part of the portable archive or coordinated backup. A hard process failure, or a surfaced
-close/delete failure, can leave an orphan. After stopping OSCAR, remove only confirmed abandoned
-children beneath the configured scratch parent.
+protection on Ubuntu and Windows hosts. A persistent `.oscar-duckdb.lock` lease (a real regular file,
+mode `0600`) is held for the owning process/classloader lifetime. It prevents a concurrent owner
+from cleaning live spill. On its first successful open, an owner holding the lease automatically
+removes only recognized direct `<operation>-<lowercase UUID>` children abandoned by a prior owner;
+unrelated entries and links are preserved. Normal operation children are closed and removed per
+operation, while the lease remains until process shutdown. The entire scratch parent, including the
+lease, is excluded from the portable archive and coordinated backup. Streaming reads cooperate with
+shutdown between result rows in addition to cancelling the active JDBC statement.
 
 Object publication and PostgreSQL activation cannot be one filesystem/database transaction. A file
 that exists without an `ACTIVE`/`DELETING` catalog object is intentionally invisible and is reported

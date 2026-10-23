@@ -309,7 +309,10 @@ launcher menus, and retained only as a no-op compatibility command that explains
 The coordinated backup excludes the reserved `/var/lib/oscar/duckdb-tmp` path exactly. Keep that
 default for scratch stored in OSCAR's persistent state. A custom DuckDB temporary parent is valid
 only outside `/var/lib/oscar`, must remain disjoint from the archive, and needs its own capacity and
-owner-only-permission monitoring.
+owner-only-permission monitoring. OSCAR holds `.oscar-duckdb.lock` in that parent for its process
+lifetime (real regular file, mode `0600`) and refuses a concurrent owner. The first owner after a
+crash removes only direct, canonical `<operation>-<lowercase UUID>` directories left by the prior
+owner. Unrelated entries and symbolic links are not cleanup targets and should be investigated.
 
 ## Archive health inspection
 
@@ -832,9 +835,10 @@ Track at least:
 | Complete-frame CRC or immutable CSV mismatch | Initialization/publication fails visibly | Preserve all evidence; investigate storage/hardware; recover from verified copy |
 | Observation batch commit fails | Snapshots stay queued for a later in-process retry | Fix PostgreSQL/network/disk immediately; restart only after assessing uncommitted-memory exposure |
 | Archive export fails | Hot rows remain; job records `FAILED` | Check database, archive space/permissions, DuckDB error, stale partials; allow controlled retry |
-| DuckDB memory/spill cap is exhausted | Current export/query/parity operation fails; no generation is activated and no unverified hot row is deleted | Reduce query/export concurrency or window size, restore scratch capacity, or raise a cap only after site-specific load testing; with OSCAR stopped, remove abandoned children beneath the configured DuckDB temporary parent |
+| DuckDB memory/spill cap is exhausted | Current export/query/parity operation fails; no generation is activated and no unverified hot row is deleted | Reduce query/export concurrency or window size, restore scratch capacity, or raise a cap only after site-specific load testing; a subsequent clean owner automatically reclaims recognized abandoned operation children |
 | DuckDB session capacity stays busy for 30 seconds | Waiting operation fails before allocating a connection or scratch child; active work continues | Let the caller retry, inspect unusually long archive queries/exports, and raise concurrency only after measuring aggregate native memory, CPU, and spill |
-| DuckDB scratch parent is broad or overlaps archive | Archive operation fails before opening DuckDB | Keep `/var/lib/oscar/duckdb-tmp` disjoint from the archive and mode `0700`; on a non-POSIX embedding apply an equivalent owner-only ACL |
+| DuckDB scratch parent is broad, overlaps archive, has an unsafe lease, or is owned by another process | Archive operation fails before opening DuckDB or cleaning scratch | Keep `/var/lib/oscar/duckdb-tmp` disjoint from the archive and mode `0700`, keep `.oscar-duckdb.lock` a real regular file owned by OSCAR and mode `0600`, and stop the competing owner; on a non-POSIX embedding apply equivalent owner-only ACLs |
+| Recognized DuckDB operation children remain after OSCAR starts | First-open recovery did not complete or archive work has not yet opened DuckDB | Preserve logs and unexpected entries, confirm no second OSCAR process owns the lease, then exercise `archive status`; only with OSCAR stopped should an operator remove confirmed abandoned canonical children by hand |
 | Parity fails | Hot rows remain; generation is not sealable | Compare receipt details and source/object hashes; do not enable/bypass deletion |
 | Observation hold defers hot deletion | Held exact IDs remain hot; generation stays `ACTIVE` | No emergency action; review/release hold only through approved workflow |
 | Cataloged archive object missing/hash mismatch, ID block mismatch, or missing generation schema rows | Reader/verify/purge fails | Stop destructive work, preserve evidence, restore the coordinated database and exact archive objects from the same backup epoch, then verify again |

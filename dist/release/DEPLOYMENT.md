@@ -235,11 +235,18 @@ DuckDB query scratch is separate from both temporary mounts and the immutable ar
 archive connection is limited by the persisted database-module settings (shipping defaults:
 256 MiB memory, two threads, and 4 GiB spill) and gets a private child below
 `/var/lib/oscar/duckdb-tmp` in `oscar_state`. Normal connection close removes the child; coordinated
-backups exclude this scratch parent. The scratch and archive roots must be disjoint. In the Linux
-container (on either Ubuntu or Windows hosts), OSCAR requires POSIX mode `0700` on the parent and
-each operation child and rejects an existing broader parent; a non-container/non-POSIX embedding
-must provide an equivalent owner-only ACL. If a hard process/container failure leaves a child
-behind, stop OSCAR before removing only abandoned children from that configured parent.
+backups exclude this scratch parent. OSCAR holds an operating-system lease in the persistent
+`.oscar-duckdb.lock` file for its process/classloader lifetime, so a second owner cannot clean live
+spill. The first session after a crash, while holding the lease, automatically removes only direct
+children matching the canonical `<operation>-<lowercase UUID>` form; it preserves unrelated entries
+and never follows symbolic links. Streaming archive reads check shutdown cancellation between rows
+as well as cancelling an active JDBC statement. The scratch and archive roots must be disjoint. In
+the Linux container (on either Ubuntu or Windows hosts), OSCAR requires POSIX mode `0700` on the
+parent and each operation child, and a real regular non-link lease with mode `0600`; broader or
+unsafe existing permissions are rejected. A non-container/non-POSIX embedding must provide
+equivalent owner-only ACLs. Manual cleanup is a fallback only: stop OSCAR first and remove only
+confirmed abandoned canonical operation children, never the lease or unrelated entries while a
+process may be active.
 The backup exclusion is intentionally limited to the reserved `/var/lib/oscar/duckdb-tmp` path.
 OSCAR therefore rejects any other scratch path inside `/var/lib/oscar`; a custom path must be
 outside that persistent state tree and disjoint from the archive.

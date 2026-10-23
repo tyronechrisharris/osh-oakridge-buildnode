@@ -227,11 +227,21 @@ fair first-in/first-out gate waits up to 30 seconds and then fails busy; all ind
 configured archive stores share the gate, and the smallest cap registered by an active or waiting
 store governs admission. This prevents overlapping queries and background jobs from multiplying
 the per-session native-memory and spill envelopes without bound. Each admitted operation receives
-a new unguessable child beneath
-`/var/lib/oscar/duckdb-tmp`; the connection is closed before that child is recursively removed.
+a new unguessable child beneath `/var/lib/oscar/duckdb-tmp`; the connection is closed before that
+child is recursively removed. The first embedded DuckDB session in a process also acquires and
+holds an operating-system lease at `/var/lib/oscar/duckdb-tmp/.oscar-duckdb.lock`. The lease is a
+real, non-symbolic-link regular file with POSIX mode `0600`; it prevents a second process or
+classloader from treating live operation directories as abandoned. While holding that lease,
+first-open recovery removes only direct child directories whose names match OSCAR's canonical
+`<operation>-<lowercase UUID>` form. It never follows symbolic links or removes unrelated entries.
+Streaming archive readers check cancellation between rows as well as cancelling the active JDBC
+statement, so shutdown can interrupt both a blocked DuckDB call and result iteration. A hard process
+failure can leave operation children, but the next successful owner reclaims those recognized
+children before opening a session.
 OSCAR rejects a scratch root that contains, equals, or is contained by the immutable archive root.
-On POSIX filesystems both the scratch parent and operation child must be mode `0700`; an existing
-broader parent is rejected instead of silently changing administrator-managed permissions. The
+On POSIX filesystems both the scratch parent and operation child must be mode `0700`; the lease must
+be mode `0600`. Existing broader permissions are rejected instead of silently changing
+administrator-managed permissions. The
 Linux container used on both Ubuntu and Windows supplies these POSIX semantics. A non-container,
 non-POSIX embedding must enforce an equivalent owner-only ACL. The spill directory is excluded
 from coordinated backups. Because that exclusion is deliberately exact, the only permitted scratch
