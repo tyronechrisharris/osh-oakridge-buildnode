@@ -168,17 +168,30 @@ overlays, tombstones, and application state and therefore must be captured with 
 a coordinated snapshot. Only the five output names allowlisted in the standard configuration are
 cold-tiered; this is not a generic every-table or every-observation export.
 
-An hourly background cycle finds the oldest eligible unarchived row before the 48-hour cutoff. To
+An asynchronous single-worker cycle starts immediately when the database module starts, then runs
+hourly and finds the oldest eligible unarchived row before the 48-hour cutoff. Ingestion only writes
+the hot PostgreSQL journal; it never waits for Parquet work. This deliberately avoids producing
+tiny duplicate cold files as each live observation arrives while still beginning catch-up promptly
+after a restart. To
 catch up without monopolizing the host, a cycle starts at most 24 generations and stops starting
 new work after 15 minutes by default; an in-progress generation is allowed to finish safely. Each
-normal UTC window is one hour and is halved down to one second if it would exceed
-`maximumRowsPerGeneration` (2,000,000 by default) or
-`maximumUncompressedBytesPerGeneration` (2 GiB by default). The byte estimate uses the same
-per-row JSON accounting enforced by the exporter. If even a one-second prefix exceeds either cap,
-the cycle fails closed and retains the hot rows rather than retrying an impossible hour forever.
+normal catalog window is one UTC hour. The exporter orders eligible unowned rows by phenomenon
+time and observation ID and publishes deterministic bounded prefixes of that hour. A prefix is
+limited by `maximumRowsPerGeneration` (2,000,000 by default) and the lower of the operator's
+`maximumUncompressedBytesPerGeneration` setting (2 GiB by default) or one eighth of the configured
+DuckDB session memory (32 MiB with the standard 256 MiB session). Remaining rows are published as
+same-hour revisions during the current or a later cycle. If one row alone exceeds the effective
+limit, the cycle fails closed and retains it hot for operator action.
+
+Before selecting new full-hour work, each cycle reclaims the exact bounds of the oldest eligible
+latest-revision failed job (or an export left stale for two hours). This preserves retry identity
+for sub-hour jobs produced by earlier releases and clears their durable failure state on upgrade.
+An exact retry that has become empty is recorded as `SUPERSEDED`, so it cannot starve later windows.
 
 The exporter uses a read-only PostgreSQL `REPEATABLE READ` transaction and does not update or lock
-the selected rows while producing the files. It sorts observations by datastream and time, writes
+the selected rows while producing the files. PostgreSQL is fetched in 5,000-row pages while
+DuckDB insertion is flushed and explicitly cleared every 500 rows, preventing the JDBC batch from
+retaining the entire hour in native memory. It sorts observations by datastream and time, writes
 ZSTD Parquet, verifies the row count and ID range through DuckDB, records a compressed datastream
 schema snapshot, and publishes the manifest last. Catalog activation then marks the exact exported
 rows with the generation UUID and requires the marked count to equal the manifest count. New or

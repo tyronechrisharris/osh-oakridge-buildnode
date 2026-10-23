@@ -70,6 +70,11 @@ DuckDB writes ZSTD-compressed Parquet with a row-group target of 122,880 rows. S
 Hive-style date partition allow Parquet min/max metadata and path selection to avoid scanning
 unrelated time/datastream ranges.
 
+A busy UTC hour may be represented by several immutable generations with the same catalog window.
+Each generation contains the next deterministic `(phenomenon_time, id_value)` prefix that fits the
+bounded export budget; later prefixes use normal job revisions. Catalog ownership remains exact per
+observation, so combined hot/cold reads and portable exports do not duplicate rows.
+
 `result_json` is not a self-describing replacement for the OSH schema. Keep the matching schema
 snapshot whenever a Parquet object is copied.
 
@@ -164,6 +169,9 @@ deployment running the matching release rather than starting older code on a new
 | `oscar_deletion_ledger` | Per-object deletion audit trail |
 | `oscar_media_manifest` / `oscar_media_asset` | Reserved structured media catalog records |
 | `oscar_backup_epoch` | Link between a coordinated backup manifest and the bounded count, byte length, and SHA-256 receipt for its authenticated active/sealed-generation inventory; exact UUIDs stay in the backup file rather than a per-backup PostgreSQL array |
+
+Archive-job state `SUPERSEDED` is an audited terminal no-op used when a reclaimed failed/stale
+window contains no eligible unowned rows. It has no generation and is never query-visible.
 
 Generation states used by the observation reader/lifecycle are:
 

@@ -59,14 +59,25 @@ last completed generation. A catch-up cycle starts at most `maximumGenerationsPe
 stops starting new generations after `maximumCycleMinutes` (15); in-progress publication is
 allowed to complete safely.
 
-The worker selects a half-open UTC window `[start, end)`. It uses a PostgreSQL read-only
-`REPEATABLE READ` snapshot, streams rows with a 5,000-row fetch size, and writes through embedded
-DuckDB. Live inserts continue. Before export, one bounded PostgreSQL sizing query measures both the
-row count and the same `128 + UTF-8 JSON bytes` estimate enforced by the exporter. The scheduler
-halves the leading interval while either the configured row or byte cap is exceeded, down to one
-second. The exporter independently reads a sentinel row and enforces both limits so a racing or
-mis-sized window cannot publish partial history. A still-oversized one-second prefix fails closed
-with all hot rows retained for operator action.
+The worker is independent of the ingestion thread: it runs once immediately at module startup and
+then at the configured interval. New observations remain cheap hot-journal writes and are not
+individually converted to Parquet before they become age-eligible. The worker selects a half-open
+UTC hour `[start, end)`. It uses a PostgreSQL read-only
+`REPEATABLE READ` snapshot and a 5,000-row fetch size while flushing explicitly cleared 500-row
+inserts into embedded DuckDB. Live inserts continue. Rows are ordered by `(phenomenontime, id)` and
+the exporter publishes the largest deterministic prefix permitted by the configured row cap and
+the effective byte cap. The effective byte cap is the lower of the operator setting and one eighth
+of DuckDB session memory—32 MiB with the standard 256 MiB session—leaving room for table pages,
+sort keys, compression, and Parquet buffers. Remaining unowned rows become normal same-hour job
+revisions, so a restart resumes safely without tiny time slices or duplicate ownership. A single
+row larger than the effective cap fails closed and remains hot for operator action.
+
+On upgrade, the worker first reclaims the exact window of any latest-revision `FAILED` job or
+two-hour-stale `EXPORTING` job that is wholly older than the cutoff. This includes sub-hour windows
+created by the former time-bisection scheduler, preventing a successful replacement full-hour
+archive from leaving an obsolete failed job in health reports.
+If such a reclaimed window no longer has any eligible unowned rows, its attempt becomes
+`SUPERSEDED` with an audit detail instead of remaining `FAILED`; later windows can continue.
 
 The exporter and every other archive-side DuckDB operation use the configured memory, thread, and
 temporary-space caps. Larger sorts or joins spill only into an operation-private directory, which

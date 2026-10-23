@@ -144,6 +144,10 @@ jobs:
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.closeSurfacesFinalFlushFailureAndRetainsPendingObservation \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.archiveCatalogNamespacesIndependentObservationStores \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.byteHeavyArchiveWindowSplitsAndActivatesBothPrefixes \
+            --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.denseHourUsesBoundedSameWindowRevisionsAndRecoversFailedJob \
+            --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.legacyFailedSubHourJobIsRetriedBeforeFullHourWork \
+            --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.emptyLegacyRetryIsSupersededWithoutStarvingLaterWork \
+            --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.productionMemoryBudgetArchivesObservedDenseHourAcrossRestart \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.sparseByteHeavyHourDoesNotSelectAnEmptyPrefix \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.archivePayloadByteCapFailsBeforePublication \
             --tests org.sensorhub.impl.datastore.postgis.TestDisposableTieredPostgresIntegration.staleJobRetryReplacesItsDeterministicCrashObjects \

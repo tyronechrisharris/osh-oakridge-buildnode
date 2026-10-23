@@ -53,7 +53,7 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Archive hot retention | 2 days | Age before the five allowlisted high-volume detector streams are copied to cold storage |
 | Archive interval | 60 min | Background cycle frequency |
 | Archive catch-up bound | 24 generations / 15 min | Stops starting new generations at the first bound; in-progress publication completes safely |
-| Maximum generation | 2,000,000 rows / 2 GiB estimated uncompressed bytes | A UTC window is halved down to one second while either cap is exceeded; an irreducible prefix fails closed with hot rows retained |
+| Maximum generation | 2,000,000 rows / lower of 2 GiB operator cap or 1/8 DuckDB memory (32 MiB standard) | Deterministic `(phenomenontime,id)` prefixes become same-hour revisions; 500-row cleared DuckDB inserts bound native staging memory, and a single oversized row fails closed hot |
 | DuckDB memory / threads | 256 MiB / 2 per connection | Bounds native memory and CPU for every export, verification, parity, delete, cold query, metadata scan, and count |
 | DuckDB session admission | 2 process-wide / 30 s wait | Fairly bounds the aggregate native-memory/CPU/spill multiplier; excess work fails busy and can be retried instead of opening an unbounded connection |
 | DuckDB spill | 4 GiB per operation in `/var/lib/oscar/duckdb-tmp` | Each connection gets a mode-0700 private child that is removed on close; scratch must be disjoint from the immutable archive and is excluded from backup |
