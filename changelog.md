@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
 - Make completed alarm video immediately eligible for asynchronous five-JPEG conversion on the next retention scan, preserve the source MP4 for 24 hours after verified publication, and keep every failed/fewer-than-five-frame source intact
 - Make new self-signed deployments LAN/Tailscale-ready by adding active non-container LAN IPv4, stable Tailscale IPv4/IPv6, and discoverable MagicDNS identity to certificate SANs, accepting explicit additional DNS/IP SANs, validating every requested identity, and printing covered client URLs plus a verifiable public-certificate fingerprint
 
+### Statistics reliability and resource control
+- Serialize scheduled and operator-requested full National Statistics publications, use fixed-delay scheduling, and retain cancellable datastore shutdown so long archive-backed scans cannot overlap and multiply CPU, memory, or scratch-space pressure
+- Return a terminal `COMPLETED` command only after a newly persisted statistics observation is available, preserve legacy statistics timestamp decoding without double-counting history, and use strictly increasing millisecond cutoffs with open-lower incremental ranges
+- Keep the Viewer busy until the durable command status is terminal, fetch the exact returned observation instead of an older `latest` result, fail visibly on terminal command errors, and cancel stale UI work when the node or operational-view scope changes
+- Execute operational-view range scans sequentially, disable duplicate refresh controls while initial or manual work is active, and regression-test the exact command, observation, rendered counts, and resource-safe lifecycle
+
 ### Storage and data lifecycle
 - Add a crash-recoverable, per-lane direct daily-file journal that captures Rapiscan and RS350 input before parsing and Aspect register snapshots before observation publication
 - Make the daily journal a required driver dependency by default so startup or append failures cannot silently bypass source-record capture
