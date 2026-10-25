@@ -50,16 +50,16 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Sealed journal lifecycle queue | bounded durable batches | Avoids startup and periodic all-history directory scans while recovery and deletion backlogs converge |
 | Database `idProviderType` | `SEQUENTIAL` | Required for exact, race-free archive ownership |
 | Database batch | 10,000 rows / 1 s | Bounded insert transaction and commit period |
-| Archive hot retention | 2 days | Age before the five allowlisted high-volume detector streams are copied to cold storage |
-| Archive interval | 60 min | Background cycle frequency |
-| Archive catch-up bound | 24 generations / 15 min | Stops starting new generations at the first bound; in-progress publication completes safely |
+| Archive mode / completed-hour delay | `PARQUET_PRIMARY` / 5 min | The five allowlisted immutable outputs commit to PostgreSQL staging first; a completed UTC hour then becomes eligible for Parquet, without a direct-to-Parquet path |
+| Archive interval | 5 min | Background cycle frequency; eligibility is not an activation SLA |
+| Archive work bounds | 2 generations / 2 verifications / 2 deletions / 15 min | Independently bounds each lifecycle phase and stops starting new generations at the duration bound; in-progress publication completes safely |
 | Maximum generation | 2,000,000 rows / lower of 2 GiB operator cap or 1/8 DuckDB memory (32 MiB standard) | Deterministic `(phenomenontime,id)` prefixes become same-hour revisions; 500-row cleared DuckDB inserts bound native staging memory, and a single oversized row fails closed hot |
 | DuckDB memory / threads | 256 MiB / 2 per connection | Bounds native memory and CPU for every export, verification, parity, delete, cold query, metadata scan, and count |
 | DuckDB session admission | 2 process-wide / 30 s wait | Fairly bounds the aggregate native-memory/CPU/spill multiplier; excess work fails busy and can be retried instead of opening an unbounded connection |
 | DuckDB spill | 4 GiB per operation in `/var/lib/oscar/duckdb-tmp` | Each connection gets a mode-0700 private child that is removed on close; scratch must be disjoint from the immutable archive and is excluded from backup |
 | Parquet compression | ZSTD level 6 | Cold-storage size/CPU tradeoff |
-| Archive rollback grace | 1 day | Verified hot/cold overlap after activation before exact hot-row deletion |
-| `deleteHotAfterArchive` | `true` | Deletes only generation-owned eligible rows after parity and overlap, normally about 72 hours after observation plus scheduling |
+| Archive rollback grace | 3 days from activation | Roughly 72 hours minimum verified hot/cold overlap; scheduling, backlog, failures, and holds can extend it |
+| `deleteHotAfterArchive` | `true` | Deletes only exact generation-owned eligible staging rows after parity and grace; it does not delete mutable event/workflow rows |
 | Video retention age | 0 days | Makes a completed source video immediately eligible for asynchronous five-JPEG conversion on a retention scan |
 | Retention scan / catch-up | 5 min / 6 h forward | Bounds normal discovery and catch-up work after downtime |
 | Late-arrival scan | every 6 h / 2 h per pass / 24 h allowance | Rechecks delayed observations without an all-history rescan |
@@ -85,6 +85,13 @@ candidate mutation.
 `delegateObservationLifecycleToDatabase=true` disables the old occupancy-gated high-volume purge so
 the tiered database owns gamma/neutron lifecycle. It does not disable connection-status maintenance
 or manifest-gated daily-file compatibility cleanup.
+
+The `PARQUET_PRIMARY` setting applies only to fresh databases initialized from this standard
+profile. PostgreSQL is still the commit-durable staging layer for the allowlisted immutable outputs,
+and remains the system of record for mutable occupancy/alarm events, adjudications, reports,
+metadata, overlays, tombstones, and non-allowlisted streams. Only a fresh primary schema omits the
+generic observation-payload GIN index; purpose-built event indexes remain. Upgrade preserves an
+existing schema and configuration rather than dropping that index or silently changing its mode.
 
 Variable PostgreSQL keyset observation pages are deliberately kept unnamed at statement scope
 (`prepareThreshold=0`). The same query shape is reused for different stream-ID sets and time
@@ -236,8 +243,11 @@ Do not erase an old production volume simply to make the 3.9.2 module start.
 
 ### Phase 1: validate the primary cold tier
 
-The shipping profile archives only the five allowlisted high-volume outputs after 48 hours and,
-after successful parity plus a 24-hour overlap, deletes their exact generation-owned hot rows.
+The shipping profile commits only the five allowlisted immutable high-volume outputs to bounded
+PostgreSQL staging, then makes each completed UTC hour Parquet-eligible five minutes after close.
+After manifest-last activation, successful parity, and three days from activation, it may delete
+their exact generation-owned staging rows. The three days are a roughly 72-hour minimum, not a
+deletion deadline. Mutable event/workflow records remain in PostgreSQL.
 Run long enough to create multiple generations across representative lane/output rates. Check:
 
 ```sh
@@ -276,7 +286,7 @@ daily files, media, and mixed-tier queries match the source system. See
 ### Phase 3: validate hot deletion
 
 The lifecycle deletes only exact generation-owned IDs with a successful parity receipt, in bounded
-batches, after the one-day grace. Watch PostgreSQL row count, WAL generation, database size, archive receipts,
+batches, after the three-day activation grace. Watch PostgreSQL row count, WAL generation, database size, archive receipts,
 query latency, and logs. PostgreSQL may not immediately return deleted heap space to the filesystem;
 normal autovacuum reuses it. Do not run an unplanned `VACUUM FULL`, which takes strong locks and can
 cause a major outage.
@@ -808,8 +818,9 @@ row and bounded long-term hot-table growth. Expect temporary CPU and sequential 
 DuckDB export/parity pass, and CPU during FFmpeg JPEG extraction. DuckDB is capped per connection
 at 256 MiB, two workers, and 4 GiB of spill by default, and a fair process-wide gate admits at most
 two sessions. Work that cannot acquire capacity within 30 seconds fails busy without activating a
-generation or deleting hot rows. Each generation is bounded; during
-backlog catch-up, one cycle may start up to 24 generations over its 15-minute start window. Health/status UI polling remains independently bounded. Treat a
+generation or deleting hot rows. Each generation is bounded; during backlog catch-up, one cycle may
+start up to two generations over its 15-minute start window, verify at most two, and delete at most
+two eligible hot generations. Health/status UI polling remains independently bounded. Treat a
 sustained regression—not a brief background spike—as the alert condition.
 
 Track at least:

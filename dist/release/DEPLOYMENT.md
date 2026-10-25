@@ -432,9 +432,14 @@ those live dependencies. Verification is still an acceptance mutation: it publis
 `VERIFIED` and normalizes backup permissions, and may update the live catalog only after proving
 volume ownership.
 Fresh deployments default to backup mode `disabled`; backup, verification, restore, and the retired
-prune command fail with opt-in guidance until setup changes the mode to `single`. The standard data
-lifecycle archives only five allowlisted high-volume outputs after 48 hours and deletes their exact
-hot rows only after successful parity plus 24 hours of overlap (about 72 hours plus scheduling).
+prune command fail with opt-in guidance until setup changes the mode to `single`. For a fresh
+database, the standard data lifecycle explicitly selects `PARQUET_PRIMARY`: five allowlisted
+immutable high-volume outputs commit to bounded PostgreSQL staging first, and a five-minute worker
+makes a completed UTC hour eligible five minutes after it closes. It deletes only exact
+generation-owned staging rows after manifest-last activation, successful parity, and three days
+from activation. That roughly 72-hour overlap is a minimum rather than a deletion SLA; bounded
+backlog, failures, and holds can extend it. Mutable events and other non-allowlisted data remain in
+PostgreSQL, and only a fresh primary schema omits the generic payload GIN index.
 Parquet is the primary cold tier, not a backup. Cold archive deletion always requires a reviewed
 `archive dry-run` plan and its one-time token.
 

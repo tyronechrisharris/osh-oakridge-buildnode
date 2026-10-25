@@ -100,13 +100,19 @@ const expectedVideoRetention = {
 };
 if (Object.entries(expectedVideoRetention).some(([field, expected]) =>
         service?.videoRetentionConfig?.[field] !== expected) ||
-    archive?.hotRetentionDays !== 2 || archive?.rollbackGraceDays !== 1 ||
+    archive?.storageMode !== 'PARQUET_PRIMARY' ||
+    archive?.hotRetentionDays !== 2 ||
+    archive?.parquetPrimaryArchiveDelayMinutes !== 5 || archive?.intervalMinutes !== 5 ||
+    archive?.maximumGenerationsPerCycle !== 2 ||
+    archive?.maximumVerificationsPerCycle !== 2 ||
+    archive?.maximumDeletionsPerCycle !== 2 ||
+    archive?.rollbackGraceDays !== 3 ||
     archive?.deleteHotAfterArchive !== true ||
     archive?.requireParityReceipt !== true ||
     dailyJournal?.sealedJournalRetentionDays !== 30 ||
     dailyJournal?.requireBackupBeforeSealedJournalDeletion !== false ||
     JSON.stringify(archive?.outputNames) !== JSON.stringify(outputs)) {
-    throw new Error('standard lifecycle defaults no longer encode the production media cadence/grace, 48-hour cold eligibility, verified 24-hour overlap, 30-day exact-replay journal retention, and five-output allowlist');
+    throw new Error('standard lifecycle defaults no longer encode the production media cadence/grace, explicit five-minute Parquet-primary cycle, balanced work bounds, three-day activation grace, 30-day exact-replay journal retention, and five-output allowlist');
 }
 NODE
 

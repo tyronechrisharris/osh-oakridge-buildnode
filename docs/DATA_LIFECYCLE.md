@@ -11,7 +11,7 @@ hosts. macOS deployment and storage operations fail closed; it is not a supporte
 
 | Data class | Default transition | Removal gate | Removed automatically? |
 | --- | --- | --- | --- |
-| Selected high-volume detector observations | Copy to an `ACTIVE` Parquet generation when older than 48 hours | Valid Parquet/schema/manifest objects, active catalog generation, exact-row parity receipt, 24-hour overlap, no applicable hold | Yes for exact eligible rows in the shipping profile, normally about 72 hours after observation plus scheduling |
+| Selected immutable high-volume detector observations | Commit first to bounded PostgreSQL staging; make a completed UTC hour Parquet-eligible five minutes after close | Valid Parquet/schema/manifest objects, active catalog generation, exact-row parity receipt, three days from activation, no applicable hold | Yes for exact eligible rows; roughly 72 hours from activation is a minimum, not a deletion SLA |
 | Other PostgreSQL observations and transactional records | Remain hot | Existing application policy | Not by the cold-tier scheduler |
 | Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV, v1 manifest, `PUBLISHED` ledger, 30 days after the later of day close or actual publication, and exact sealed-journal replay parity; sites may additionally require verified backup confirmation | Yes for eligible private sealed segments; published daily files are not pressure-cleanup candidates |
 | Alarm source MP4 | Immediately eligible for an asynchronous attempt to publish exactly five JPEGs | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
@@ -34,9 +34,11 @@ serialized immediately, then queued for a bounded prepared-statement batch. The 
 flushes every second or at 10,000 observations. Until a successful flush, the observation is
 not durable in PostgreSQL; a failed batch remains queued for a later commit attempt.
 
-The hot store remains authoritative for systems, datastream metadata, recent observations, event
-records, occupancy/alarm workflows, adjudications, and reports. Parquet is the primary cold tier,
-not a backup, and only output names listed in
+PostgreSQL remains authoritative for systems, datastream metadata, event records, occupancy/alarm
+workflows, adjudications, reports, archive control state, and observations not selected for the
+primary cold tier. For allowlisted immutable outputs, a successful PostgreSQL commit is the durable
+staging boundary; OSCAR does not acknowledge those observations through a direct-to-Parquet path.
+Parquet is the primary cold tier, not a backup, and only output names listed in
 `archive.outputNames` are eligible for cold tiering. The 3.9.2 default list is:
 
 ```text
@@ -52,16 +54,18 @@ does not cold-tier every table or every observation stream.
 
 ### 2. Non-disruptive archive export
 
-The database's archive worker runs at `intervalMinutes` (60 by default). It computes a cutoff of
-`now - hotRetentionDays`, truncated to a UTC hour, then finds the oldest eligible row whose
-`archivegenerationid` is still null. This lookup includes late arrivals; it is not based only on the
-last completed generation. A catch-up cycle starts at most `maximumGenerationsPerCycle` (24) and
-stops starting new generations after `maximumCycleMinutes` (15); in-progress publication is
-allowed to complete safely.
+The database's archive worker runs at `intervalMinutes` (five by default). In the shipping
+`PARQUET_PRIMARY` mode it subtracts `parquetPrimaryArchiveDelayMinutes` (five), truncates that value
+to a UTC hour, and finds the oldest eligible row whose `archivegenerationid` is still null. Thus a
+full UTC hour is normally eligible five minutes after it closes; activation can occur later and is
+not an SLA. This lookup includes late arrivals; it is not based only on the last completed
+generation. A cycle starts at most `maximumGenerationsPerCycle` (two), checks at most two
+unverified generations, deletes at most two eligible hot generations, and stops starting new
+generations after `maximumCycleMinutes` (15); in-progress publication is allowed to complete safely.
 
 The worker is independent of the ingestion thread: it runs once immediately at module startup and
-then at the configured interval. New observations remain cheap hot-journal writes and are not
-individually converted to Parquet before they become age-eligible. The worker selects a half-open
+then at the configured interval. New observations are committed to PostgreSQL staging first and are
+not individually converted to Parquet. The worker selects a half-open
 UTC hour `[start, end)`. It uses a PostgreSQL read-only
 `REPEATABLE READ` snapshot and a 5,000-row fetch size while flushing explicitly cleared 500-row
 inserts into embedded DuckDB. Live inserts continue. Rows are ordered by `(phenomenontime, id)` and
@@ -149,11 +153,12 @@ The shipped 3.9.2 profile sets `deleteHotAfterArchive=true`. A generation become
 eligible only after:
 
 - a successful `HOT_COLD_PARITY` receipt;
-- `rollbackGraceDays` since activation (one day by default); and
+- `rollbackGraceDays` since activation (three days by default); and
 - no active generation hold.
 
-Together with the two-day archive threshold, this produces roughly 72 hours of hot residency plus
-hourly scheduling and processing time. Deletion uses exact IDs from the verified Parquet object in transactions of `deleteBatchSize`
+The grace clock begins at catalog activation, not observation time. Three days therefore provides
+roughly 72 hours of hot/cold overlap after activation as a minimum, not a deletion SLA; worker
+scheduling, backlogs, failed parity, and holds can extend it. Deletion uses exact IDs from the verified Parquet object in transactions of `deleteBatchSize`
 (5,000 by default) and additionally requires each PostgreSQL row's `archivegenerationid` to equal
 that generation. Observation-specific holds are skipped. If held rows remain, the generation stays
 `ACTIVE` and receives a deferred-hold receipt; a later cycle retries. It becomes `SEALED` only after

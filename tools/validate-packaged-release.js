@@ -234,11 +234,23 @@ if (!fs.existsSync(standardConfigPath)) {
                 fail(`the standard video-retention ${field} must be ${expected}`);
             }
         }
-        if (archiveConfig?.hotRetentionDays !== 2) {
-            fail('the standard cold-tier eligibility age must be 2 days');
+        if (archiveConfig?.storageMode !== 'PARQUET_PRIMARY') {
+            fail('the standard profile must explicitly select PARQUET_PRIMARY');
         }
-        if (archiveConfig?.rollbackGraceDays !== 1) {
-            fail('the standard verified hot/cold overlap must be 1 day');
+        if (archiveConfig?.hotRetentionDays !== 2) {
+            fail('the inactive HOT_RETENTION compatibility value must remain 2 days');
+        }
+        if (archiveConfig?.parquetPrimaryArchiveDelayMinutes !== 5 ||
+            archiveConfig?.intervalMinutes !== 5) {
+            fail('the standard Parquet-primary profile must use a 5-minute completed-hour delay and cycle');
+        }
+        if (archiveConfig?.maximumGenerationsPerCycle !== 2 ||
+            archiveConfig?.maximumVerificationsPerCycle !== 2 ||
+            archiveConfig?.maximumDeletionsPerCycle !== 2) {
+            fail('the standard Parquet-primary lifecycle work bounds must all equal 2');
+        }
+        if (archiveConfig?.rollbackGraceDays !== 3) {
+            fail('the standard verified hot/cold overlap must be 3 days from activation');
         }
         if (archiveConfig?.deleteHotAfterArchive !== true) {
             fail('the standard profile must delete eligible hot observations after verified overlap');

@@ -17,9 +17,10 @@ deployment and storage commands fail closed there.
 ## Design goals
 
 - Preserve OSH system, datastream, feature-of-interest, and observation identities.
-- Keep recent and operational records in PostgreSQL for low-latency application workflows.
-- Copy eligible high-volume detector observations to queryable ZSTD Parquet generations without
-  locking the live tables or pausing ingestion.
+- Keep mutable/transactional records in PostgreSQL, and use PostgreSQL as bounded commit-durable
+  staging for the allowlisted immutable detector outputs.
+- Copy completed-hour batches of those eligible outputs to queryable ZSTD Parquet generations
+  without locking the live tables or pausing ingestion.
 - Capture the exact RPM input needed for a daily file before parsing can reject it.
 - Retain exactly five independently decodable JPEGs from an aging alarm video, while keeping the
   legacy `videoPaths` field and source video during a rollback grace period.
@@ -31,7 +32,7 @@ deployment and storage commands fail closed there.
 
 | Data | Primary location | Owner | Default lifecycle |
 | --- | --- | --- | --- |
-| Recent observations and OSH metadata | PostgreSQL `postgres_data` volume | Tiered OSH database | Only allowlisted high-volume detector streams become cold-tier eligible after 48 hours; all other observations and business records remain in PostgreSQL |
+| Transactional records, OSH metadata, and immutable-output staging | PostgreSQL `postgres_data` volume | Tiered OSH database | Allowlisted immutable detector outputs are committed here first and remain through verified activation plus grace; mutable occupancy/alarm events, adjudications, reports, metadata, overlays, tombstones, and all non-allowlisted observations remain PostgreSQL-backed |
 | Cold detector observations | `${OSCAR_ARCHIVE_DIR}` bind mount | Tiered OSH database and archive catalog | Immutable Parquet generation plus manifest and schema snapshot |
 | Daily-file source journal | `files/.dailyfile-journal` in `oscar_state` | Daily File Journal service | Per-lane framed segments and publication ledger; private sealed segments expire after 30 days only after immutable-publication validation and exact frozen replay, with an optional additional backup gate |
 | Published daily files | `files/dailyfiles` in `oscar_state` | Daily File Journal service | Immutable legacy CSV plus versioned SHA-256 manifest |
@@ -83,9 +84,9 @@ invokes a legacy publisher or merge helper, and OSCAR does not provide PITR.
 ```text
 RPM record
   |-- synchronous per-lane journal append --> framed segment --> daily CSV + manifest
-  `-- parse/publish --> in-memory batch --> PostgreSQL hot observations
+  `-- parse/publish --> in-memory batch --> PostgreSQL commit-durable staging/transactions
                                               |
-                                              | repeatable-read snapshot after hot-retention age
+                                              | repeatable-read snapshot of an eligible completed hour
                                               v
                           Parquet + schema snapshot + manifest
                                               |
@@ -101,9 +102,10 @@ Viewer/OSH query --> PostgreSQL candidates + catalog-authorized Parquet candidat
 ```
 
 Catalog activation makes an `ACTIVE` generation queryable. The shipping profile requires a verified
-hot/cold parity receipt and one full day of overlap before deleting exact generation-owned hot IDs.
-With the 48-hour archive-eligibility age, normal hot removal is therefore about 72 hours after the
-observation, plus hourly scheduling and processing time. The generation then becomes `SEALED`;
+hot/cold parity receipt and three days from activation before deleting exact generation-owned hot
+IDs. This is roughly a 72-hour minimum after activation, not a deletion SLA: completed-hour delay,
+scheduling, bounded backlogs, verification failures, and holds can all extend PostgreSQL residency.
+The generation then becomes `SEALED`;
 both `ACTIVE` and `SEALED` generations are online query candidates. Confirmed cold purge first makes
 a `SEALED` generation `DELETING` and non-queryable, then removes its files and ends in `PURGED`.
 
@@ -118,7 +120,13 @@ values when they are accepted, and commits a prepared-statement batch at 10,000 
 configured `autoCommitPeriod` (one second in the standard configuration). The PostgreSQL JDBC
 driver rewrites compatible batches into multi-row inserts. A statement-level transition-table
 trigger updates each affected datastream's time range once per statement instead of once per
-observation.
+observation. An allowlisted immutable observation becomes durable staging only after that database
+commit succeeds; the primary profile is not a direct-to-Parquet acknowledgement path.
+
+Only a fresh schema created with explicit `PARQUET_PRIMARY` omits the generic observation-payload
+GIN index. Purpose-built event filter indexes remain because mutable occupancy/alarm records stay in
+PostgreSQL. Ordinary PostGIS stores, the `HOT_RETENTION` tiered mode, and already-created schemas are
+not silently changed or stripped of an index.
 
 The allocator raises its startup high-water from both live rows and every cataloged archive state
 for the same store/scope. Archive activation and sealing take an exclusive transaction-scoped store
@@ -165,17 +173,20 @@ racing a successful hold without loading every generation hold in the store.
 
 Parquet is OSCAR's primary cold observation tier, not a backup. It depends on the PostgreSQL catalog,
 overlays, tombstones, and application state and therefore must be captured with those components in
-a coordinated snapshot. Only the five output names allowlisted in the standard configuration are
-cold-tiered; this is not a generic every-table or every-observation export.
+a coordinated snapshot. Only the five immutable output names allowlisted in the standard
+configuration are cold-tiered; this is not a generic every-table or every-observation export, and
+mutable events remain in PostgreSQL.
 
 An asynchronous single-worker cycle starts immediately when the database module starts, then runs
-hourly and finds the oldest eligible unarchived row before the 48-hour cutoff. Ingestion only writes
-the hot PostgreSQL journal; it never waits for Parquet work. This deliberately avoids producing
-tiny duplicate cold files as each live observation arrives while still beginning catch-up promptly
-after a restart. To
-catch up without monopolizing the host, a cycle starts at most 24 generations and stops starting
-new work after 15 minutes by default; an in-progress generation is allowed to finish safely. Each
-normal catalog window is one UTC hour. The exporter orders eligible unowned rows by phenomenon
+every five minutes. In `PARQUET_PRIMARY`, its cutoff is five minutes before the current time,
+truncated to a UTC hour, so only a completed UTC hour becomes eligible and normally no sooner than
+five minutes after it closes. Ingestion always commits PostgreSQL first and never waits for Parquet
+work; there is no direct-to-Parquet write path or one-object-per-observation behavior. Eligibility is
+not an activation SLA: resource admission, backlog, failure, and retry can delay publication. To
+catch up without monopolizing the host, a cycle starts at most two generations, verifies at most
+two, deletes at most two eligible hot generations, and stops starting new work after 15 minutes by
+default; an in-progress generation is allowed to finish safely. Each normal catalog window is one
+UTC hour. The exporter orders eligible unowned rows by phenomenon
 time and observation ID and publishes deterministic bounded prefixes of that hour. A prefix is
 limited by `maximumRowsPerGeneration` (2,000,000 by default) and the lower of the operator's
 `maximumUncompressedBytesPerGeneration` setting (2 GiB by default) or one eighth of the configured
@@ -332,8 +343,9 @@ min/max row-group pruning for bounded archive searches. Event, adjudication, rep
 telemetry workflows remain on the hot path.
 
 Archiving and media conversion are intentionally background work and still consume CPU and I/O.
-Each archive generation is bounded, and a catch-up cycle starts no more than 24 generations or 15
-minutes of new work by default; media extraction decodes one source twice to make time-positioned,
+Each archive generation is bounded, and a catch-up cycle starts no more than two generations or 15
+minutes of new work by default; parity verification and eligible deletion are independently bounded
+at two generations per cycle. Media extraction decodes one source twice to make time-positioned,
 independently decodable JPEGs. Provision spare capacity and measure the site under
 its real lane/camera rate before enabling hot-row deletion. See
 [Storage operations](STORAGE_OPERATIONS.md#capacity-and-performance-monitoring).
@@ -366,7 +378,8 @@ policy to hot, cold, exported, and backup copies.
 
 OSCAR 3.9.2 is a substantial storage-profile update. A new installation uses:
 
-- `OscarTieredObsSystemDatabaseConfig` with sequential IDs and batched writes;
+- `OscarTieredObsSystemDatabaseConfig` with explicit `PARQUET_PRIMARY`, sequential IDs, and batched
+  commit-durable PostgreSQL staging for the allowlisted immutable outputs;
 - additional archive ownership metadata on observations and a versioned archive catalog;
 - a required direct daily-file journal for Rapiscan, Aspect, and RS350 drivers;
 - exact-five JPEG retained media rather than keyframe-only MP4 reduction; and

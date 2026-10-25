@@ -119,9 +119,14 @@ const expectedStorageDefaults = {
     'videoRetentionConfig.maintenanceWorkLimit': [videoRetention?.maintenanceWorkLimit, 200],
     'videoRetentionConfig.metadataReclamationWorkLimit': [videoRetention?.metadataReclamationWorkLimit, 200],
     'archive.enabled': [archive?.enabled, true],
-    'archive.intervalMinutes': [archive?.intervalMinutes, 60],
+    'archive.storageMode': [archive?.storageMode, 'PARQUET_PRIMARY'],
     'archive.hotRetentionDays': [archive?.hotRetentionDays, 2],
-    'archive.rollbackGraceDays': [archive?.rollbackGraceDays, 1],
+    'archive.parquetPrimaryArchiveDelayMinutes': [archive?.parquetPrimaryArchiveDelayMinutes, 5],
+    'archive.intervalMinutes': [archive?.intervalMinutes, 5],
+    'archive.maximumGenerationsPerCycle': [archive?.maximumGenerationsPerCycle, 2],
+    'archive.maximumVerificationsPerCycle': [archive?.maximumVerificationsPerCycle, 2],
+    'archive.maximumDeletionsPerCycle': [archive?.maximumDeletionsPerCycle, 2],
+    'archive.rollbackGraceDays': [archive?.rollbackGraceDays, 3],
     'archive.deleteHotAfterArchive': [archive?.deleteHotAfterArchive, true],
     'archive.requireParityReceipt': [archive?.requireParityReceipt, true],
     'dailyJournal.sealedJournalRetentionDays': [dailyJournal?.sealedJournalRetentionDays, 30],
@@ -131,6 +136,12 @@ for (const [field, [actual, expected]] of Object.entries(expectedStorageDefaults
     if (actual !== expected) {
         throw new Error(`dist/config/standard/config.json: expected ${field}=${expected}, found ${actual}.`);
     }
+}
+const expectedArchiveOutputs = [
+    'gammaCounts', 'gammaThreshold', 'neutronCounts', 'setupGamma', 'setupNeutron',
+];
+if (JSON.stringify(archive?.outputNames) !== JSON.stringify(expectedArchiveOutputs)) {
+    throw new Error('dist/config/standard/config.json: expected the approved five-output immutable archive allowlist.');
 }
 requireMatch('dist/release/.env.example', /^OSCAR_VERSION=(.+)$/m, version, 'OSCAR_VERSION');
 requireMatch(
