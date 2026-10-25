@@ -70,10 +70,10 @@ DuckDB writes ZSTD-compressed Parquet with a row-group target of 122,880 rows. S
 Hive-style date partition allow Parquet min/max metadata and path selection to avoid scanning
 unrelated time/datastream ranges.
 
-A busy UTC hour may be represented by several immutable generations with the same catalog window.
+A busy UTC-aligned staging window may be represented by several immutable generations with the same catalog window.
 Each generation contains the next deterministic `(phenomenon_time, id_value)` prefix that fits the
 bounded export budget; later prefixes use normal job revisions. Catalog ownership remains exact per
-observation, so combined hot/cold reads and portable exports do not duplicate rows.
+observation, so combined staging/cold reads and portable exports do not duplicate rows.
 
 `result_json` is not a self-describing replacement for the OSH schema. Keep the matching schema
 snapshot whenever a Parquet object is copied.
@@ -160,11 +160,14 @@ deployment running the matching release rather than starting older code on a new
 | `oscar_archive_object` | Every generation object, kind, relative path, SHA-256, bytes, and lifecycle state |
 | `oscar_archive_id_block` | Generation ID range used to plan exact-ID lookups |
 | `oscar_archive_schema` | PostgreSQL copy of each generation's datastream schemas |
+| `oscar_obs_storage_route` | Stable mutable-versus-immutable classification for each observed datastream |
+| `oscar_obs_stage_partition` | Attached/detached catalog for short-lived LOGGED Parquet-primary staging children |
+| `oscar_obs_stage_owner` | Compact exact row-to-generation ownership while a staging child still overlaps Parquet; removed with the child |
 | `oscar_event_locator` | Stable public-event to observation/generation locator reserved for direct lookup |
 | `oscar_obs_overlay` | Mutable value for an updated immutable archived observation |
 | `oscar_tombstone` | Logical removal of an immutable archived observation |
 | `oscar_retention_hold` | Active/released generation or observation holds |
-| `oscar_archive_verification` | Parity, hot-deletion, and deferred-hold receipts |
+| `oscar_archive_verification` | Parity plus primary-stage retirement or compatibility hot-deletion receipts |
 | `oscar_deletion_plan` / `oscar_deletion_plan_item` | Frozen, expiring cold-deletion selection |
 | `oscar_deletion_ledger` | Per-object deletion audit trail |
 | `oscar_media_manifest` / `oscar_media_asset` | Reserved structured media catalog records |
@@ -180,8 +183,9 @@ EXPORTING job --> ACTIVE generation --> SEALED generation --> DELETING generatio
          `----> FAILED job
 ```
 
-- `ACTIVE`: files are queryable and hot copies can still exist.
-- `SEALED`: parity passed and exact hot rows have been removed; files remain queryable.
+- `ACTIVE`: files are queryable and a verified PostgreSQL overlap can still exist.
+- `SEALED`: parity passed and the corresponding Parquet-primary stage child has been
+  dropped (or, in `HOT_RETENTION`, its exact hot rows were deleted); files remain queryable.
 - `DELETING`: a confirmed purge transaction made the entire generation non-queryable and persisted
   deletion intent before the first file removal. Re-running the same plan/token resumes it.
 - `PURGED`: an approved cold-deletion plan removed the objects; it is not queryable.

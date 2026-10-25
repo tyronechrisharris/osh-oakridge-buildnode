@@ -241,22 +241,28 @@ if (!fs.existsSync(standardConfigPath)) {
             fail('the inactive HOT_RETENTION compatibility value must remain 2 days');
         }
         if (archiveConfig?.parquetPrimaryArchiveDelayMinutes !== 5 ||
-            archiveConfig?.intervalMinutes !== 5) {
-            fail('the standard Parquet-primary profile must use a 5-minute completed-hour delay and cycle');
+            archiveConfig?.immutableStageWindowMinutes !== 30 ||
+            archiveConfig?.maximumFuturePhenomenonSkewMinutes !== 5 ||
+            archiveConfig?.parquetPrimaryIntervalMinutes !== 1 ||
+            archiveConfig?.maximumStagePartitionsPerCycle !== 8) {
+            fail('the standard Parquet-primary profile must use a 30-minute stage, 5-minute delay, 5-minute future-skew limit, 1-minute worker, and 8-partition retirement bound');
+        }
+        if (archiveConfig?.intervalMinutes !== 60) {
+            fail('the inactive HOT_RETENTION compatibility interval must remain 60 minutes');
         }
         if (archiveConfig?.maximumGenerationsPerCycle !== 2 ||
             archiveConfig?.maximumVerificationsPerCycle !== 2 ||
             archiveConfig?.maximumDeletionsPerCycle !== 2) {
-            fail('the standard Parquet-primary lifecycle work bounds must all equal 2');
+            fail('the standard generation, verification, and inactive HOT_RETENTION deletion bounds must all equal 2');
         }
         if (archiveConfig?.rollbackGraceDays !== 3) {
-            fail('the standard verified hot/cold overlap must be 3 days from activation');
+            fail('the inactive HOT_RETENTION compatibility rollback grace must remain 3 days');
         }
         if (archiveConfig?.deleteHotAfterArchive !== true) {
-            fail('the standard profile must delete eligible hot observations after verified overlap');
+            fail('the standard profile must retire verified Parquet-primary staging');
         }
         if (archiveConfig?.requireParityReceipt !== true) {
-            fail('the standard profile must require a parity receipt before deleting eligible hot observations');
+            fail('the standard profile must require a parity receipt before retiring immutable staging children');
         }
         if (dailyJournalConfig?.sealedJournalRetentionDays !== 30 ||
             dailyJournalConfig?.requireBackupBeforeSealedJournalDeletion !== false) {

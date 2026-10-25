@@ -102,7 +102,12 @@ if (Object.entries(expectedVideoRetention).some(([field, expected]) =>
         service?.videoRetentionConfig?.[field] !== expected) ||
     archive?.storageMode !== 'PARQUET_PRIMARY' ||
     archive?.hotRetentionDays !== 2 ||
-    archive?.parquetPrimaryArchiveDelayMinutes !== 5 || archive?.intervalMinutes !== 5 ||
+    archive?.parquetPrimaryArchiveDelayMinutes !== 5 ||
+    archive?.immutableStageWindowMinutes !== 30 ||
+    archive?.maximumFuturePhenomenonSkewMinutes !== 5 ||
+    archive?.parquetPrimaryIntervalMinutes !== 1 ||
+    archive?.maximumStagePartitionsPerCycle !== 8 ||
+    archive?.intervalMinutes !== 60 ||
     archive?.maximumGenerationsPerCycle !== 2 ||
     archive?.maximumVerificationsPerCycle !== 2 ||
     archive?.maximumDeletionsPerCycle !== 2 ||
@@ -112,7 +117,7 @@ if (Object.entries(expectedVideoRetention).some(([field, expected]) =>
     dailyJournal?.sealedJournalRetentionDays !== 30 ||
     dailyJournal?.requireBackupBeforeSealedJournalDeletion !== false ||
     JSON.stringify(archive?.outputNames) !== JSON.stringify(outputs)) {
-    throw new Error('standard lifecycle defaults no longer encode the production media cadence/grace, explicit five-minute Parquet-primary cycle, balanced work bounds, three-day activation grace, 30-day exact-replay journal retention, and five-output allowlist');
+    throw new Error('standard lifecycle defaults no longer encode the production media cadence/grace, 30-minute Parquet-primary staging, 5-minute delay/skew, 1-minute worker, 8-partition retirement bound, inactive HOT_RETENTION compatibility values, 30-day exact-replay journal retention, and five-output allowlist');
 }
 NODE
 

@@ -220,5 +220,5 @@ Entering the hostname without `https://` is supported on the default port; the g
 The release's `documentation` directory contains the current deployment guide, operational-view and
 Status of Health guides, storage architecture/data-lifecycle/archive/backup/operations guides, and
 all four localized operator manuals. Read `documentation/STORAGE_OPERATIONS.md` before relying on
-hot deletion or removing old cold generations. Official GitHub release artifacts also include the
+verified staging-partition retirement or removing old cold generations. Official GitHub release artifacts also include the
 generated, version-labeled PDF manuals.

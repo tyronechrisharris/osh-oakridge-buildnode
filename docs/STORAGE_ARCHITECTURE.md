@@ -19,7 +19,7 @@ deployment and storage commands fail closed there.
 - Preserve OSH system, datastream, feature-of-interest, and observation identities.
 - Keep mutable/transactional records in PostgreSQL, and use PostgreSQL as bounded commit-durable
   staging for the allowlisted immutable detector outputs.
-- Copy completed-hour batches of those eligible outputs to queryable ZSTD Parquet generations
+- Copy closed 30-minute batches of those eligible outputs to queryable ZSTD Parquet generations
   without locking the live tables or pausing ingestion.
 - Capture the exact RPM input needed for a daily file before parsing can reject it.
 - Retain exactly five independently decodable JPEGs from an aging alarm video, while keeping the
@@ -32,7 +32,7 @@ deployment and storage commands fail closed there.
 
 | Data | Primary location | Owner | Default lifecycle |
 | --- | --- | --- | --- |
-| Transactional records, OSH metadata, and immutable-output staging | PostgreSQL `postgres_data` volume | Tiered OSH database | Allowlisted immutable detector outputs are committed here first and remain through verified activation plus grace; mutable occupancy/alarm events, adjudications, reports, metadata, overlays, tombstones, and all non-allowlisted observations remain PostgreSQL-backed |
+| Transactional records, OSH metadata, and immutable-output staging | PostgreSQL `postgres_data` volume | Tiered OSH database | Allowlisted immutable detector outputs commit first to short-lived LOGGED 30-minute child relations; after verified Parquet activation and exact parity the whole child is dropped. Mutable occupancy/alarm events, adjudications, reports, small metadata, overlays, tombstones, and all non-allowlisted observations remain PostgreSQL-backed |
 | Cold detector observations | `${OSCAR_ARCHIVE_DIR}` bind mount | Tiered OSH database and archive catalog | Immutable Parquet generation plus manifest and schema snapshot |
 | Daily-file source journal | `files/.dailyfile-journal` in `oscar_state` | Daily File Journal service | Per-lane framed segments and publication ledger; private sealed segments expire after 30 days only after immutable-publication validation and exact frozen replay, with an optional additional backup gate |
 | Published daily files | `files/dailyfiles` in `oscar_state` | Daily File Journal service | Immutable legacy CSV plus versioned SHA-256 manifest |
@@ -86,26 +86,27 @@ RPM record
   |-- synchronous per-lane journal append --> framed segment --> daily CSV + manifest
   `-- parse/publish --> in-memory batch --> PostgreSQL commit-durable staging/transactions
                                               |
-                                              | repeatable-read snapshot of an eligible completed hour
+                                              | repeatable-read snapshot of an eligible closed stage window
                                               v
                           Parquet + schema snapshot + manifest
                                               |
-                           catalog activation + exact-row ownership marker
+                     catalog activation + compact exact-owner ledger
                                               |
-              hot/cold parity receipt + rollback grace
-                 + deleteHotAfterArchive=true
+                         object hash + exact parity receipt
                                               v
-                           bounded deletion of exact hot row IDs
+                    transactional detach + whole-child drop
 
 Viewer/OSH query --> PostgreSQL candidates + catalog-authorized Parquet candidates
                     --> overlays/tombstones --> de-duplicate (hot wins) --> order/limit
 ```
 
-Catalog activation makes an `ACTIVE` generation queryable. The shipping profile requires a verified
-hot/cold parity receipt and three days from activation before deleting exact generation-owned hot
-IDs. This is roughly a 72-hour minimum after activation, not a deletion SLA: completed-hour delay,
-scheduling, bounded backlogs, verification failures, and holds can all extend PostgreSQL residency.
-The generation then becomes `SEALED`;
+Catalog activation makes an `ACTIVE` generation queryable. In the shipping `PARQUET_PRIMARY`
+profile, the worker re-hashes the Parquet object, proves exact row and UUID parity, and then
+transactionally detaches and drops the complete staging child. There is no three-day duplicate-raw
+overlap or row-wise staging deletion in this mode. The normal window, delay, clock-skew, and worker
+budget totals at most 60 minutes, but this is an operational SLO rather than a hard deadline:
+resource backlog, publication/parity failure, or an outage can extend PostgreSQL residency. The
+generation then becomes `SEALED`;
 both `ACTIVE` and `SEALED` generations are online query candidates. Confirmed cold purge first makes
 a `SEALED` generation `DELETING` and non-queryable, then removes its files and ends in `PURGED`.
 
@@ -123,17 +124,19 @@ trigger updates each affected datastream's time range once per statement instead
 observation. An allowlisted immutable observation becomes durable staging only after that database
 commit succeeds; the primary profile is not a direct-to-Parquet acknowledgement path.
 
-Only a fresh schema created with explicit `PARQUET_PRIMARY` omits the generic observation-payload
-GIN index. Purpose-built event filter indexes remain because mutable occupancy/alarm records stay in
-PostgreSQL. Ordinary PostGIS stores, the `HOT_RETENTION` tiered mode, and already-created schemas are
-not silently changed or stripped of an index.
+Only a fresh schema created with explicit `PARQUET_PRIMARY` routes allowlisted detector rows into
+short-lived LOGGED children. Those children keep only lean routing, export, and parity indexes; they
+omit the generic observation-payload GIN and mutable-event indexes. Purpose-built event filter
+indexes remain on the PostgreSQL parent because mutable occupancy/alarm records stay there.
+Ordinary PostGIS stores, the `HOT_RETENTION` tiered mode, and already-created schemas are not
+silently changed or stripped of an index.
 
 The allocator raises its startup high-water from both live rows and every cataloged archive state
 for the same store/scope. Archive activation and sealing take an exclusive transaction-scoped store
 lock; observation batches and logical mutations take its shared form and then acquire affected
 observation locks in ascending numeric order. File export stays outside that critical section. This
 preserves public IDs and makes a hot-to-cold ownership transition atomic with concurrent writes,
-overlays, tombstones, and hot-row deletion without introducing a global runtime mutex.
+overlays, tombstones, and stage retirement without introducing a global runtime mutex.
 
 PostgreSQL remains the catalog of record for systems, datastreams, schemas, event locators,
 archive generations, integrity receipts, overlays, tombstones, retention holds, deletion plans,
@@ -166,7 +169,7 @@ Catalog schema v5 adds durable retention-hold resolution provenance and makes ho
 logical mutation boundary. A removal holds the shared store/per-observation locks, takes a shared
 hold-table lock in the same transaction, and materializes only exact observation holds plus held
 generations whose ID blocks are candidates for that bounded ID set. CLI hold creation/release uses
-a conflicting table-writer lock. This prevents both hot-row deletion and archived tombstoning from
+a conflicting table-writer lock. This prevents archived tombstoning or cold purge from
 racing a successful hold without loading every generation hold in the store.
 
 ### Parquet cold tier
@@ -178,21 +181,23 @@ configuration are cold-tiered; this is not a generic every-table or every-observ
 mutable events remain in PostgreSQL.
 
 An asynchronous single-worker cycle starts immediately when the database module starts, then runs
-every five minutes. In `PARQUET_PRIMARY`, its cutoff is five minutes before the current time,
-truncated to a UTC hour, so only a completed UTC hour becomes eligible and normally no sooner than
-five minutes after it closes. Ingestion always commits PostgreSQL first and never waits for Parquet
-work; there is no direct-to-Parquet write path or one-object-per-observation behavior. Eligibility is
-not an activation SLA: resource admission, backlog, failure, and retry can delay publication. To
-catch up without monopolizing the host, a cycle starts at most two generations, verifies at most
-two, deletes at most two eligible hot generations, and stops starting new work after 15 minutes by
-default; an in-progress generation is allowed to finish safely. Each normal catalog window is one
-UTC hour. The exporter orders eligible unowned rows by phenomenon
-time and observation ID and publishes deterministic bounded prefixes of that hour. A prefix is
+every minute. In `PARQUET_PRIMARY`, allowlisted observations route to UTC-aligned, LOGGED 30-minute
+staging children. A closed window becomes eligible after the five-minute safety delay. Detector
+phenomenon times more than five minutes ahead of PostgreSQL's transaction clock are rejected so a
+bad device clock cannot pin a future partition indefinitely. Ingestion always commits PostgreSQL
+first and never waits for Parquet work; there is no direct-to-Parquet write path or
+one-object-per-observation behavior. The 30 + 5 + 1 + 5 minute nominal window/delay/worker/skew
+budget is at most 41 minutes and is required to remain at or below 60 minutes, but it is not a hard
+deadline: resource admission, backlog, failure, and retry can delay publication. To catch up
+without monopolizing the host, a cycle starts at most two generations, verifies at most two, retires
+at most eight complete stage partitions, and stops starting new work after 15 minutes by default;
+in-progress publication is allowed to finish safely. The exporter orders eligible unowned rows by phenomenon
+time and observation ID and publishes deterministic bounded prefixes of that window. A prefix is
 limited by `maximumRowsPerGeneration` (2,000,000 by default) and the lower of the operator's
 `maximumUncompressedBytesPerGeneration` setting (2 GiB by default) or one eighth of the configured
 DuckDB session memory (32 MiB with the standard 256 MiB session). Remaining rows are published as
-same-hour revisions during the current or a later cycle. If one row alone exceeds the effective
-limit, the cycle fails closed and retains it hot for operator action.
+same-window revisions during the current or a later cycle. If one row alone exceeds the effective
+limit, the cycle fails closed and retains it in the LOGGED stage for operator action.
 
 Before selecting new full-hour work, each cycle reclaims the exact bounds of the oldest eligible
 latest-revision failed job (or an export left stale for two hours). This preserves retry identity
@@ -204,12 +209,16 @@ the selected rows while producing the files. PostgreSQL is fetched in 5,000-row 
 DuckDB insertion is flushed and explicitly cleared every 500 rows, preventing the JDBC batch from
 retaining the entire hour in native memory. It sorts observations by datastream and time, writes
 ZSTD Parquet, verifies the row count and ID range through DuckDB, records a compressed datastream
-schema snapshot, and publishes the manifest last. Catalog activation then marks the exact exported
-rows with the generation UUID and requires the marked count to equal the manifest count. New or
-late rows remain unmarked and are picked up by a later generation.
+schema snapshot, and publishes the manifest last. Catalog activation then records exact ownership
+in a compact, short-lived ledger and requires the owned count and UUID set to equal the manifest.
+New or late rows remain unowned and are picked up by a later generation. After every row in a stage
+child has an active, parity-verified owner, the worker re-hashes the authoritative Parquet objects,
+transactionally detaches and drops the complete child, clears its temporary ownership entries, and
+seals fully retired generations. PostgreSQL therefore performs no large row-wise raw-data delete in
+the primary mode.
 
-Normal reads merge PostgreSQL and all catalog-authorized Parquet generations. PostgreSQL wins if a
-row intentionally exists in both tiers during rollback grace. Archived updates are stored as small
+Normal reads merge PostgreSQL staging and all catalog-authorized Parquet generations. PostgreSQL
+wins during the brief verified transition when the same ID exists in both tiers. Archived updates are stored as small
 PostgreSQL overlays, and archived deletes become PostgreSQL tombstones; immutable Parquet files are
 not rewritten for individual mutations. If a live datastream schema is no longer present, the
 generation's schema snapshot is used to decode its observations.
@@ -231,7 +240,7 @@ query service. An exported generation can also be inspected with ordinary DuckDB
 tools; see [Archive format](ARCHIVE_FORMAT.md).
 
 Every embedded DuckDB connection—export, post-write verification, activation staging, hot/cold
-parity, hot-row deletion, cold result streaming, metadata scans, and counts—uses the same bounded
+parity, cold result streaming, metadata scans, and counts—uses the same bounded
 resource policy. The 3.9.2 production defaults are 256 MiB of DuckDB memory, two worker threads,
 and 4 GiB of spill per operation, with at most two embedded sessions admitted process-wide. A
 fair first-in/first-out gate waits up to 30 seconds and then fails busy; all independently
@@ -330,7 +339,7 @@ The storage layers use the same publication pattern:
 5. Publish the manifest or catalog transition last.
 
 Incomplete files are therefore not normal read candidates. Complete corruption is fail-visible:
-the system preserves the original source or hot rows and records/logs the failure. Archive readers
+the system preserves the original source or staging data and records/logs the failure. Archive readers
 also verify a Parquet object's SHA-256 before first use in the process. Operators must investigate a
 missing or mismatched catalog object; they must not remove its catalog row to hide the error.
 
@@ -344,10 +353,10 @@ telemetry workflows remain on the hot path.
 
 Archiving and media conversion are intentionally background work and still consume CPU and I/O.
 Each archive generation is bounded, and a catch-up cycle starts no more than two generations or 15
-minutes of new work by default; parity verification and eligible deletion are independently bounded
-at two generations per cycle. Media extraction decodes one source twice to make time-positioned,
+minutes of new work by default; parity verification is bounded at two generations and physical
+stage retirement at eight partitions per cycle. Media extraction decodes one source twice to make time-positioned,
 independently decodable JPEGs. Provision spare capacity and measure the site under
-its real lane/camera rate before enabling hot-row deletion. See
+its real lane/camera rate before accepting whole-stage retirement. See
 [Storage operations](STORAGE_OPERATIONS.md#capacity-and-performance-monitoring).
 The media scanner opens its PostgreSQL reads inside a worker-scoped cancellation boundary and
 checks interruption between bounded maintenance entries. A supported stop therefore cancels only
@@ -380,7 +389,7 @@ OSCAR 3.9.2 is a substantial storage-profile update. A new installation uses:
 
 - `OscarTieredObsSystemDatabaseConfig` with explicit `PARQUET_PRIMARY`, sequential IDs, and batched
   commit-durable PostgreSQL staging for the allowlisted immutable outputs;
-- additional archive ownership metadata on observations and a versioned archive catalog;
+- a compact short-lived exact-owner ledger for staging plus a versioned archive catalog;
 - a required direct daily-file journal for Rapiscan, Aspect, and RS350 drivers;
 - exact-five JPEG retained media rather than keyframe-only MP4 reduction; and
 - PostgreSQL data checksums, `archive_mode=off`, an external Parquet archive bind, and an optional
@@ -397,12 +406,12 @@ same `COALESCE` expressions as the unique index, including for null fields, so P
 prepared plans can probe the complete key instead of scanning every row for a datastream.
 Exact natural-key replays are no-ops, while corrected values retain the original OSH observation
 ID. If the observation is already archive-owned, OSCAR writes the correction to the immutable
-generation's PostgreSQL overlay—both during hot-copy grace and after the hot row has been deleted—
+generation's PostgreSQL overlay—both during the brief verified staging transition and after the staging child has been dropped—
 instead of modifying Parquet or inserting a duplicate hot identity.
 
 For the current test systems and for new production deployments, initialize a fresh 3.9.2 database
 and configuration. For a production system whose history must be preserved, keep the old deployment
 read-only, take and verify a backup, export records required by policy, and perform a separately
 validated migration rather than deleting volumes or assuming `upgrade` enabled the new lifecycle.
-The staged rollout in [Storage operations](STORAGE_OPERATIONS.md#production-rollout) keeps hot-row
-deletion off until archive parity and a restore drill pass.
+The staged rollout in [Storage operations](STORAGE_OPERATIONS.md#production-rollout) validates
+whole-partition retirement only after archive parity and a restore drill pass.

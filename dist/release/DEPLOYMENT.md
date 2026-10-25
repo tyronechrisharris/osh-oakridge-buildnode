@@ -434,12 +434,17 @@ volume ownership.
 Fresh deployments default to backup mode `disabled`; backup, verification, restore, and the retired
 prune command fail with opt-in guidance until setup changes the mode to `single`. For a fresh
 database, the standard data lifecycle explicitly selects `PARQUET_PRIMARY`: five allowlisted
-immutable high-volume outputs commit to bounded PostgreSQL staging first, and a five-minute worker
-makes a completed UTC hour eligible five minutes after it closes. It deletes only exact
-generation-owned staging rows after manifest-last activation, successful parity, and three days
-from activation. That roughly 72-hour overlap is a minimum rather than a deletion SLA; bounded
-backlog, failures, and holds can extend it. Mutable events and other non-allowlisted data remain in
-PostgreSQL, and only a fresh primary schema omits the generic payload GIN index.
+immutable high-volume outputs commit first to LOGGED, UTC-aligned 30-minute PostgreSQL staging
+children. A one-minute worker makes a closed child eligible after a five-minute safety delay; a
+detector timestamp more than five minutes ahead of the database receipt clock is rejected. After
+manifest-last activation, object re-hash, and exact row/UUID parity, OSCAR transactionally detaches
+and drops the complete child, retiring at most eight children per cycle. There is no three-day raw
+PostgreSQL overlap in this mode. The normal staging budget is at most 60 minutes, but this is an
+operational SLO rather than a hard deadline during backlog, failure, lock contention, or downtime.
+Mutable events, adjudications, small metadata, and other non-allowlisted data remain in PostgreSQL;
+fresh primary staging children omit generic payload and mutable-event indexes. After safe stage
+retirement, Parquet and the independently published daily files are the durable long-term detector
+representations; the compact staging-owner ledger is removed with its child.
 Parquet is the primary cold tier, not a backup. Cold archive deletion always requires a reviewed
 `archive dry-run` plan and its one-time token.
 

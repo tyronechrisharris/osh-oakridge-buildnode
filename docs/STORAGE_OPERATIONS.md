@@ -19,7 +19,7 @@ fallback.
    permanent data loss is authorized and a verified backup is retained.
 2. Never edit `.open`/`.seg` journal files, published daily CSVs/manifests, retained-media internals,
    Parquet files, or generation manifests in place.
-3. Run `archive verify` before relying on hot deletion, exporting evidence, or creating a cold purge
+3. Run `archive verify` before relying on stage retirement, exporting evidence, or creating a cold purge
    plan.
 4. Use `archive dry-run` and its one-time token for cold deletion. Do not substitute `rm`, Explorer,
    storage-array expiration, or a generic object-store lifecycle.
@@ -50,16 +50,16 @@ New installations receive these defaults from `dist/config/standard/config.json`
 | Sealed journal lifecycle queue | bounded durable batches | Avoids startup and periodic all-history directory scans while recovery and deletion backlogs converge |
 | Database `idProviderType` | `SEQUENTIAL` | Required for exact, race-free archive ownership |
 | Database batch | 10,000 rows / 1 s | Bounded insert transaction and commit period |
-| Archive mode / completed-hour delay | `PARQUET_PRIMARY` / 5 min | The five allowlisted immutable outputs commit to PostgreSQL staging first; a completed UTC hour then becomes eligible for Parquet, without a direct-to-Parquet path |
-| Archive interval | 5 min | Background cycle frequency; eligibility is not an activation SLA |
-| Archive work bounds | 2 generations / 2 verifications / 2 deletions / 15 min | Independently bounds each lifecycle phase and stops starting new generations at the duration bound; in-progress publication completes safely |
-| Maximum generation | 2,000,000 rows / lower of 2 GiB operator cap or 1/8 DuckDB memory (32 MiB standard) | Deterministic `(phenomenontime,id)` prefixes become same-hour revisions; 500-row cleared DuckDB inserts bound native staging memory, and a single oversized row fails closed hot |
+| Primary stage window / delay / future skew | 30 min / 5 min / 5 min | The five allowlisted immutable outputs commit to UTC-aligned LOGGED PostgreSQL children first; a closed child becomes Parquet-eligible after the delay, and farther-future detector clocks are rejected |
+| Parquet-primary worker interval | 1 min | Background export, parity, and retirement cadence; the at-most-one-hour normal staging budget is an SLO, not a hard deadline during failure or backlog |
+| Archive work bounds | 2 generations / 2 verifications / 8 partition retirements / 15 min | Independently bounds each lifecycle phase and stops starting new generations at the duration bound; in-progress publication completes safely |
+| Maximum generation | 2,000,000 rows / lower of 2 GiB operator cap or 1/8 DuckDB memory (32 MiB standard) | Deterministic `(phenomenontime,id)` prefixes become same-window revisions; 500-row cleared DuckDB inserts bound native staging memory, and a single oversized row fails closed in the LOGGED child |
 | DuckDB memory / threads | 256 MiB / 2 per connection | Bounds native memory and CPU for every export, verification, parity, delete, cold query, metadata scan, and count |
 | DuckDB session admission | 2 process-wide / 30 s wait | Fairly bounds the aggregate native-memory/CPU/spill multiplier; excess work fails busy and can be retried instead of opening an unbounded connection |
 | DuckDB spill | 4 GiB per operation in `/var/lib/oscar/duckdb-tmp` | Each connection gets a mode-0700 private child that is removed on close; scratch must be disjoint from the immutable archive and is excluded from backup |
 | Parquet compression | ZSTD level 6 | Cold-storage size/CPU tradeoff |
-| Archive rollback grace | 3 days from activation | Roughly 72 hours minimum verified hot/cold overlap; scheduling, backlog, failures, and holds can extend it |
-| `deleteHotAfterArchive` | `true` | Deletes only exact generation-owned eligible staging rows after parity and grace; it does not delete mutable event/workflow rows |
+| Inactive `HOT_RETENTION` compatibility | 2 retention days / 60 min interval / 3 rollback days | Retained for configuration compatibility; these values do not impose a 72-hour raw PostgreSQL overlap in `PARQUET_PRIMARY` |
+| `deleteHotAfterArchive` | `true` | After object re-hash and exact parity, transactionally detaches and drops a complete primary-stage child; it does not delete mutable event/workflow rows |
 | Video retention age | 0 days | Makes a completed source video immediately eligible for asynchronous five-JPEG conversion on a retention scan |
 | Retention scan / catch-up | 5 min / 6 h forward | Bounds normal discovery and catch-up work after downtime |
 | Late-arrival scan | every 6 h / 2 h per pass / 24 h allowance | Rechecks delayed observations without an all-history rescan |
@@ -87,10 +87,11 @@ the tiered database owns gamma/neutron lifecycle. It does not disable connection
 or manifest-gated daily-file compatibility cleanup.
 
 The `PARQUET_PRIMARY` setting applies only to fresh databases initialized from this standard
-profile. PostgreSQL is still the commit-durable staging layer for the allowlisted immutable outputs,
+profile. PostgreSQL is still the short-lived commit-durable staging layer for the allowlisted immutable outputs,
 and remains the system of record for mutable occupancy/alarm events, adjudications, reports,
-metadata, overlays, tombstones, and non-allowlisted streams. Only a fresh primary schema omits the
-generic observation-payload GIN index; purpose-built event indexes remain. Upgrade preserves an
+metadata, overlays, tombstones, and non-allowlisted streams. Fresh primary staging children omit the
+generic observation-payload GIN and mutable-event indexes; purpose-built event indexes remain on
+the parent. Upgrade preserves an
 existing schema and configuration rather than dropping that index or silently changing its mode.
 
 Variable PostgreSQL keyset observation pages are deliberately kept unnamed at statement scope
@@ -243,11 +244,13 @@ Do not erase an old production volume simply to make the 3.9.2 module start.
 
 ### Phase 1: validate the primary cold tier
 
-The shipping profile commits only the five allowlisted immutable high-volume outputs to bounded
-PostgreSQL staging, then makes each completed UTC hour Parquet-eligible five minutes after close.
-After manifest-last activation, successful parity, and three days from activation, it may delete
-their exact generation-owned staging rows. The three days are a roughly 72-hour minimum, not a
-deletion deadline. Mutable event/workflow records remain in PostgreSQL.
+The shipping profile commits only the five allowlisted immutable high-volume outputs to LOGGED,
+UTC-aligned 30-minute PostgreSQL staging children, then makes each closed child Parquet-eligible
+after five minutes and runs the worker every minute. After manifest-last activation, object re-hash,
+and exact row/UUID parity, it transactionally detaches and drops the complete child. There is no
+three-day duplicate-raw overlap in `PARQUET_PRIMARY`. The normal stage budget is at most one hour,
+but failure, backlog, lock contention, or downtime can extend it. Mutable event/workflow records
+remain in PostgreSQL.
 Run long enough to create multiple generations across representative lane/output rates. Check:
 
 ```sh
@@ -283,13 +286,13 @@ deployment, and run the full OSCAR regression suite. Confirm that the restored a
 daily files, media, and mixed-tier queries match the source system. See
 [Backup and restore](BACKUP_RESTORE.md).
 
-### Phase 3: validate hot deletion
+### Phase 3: validate whole-partition retirement
 
-The lifecycle deletes only exact generation-owned IDs with a successful parity receipt, in bounded
-batches, after the three-day activation grace. Watch PostgreSQL row count, WAL generation, database size, archive receipts,
-query latency, and logs. PostgreSQL may not immediately return deleted heap space to the filesystem;
-normal autovacuum reuses it. Do not run an unplanned `VACUUM FULL`, which takes strong locks and can
-cause a major outage.
+The primary lifecycle retires only a complete stage child whose rows all have exact, successfully
+verified owners. Watch attached/detached stage counts and age, PostgreSQL/WAL volume, database size,
+archive receipts, query latency, and logs. A healthy cycle should reclaim the relation as a unit,
+without row-wise delete bloat or an autovacuum dependency. Do not run an unplanned `VACUUM FULL`,
+which takes strong locks and can cause a major outage.
 
 ### Phase 4: cold retention
 
@@ -506,7 +509,7 @@ has started. Observation hold IDs are positive signed 64-bit values (maximum
 `9223372036854775807`); the CLI rejects larger decimal values before SQL and uses `bigint`
 predicates so PostgreSQL can retain index plans on observation and ID-block columns.
 
-Active holds also protect logical datastore removal, not only lifecycle hot-row deletion and cold
+Active holds also protect logical datastore removal and cold
 purge. Single-observation removal fails with an explicit active-hold error and leaves the row
 visible. Bulk filtered removal skips held observation IDs and rows owned by a held generation,
 continues removing eligible rows, and returns only the number actually removed; a later invocation
@@ -818,9 +821,9 @@ row and bounded long-term hot-table growth. Expect temporary CPU and sequential 
 DuckDB export/parity pass, and CPU during FFmpeg JPEG extraction. DuckDB is capped per connection
 at 256 MiB, two workers, and 4 GiB of spill by default, and a fair process-wide gate admits at most
 two sessions. Work that cannot acquire capacity within 30 seconds fails busy without activating a
-generation or deleting hot rows. Each generation is bounded; during backlog catch-up, one cycle may
-start up to two generations over its 15-minute start window, verify at most two, and delete at most
-two eligible hot generations. Health/status UI polling remains independently bounded. Treat a
+generation or dropping a stage child. Each generation is bounded; during backlog catch-up, one cycle may
+start up to two generations over its 15-minute start window, verify at most two, and retire at most
+eight complete stage children. Health/status UI polling remains independently bounded. Treat a
 sustained regression—not a brief background spike—as the alert condition.
 
 Track at least:
@@ -845,13 +848,13 @@ Track at least:
 | Truncated `.open` tail after crash | Only incomplete final frame is truncated | Confirm warning and next successful append/publication |
 | Complete-frame CRC or immutable CSV mismatch | Initialization/publication fails visibly | Preserve all evidence; investigate storage/hardware; recover from verified copy |
 | Observation batch commit fails | Snapshots stay queued for a later in-process retry | Fix PostgreSQL/network/disk immediately; restart only after assessing uncommitted-memory exposure |
-| Archive export fails | Hot rows remain; job records `FAILED` | Check database, archive space/permissions, DuckDB error, stale partials; allow controlled retry |
-| DuckDB memory/spill cap is exhausted | Current export/query/parity operation fails; no generation is activated and no unverified hot row is deleted | Reduce query/export concurrency or window size, restore scratch capacity, or raise a cap only after site-specific load testing; a subsequent clean owner automatically reclaims recognized abandoned operation children |
+| Archive export fails | LOGGED stage child remains; job records `FAILED` | Check database, archive space/permissions, DuckDB error, stale partials; allow controlled retry |
+| DuckDB memory/spill cap is exhausted | Current export/query/parity operation fails; no generation is activated and no unverified stage child is dropped | Reduce query/export concurrency or window size, restore scratch capacity, or raise a cap only after site-specific load testing; a subsequent clean owner automatically reclaims recognized abandoned operation children |
 | DuckDB session capacity stays busy for 30 seconds | Waiting operation fails before allocating a connection or scratch child; active work continues | Let the caller retry, inspect unusually long archive queries/exports, and raise concurrency only after measuring aggregate native memory, CPU, and spill |
 | DuckDB scratch parent is broad, overlaps archive, has an unsafe lease, or is owned by another process | Archive operation fails before opening DuckDB or cleaning scratch | Keep `/var/lib/oscar/duckdb-tmp` disjoint from the archive and mode `0700`, keep `.oscar-duckdb.lock` a real regular file owned by OSCAR and mode `0600`, and stop the competing owner; on a non-POSIX embedding apply equivalent owner-only ACLs |
 | Recognized DuckDB operation children remain after OSCAR starts | First-open recovery did not complete or archive work has not yet opened DuckDB | Preserve logs and unexpected entries, confirm no second OSCAR process owns the lease, then exercise `archive status`; only with OSCAR stopped should an operator remove confirmed abandoned canonical children by hand |
-| Parity fails | Hot rows remain; generation is not sealable | Compare receipt details and source/object hashes; do not enable/bypass deletion |
-| Observation hold defers hot deletion | Held exact IDs remain hot; generation stays `ACTIVE` | No emergency action; review/release hold only through approved workflow |
+| Parity fails | Stage child remains; generation is not sealable | Compare receipt details and source/object hashes; do not bypass retirement |
+| Stage age exceeds one hour | Safe publication/verification is delayed; LOGGED data remains queryable | Treat the one-hour target as an SLO alert: inspect backlog, failed jobs, parity, archive space, lock contention, and worker health; do not force-drop the child |
 | Cataloged archive object missing/hash mismatch, ID block mismatch, or missing generation schema rows | Reader/verify/purge fails | Stop destructive work, preserve evidence, restore the coordinated database and exact archive objects from the same backup epoch, then verify again |
 | Unregistered/`DELETED` archive file or stale `.partial` | Archive status/verify fails without changing the file | Correlate UUID/path with export jobs and logs; reconcile under an approved recovery procedure, never delete merely to clear the check |
 | Source video has fewer than five decodable frames | No retained manifest; MP4 preserved | Correct camera/recording health; keep source under legacy playback and investigate |
@@ -868,7 +871,7 @@ Track at least:
 At least monthly, and before changing retention:
 
 1. Record filesystem and PostgreSQL sizes by data class.
-2. Compare archive generation rows/bytes with hot-row reduction and policy cutoffs.
+2. Compare archive generation rows/bytes with attached stage count/age and whole-child retirement.
 3. Review failed/stale jobs, parity failures, active holds, and deletion ledgers.
 4. Verify all active archive objects.
 5. Sample daily CSV manifest checks across lanes and daylight-saving boundaries where applicable.
