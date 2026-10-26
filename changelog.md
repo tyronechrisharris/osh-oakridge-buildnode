@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 - Update daily file format to use expected format with UTC and local timestamps
 - Set camera reconnect attempts to infinite (-1 in config)
 - Add ability to share links to specific occupancies, referencing the occupancy's observation ID
+- Add daily file output to historical occupancies and live lane view
 
 ## 3.9.0 2026-09-23
 ## Changes
