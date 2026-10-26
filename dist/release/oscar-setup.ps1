@@ -3,6 +3,7 @@ param(
     [ValidateSet('init', 'check', 'verify', 'start', 'stop', 'restart', 'status', 'logs', 'upgrade', 'help')]
     [string]$Command = 'help',
     [string]$Hostname,
+    [string]$Timezone,
     [ValidateRange(1, 65535)]
     [int]$Port = 443,
     [ValidateSet('self-signed', 'import')]
@@ -392,7 +393,7 @@ function Show-Help {
     @'
 OSCAR deployment administration
 
-  .\oscar.bat init [-Hostname oscar.local] [-Port 443]
+  .\oscar.bat init [-Hostname oscar.local] [-Port 443] [-Timezone America/Chicago]
       [-TlsMode self-signed|import] [-CertificatePath FILE -PrivateKeyPath FILE]
       [-AddHostsEntry] [-SkipHostsEntry] [-SkipStart]
       [-Prerequisites auto|existing|bundled]
@@ -433,6 +434,22 @@ try {
                 $Hostname = (Read-Host 'Hostname or IP address [oscar.local]').Trim()
                 if (-not $Hostname) { $Hostname = 'oscar.local' }
             }
+            if (-not $Timezone) {
+                $timezoneDefault = 'UTC'
+                $envPath = Join-Path $ScriptRoot '.env'
+                if (Test-Path -LiteralPath $envPath) {
+                    foreach ($line in [IO.File]::ReadAllLines($envPath)) {
+                        if ($line -match '^OSCAR_TIMEZONE=(.+)$') { $timezoneDefault = $Matches[1] }
+                    }
+                }
+                if (-not $NonInteractive) {
+                    $Timezone = (Read-Host "Local IANA timezone (e.g. America/Chicago) [$timezoneDefault]").Trim()
+                }
+                if (-not $Timezone) { $Timezone = $timezoneDefault }
+            }
+            if ($Timezone -cnotmatch '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$') {
+                throw 'Use an IANA timezone such as America/Chicago or UTC.'
+            }
             if (-not (Test-ValidHostname $Hostname)) { throw "Invalid hostname or IP address: $Hostname" }
             if ($Port -eq 80) { throw 'Port 80 is reserved for the HTTP-to-HTTPS redirect.' }
             New-Item -ItemType Directory -Force -Path (Join-Path $ScriptRoot 'secrets'), (Join-Path $ScriptRoot 'tls') | Out-Null
@@ -446,6 +463,9 @@ try {
             if (-not (Test-Path -LiteralPath $bootstrapSecretPath)) { Write-SecretFile $bootstrapSecretPath (New-RandomPassword) }
             Enable-SetupDockerFileAccess
             Prepare-DeploymentImages
+            & docker run --rm --entrypoint test (Get-OscarImage) -f "/usr/share/zoneinfo/$Timezone"
+            if ($LASTEXITCODE -ne 0) { throw "Unknown IANA timezone: $Timezone" }
+            Set-EnvValue 'OSCAR_TIMEZONE' $Timezone
             Initialize-Tls $Hostname
             Protect-DeploymentFiles
             if (-not $SkipHostsEntry) { Add-LocalHostsMapping $Hostname }

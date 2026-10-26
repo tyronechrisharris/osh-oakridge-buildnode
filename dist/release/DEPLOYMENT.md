@@ -163,3 +163,17 @@ Database backup/restore, certificate renewal, rollback automation, and version-s
 `setup.*`, `launch-all.*`, and `stop-all.*` remain as compatibility wrappers. New documentation and automation should use only `oscar.bat` or `oscar.sh`.
 
 Offline map layers are not currently required. The CLI retains an explicit MBTiles import TODO for a future milestone.
+
+## Local timezone and daily files
+
+Initialization prompts for an IANA timezone such as `America/Chicago`, `America/New_York`, or `UTC`. Use `--timezone America/Chicago` on Linux/macOS or `-Timezone America/Chicago` on Windows to specify it on the command line. Windows timezone display names such as `Central Standard Time` are not accepted. Setup validates the name against the OSCAR image's timezone database.
+
+The setting is saved as `OSCAR_TIMEZONE` in `.env`. A repeated initialization preserves the existing timezone by default; new deployments and non-interactive initialization without a timezone default to `UTC`.
+
+OSCAR uses this timezone as its Java default, including dailyfile local timestamps and local-midnight file rollover. Daylight-saving transitions follow the selected region. Dailyfile UTC timestamps remain UTC. Other application features using the Java default timezone also follow this setting.
+
+For an existing deployment, set `OSCAR_TIMEZONE=America/Chicago` in `.env` and run `docker compose up -d --no-build --pull never oscar` from the release directory to recreate the application container. A plain container restart does not apply changed environment variables. The release image must include the updated entrypoint.
+
+Rapiscan and Aspect both write `dailyfiles/<fileId>_<YYYY-MM-DD>.csv`, using the final segment of the sensor UID as the file ID. Rows contain device-specific message values followed by local and UTC times in `HH-mm-ss.SSS` format, with CRLF line endings and no header. Their SWE output names are both `dailyFile` (label `Daily File`), with `samplingTime` as the first field. Their second field is `rpmMessage` (label `RPM Message`) for both drivers. These datastream messages contain the device payload; the appended local and UTC columns belong to the stored CSV files.
+
+The `rpmMessage` field replaces `rapiscanMessage` and `aspectMessage`. External consumers selecting either old JSON property must use `rpmMessage` for new observations and retain support for the old names when reading historical data. On driver registration, OSH creates a new datastream version if the prior schema has observations; an empty datastream is updated in place. Consumers caching datastream IDs should rediscover the current `dailyFile` stream after upgrading. Stored CSV files have no field-name headers and are unaffected. The historical `test/staging-test-db.sql` snapshot retains its original field names.
