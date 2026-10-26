@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 - Set camera reconnect attempts to infinite (-1 in config)
 - Add ability to share links to specific occupancies, referencing the occupancy's observation ID
 - Add daily file output to historical occupancies and live lane view
+- Add ability to chart individual detectors instead of the sum in live lane view
 
 ## 3.9.0 2026-09-23
 ## Changes
