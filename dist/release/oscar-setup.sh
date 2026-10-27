@@ -14,6 +14,7 @@ case "$command_name" in
 esac
 
 hostname_value=''
+timezone_value=''
 port_value=443
 tls_mode='self-signed'
 certificate_path=''
@@ -36,7 +37,7 @@ usage() {
     cat <<'EOF'
 OSCAR deployment administration
 
-  sudo ./oscar.sh init [--hostname oscar.local] [--port 443]
+  sudo ./oscar.sh init [--hostname oscar.local] [--port 443] [--timezone America/Chicago]
       [--tls-mode self-signed|import] [--certificate FILE --private-key FILE]
       [--tls-san DNS_OR_IP]... [--no-auto-network-sans]
       [--add-hosts-entry] [--skip-hosts-entry] [--skip-start]
@@ -69,6 +70,7 @@ heading() { printf '\n== %s ==\n' "$*"; }
 while (($#)); do
     case "$1" in
         --hostname) hostname_value=${2:?missing hostname}; shift 2 ;;
+        --timezone) timezone_value=${2:?missing timezone}; shift 2 ;;
         --port) port_value=${2:?missing port}; shift 2 ;;
         --tls-mode) tls_mode=${2:?missing TLS mode}; shift 2 ;;
         --certificate) certificate_path=${2:?missing certificate path}; shift 2 ;;
@@ -384,7 +386,7 @@ require_unique_literal_environment_keys() {
     done
 }
 
-# A pre-3.9.2 deployment legitimately has no deployment identity or external
+# A pre-3.11.0 deployment legitimately has no deployment identity or external
 # storage-root bindings yet.  Validate everything that is present without
 # making the documented one-time adoption path depend on the new schema.  The
 # fully normalized environment is subjected to the strict validator later.
@@ -425,13 +427,13 @@ require_managed_environment_bindings() {
     [[ -z $value || $value == /* ]] || fail 'A preserved OSCAR_WAL_ARCHIVE_DIR must be an absolute path.'
 }
 
-is_pre_392_release_version() {
+is_pre_3110_release_version() {
     local value=$1 major minor patch
     [[ $value =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
     major=$((10#${BASH_REMATCH[1]}))
     minor=$((10#${BASH_REMATCH[2]}))
     patch=$((10#${BASH_REMATCH[3]}))
-    ((major < 3 || (major == 3 && minor < 9) || (major == 3 && minor == 9 && patch < 2)))
+    ((major < 3 || (major == 3 && minor < 11)))
 }
 
 normalize_legacy_backup_key_binding() {
@@ -441,11 +443,11 @@ normalize_legacy_backup_key_binding() {
     source_version_count=$(awk -F= '$1 == "OSCAR_VERSION" { count++ } END { print count+0 }' "$env_file")
     ((source_version_count == 1)) || return 0
     source_version=$(get_env_value OSCAR_VERSION)
-    is_pre_392_release_version "$source_version" || return 0
+    is_pre_3110_release_version "$source_version" || return 0
     count=$(awk -F= '$1 == "OSCAR_BACKUP_KEY_FILE" { count++ } END { print count+0 }' "$env_file")
     if ((count == 0)); then
         set_env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt
-        printf 'Added the canonical backup-key binding required for a pre-3.9.2 deployment upgrade.\n'
+        printf 'Added the canonical backup-key binding required for a pre-3.11.0 deployment upgrade.\n'
     fi
 }
 
@@ -893,7 +895,7 @@ compose() {
         env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME -u COMPOSE_ENV_FILES -u COMPOSE_PROFILES \
             -u OSCAR_VERSION -u OSCAR_DEPLOYMENT_ID -u OSCAR_ARCHIVE_DIR -u OSCAR_BACKUP_DIR \
             -u OSCAR_BACKUP_MODE -u OSCAR_WAL_ARCHIVE_DIR -u OSCAR_SECRETS_DIR -u OSCAR_TLS_DIR -u OSCAR_BACKUP_KEY_FILE \
-            -u OSCAR_HTTPS_PORT -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
+            -u OSCAR_HTTPS_PORT -u OSCAR_TIMEZONE -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
             docker compose --project-name oscar --env-file "$script_dir/.env" --file "$script_dir/compose.yaml" "$@"
     )
 }
@@ -1016,6 +1018,18 @@ case "$command_name" in
             read -r -p 'Hostname or IP address [oscar.local]: ' hostname_value
             hostname_value=${hostname_value:-oscar.local}
         fi
+        if [[ -z $timezone_value ]]; then
+            timezone_default=UTC
+            if [[ -f $script_dir/.env ]]; then
+                timezone_default=$(awk -F= '$1 == "OSCAR_TIMEZONE" { print substr($0, index($0, "=") + 1); exit }' "$script_dir/.env")
+                timezone_default=${timezone_default:-UTC}
+            fi
+            if ! $non_interactive; then
+                read -r -p "Local IANA timezone (e.g. America/Chicago) [$timezone_default]: " timezone_value
+            fi
+            timezone_value=${timezone_value:-$timezone_default}
+        fi
+        [[ $timezone_value =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || fail 'Use an IANA timezone such as America/Chicago or UTC.'
         valid_hostname "$hostname_value" || fail "Invalid hostname or IP address: $hostname_value"
         resolve_tls_sans "$hostname_value"
         [[ $port_value =~ ^[0-9]+$ ]] && ((port_value >= 1 && port_value <= 65535)) || fail 'Port must be between 1 and 65535.'
@@ -1046,6 +1060,9 @@ case "$command_name" in
             [[ -e $script_dir/secrets/backup-key.txt ]] || write_secret "$script_dir/secrets/backup-key.txt" "$(random_password)$(random_password)"
         fi
         prepare_deployment_images
+        docker run --rm --entrypoint test "$(oscar_image)" -f "/usr/share/zoneinfo/$timezone_value" \
+            || fail "Unknown IANA timezone: $timezone_value"
+        set_env_value OSCAR_TIMEZONE "$timezone_value"
         bash "$script_dir/oscar-storage.sh" prepare-directories
         initialize_tls "$hostname_value"
         protect_deployment_files

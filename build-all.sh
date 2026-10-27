@@ -39,6 +39,7 @@ node --test tools/update-version.test.js
 ./gradlew --no-parallel \
     :sensorhub-utils-rad:test \
     --tests org.sensorhub.impl.utils.rad.cambio.CambioTempDirectoryTest \
+    --tests org.sensorhub.impl.utils.rad.dailyfile.DailyFileAppenderTest \
     --tests org.sensorhub.impl.utils.rad.output.OccupancyOutputConcurrencyTest
 
 ./gradlew --no-parallel \

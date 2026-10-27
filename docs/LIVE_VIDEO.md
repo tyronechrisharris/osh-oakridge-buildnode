@@ -1,6 +1,6 @@
 # Live Video
 
-OSCAR 3.9.2 starts Lane Details video only after the HLS stream has received a decodable H.264 keyframe. Until that point, the Viewer shows **Preparing live video** instead of presenting an empty player. If preparation or playback cannot recover within the bounded retry period, the Viewer shows a localized error and a **Retry** action.
+OSCAR 3.11.0 starts Lane Details video only after the HLS stream has received a decodable H.264 keyframe. Until that point, the Viewer shows **Preparing live video** instead of presenting an empty player. If preparation or playback cannot recover within the bounded retry period, the Viewer shows a localized error and a **Retry** action.
 
 ## Camera requirements
 
@@ -95,7 +95,7 @@ and the four-command pending cap prevents unbounded growth.
 | --- | --- |
 | Preparing lasts longer than expected | Check camera connectivity, confirm the stream is H.264, and measure the source keyframe interval. A long GOP directly increases worst-case startup time. |
 | Live video could not be played | Restore camera/network reachability, inspect FFmpeg reconnect logs, and select **Retry**. |
-| Player remains at `0:00` | Confirm the deployed OSCAR 3.9.2 image includes the keyframe-gated HLS and Viewer recovery fixes; inspect the first segment for a leading keyframe and valid H.264 parameter sets. |
+| Player remains at `0:00` | Confirm the deployed OSCAR 3.11.0 image includes the keyframe-gated HLS and Viewer recovery fixes; inspect the first segment for a leading keyframe and valid H.264 parameter sets. |
 | Emulator playback is slow to start | Run the emulator asset-preparation and validation scripts, then recreate the publisher containers. Runtime publishing should continue to use stream copy rather than live transcoding. |
 | Recordings fail after a live-video change | Treat this as a regression. Live HLS and MP4 share camera input but have separate output rules; run the recording acceptance test before release. |
 | Alarm recording preparation times out | Confirm the camera produces an H.264 keyframe within five seconds and that the packet path has no write failure. OSCAR deliberately rejects the OPEN and removes the hidden partial instead of attaching a zero-packet MP4. |

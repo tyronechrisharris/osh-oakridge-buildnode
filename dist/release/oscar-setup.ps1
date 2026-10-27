@@ -5,6 +5,7 @@ param(
     [string]$StorageAction,
     [string]$HoldAction,
     [string]$Hostname,
+    [string]$Timezone,
     [ValidateRange(1, 65535)]
     [int]$Port = 443,
     [ValidateSet('self-signed', 'import')]
@@ -533,12 +534,12 @@ function Initialize-LegacyBackupKeyBinding {
     $sourceVersionText = $sourceVersionMatches[0].Substring('OSCAR_VERSION='.Length)
     if ($sourceVersionText -notmatch '^\d+\.\d+\.\d+$') { return }
     $sourceVersion = [Version]$sourceVersionText
-    if ($sourceVersion -ge [Version]'3.9.2') { return }
+    if ($sourceVersion -ge [Version]'3.11.0') { return }
 
     $matches = @($lines | Where-Object { $_ -match '^OSCAR_BACKUP_KEY_FILE=' })
     if ($matches.Count -eq 0) {
         Set-EnvValue 'OSCAR_BACKUP_KEY_FILE' './secrets/backup-key.txt'
-        Write-Host 'Added the canonical backup-key binding required for a pre-3.9.2 deployment upgrade.'
+        Write-Host 'Added the canonical backup-key binding required for a pre-3.11.0 deployment upgrade.'
     }
 }
 
@@ -1093,7 +1094,7 @@ function Clear-ComposeOverrideEnvironment {
         'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME', 'COMPOSE_ENV_FILES', 'COMPOSE_PROFILES',
         'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_MODE', 'OSCAR_BACKUP_DIR',
         'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR', 'OSCAR_BACKUP_KEY_FILE',
-        'OSCAR_HTTPS_PORT', 'OSCAR_JAVA_OPTS', 'OSCAR_POSTGIS_PLATFORM')) {
+        'OSCAR_HTTPS_PORT', 'OSCAR_TIMEZONE', 'OSCAR_JAVA_OPTS', 'OSCAR_POSTGIS_PLATFORM')) {
         if (Test-Path -LiteralPath "Env:$name") {
             $saved[$name] = (Get-Item -LiteralPath "Env:$name").Value
             Remove-Item -LiteralPath "Env:$name"
@@ -1350,7 +1351,7 @@ function Show-Help {
     @'
 OSCAR deployment administration
 
-  .\oscar.bat init [-Hostname oscar.local] [-Port 443]
+  .\oscar.bat init [-Hostname oscar.local] [-Port 443] [-Timezone America/Chicago]
       [-TlsMode self-signed|import] [-CertificatePath FILE -PrivateKeyPath FILE]
       [-TlsSan DNS_OR_IP[,DNS_OR_IP...]] [-NoAutoNetworkSans]
       [-AddHostsEntry] [-SkipHostsEntry] [-SkipStart]
@@ -1407,6 +1408,22 @@ try {
                 $Hostname = (Read-Host 'Hostname or IP address [oscar.local]').Trim()
                 if (-not $Hostname) { $Hostname = 'oscar.local' }
             }
+            if (-not $Timezone) {
+                $timezoneDefault = 'UTC'
+                $envPath = Join-Path $ScriptRoot '.env'
+                if (Test-Path -LiteralPath $envPath) {
+                    foreach ($line in [IO.File]::ReadAllLines($envPath)) {
+                        if ($line -match '^OSCAR_TIMEZONE=(.+)$') { $timezoneDefault = $Matches[1] }
+                    }
+                }
+                if (-not $NonInteractive) {
+                    $Timezone = (Read-Host "Local IANA timezone (e.g. America/Chicago) [$timezoneDefault]").Trim()
+                }
+                if (-not $Timezone) { $Timezone = $timezoneDefault }
+            }
+            if ($Timezone -cnotmatch '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$') {
+                throw 'Use an IANA timezone such as America/Chicago or UTC.'
+            }
             if (-not (Test-ValidHostname $Hostname)) { throw "Invalid hostname or IP address: $Hostname" }
             $resolvedTlsSans = @(Get-TlsSubjectAlternativeNames $Hostname)
             if ($Port -eq 80) { throw 'Port 80 is reserved for the HTTP-to-HTTPS redirect.' }
@@ -1432,6 +1449,9 @@ try {
             }
             Enable-SetupDockerFileAccess
             Prepare-DeploymentImages
+            & docker run --rm --entrypoint test (Get-OscarImage) -f "/usr/share/zoneinfo/$Timezone"
+            if ($LASTEXITCODE -ne 0) { throw "Unknown IANA timezone: $Timezone" }
+            Set-EnvValue 'OSCAR_TIMEZONE' $Timezone
             Invoke-StorageCommand 'prepare-directories' $null
             Initialize-Tls $Hostname $resolvedTlsSans
             Protect-DeploymentFiles

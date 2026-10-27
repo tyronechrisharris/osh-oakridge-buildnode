@@ -1,6 +1,6 @@
 # Status of Health
 
-The OSCAR 3.9.2 Status of Health page gives operators one current-status row for every lane visible in the current Viewer scope. Open it with the heart-monitor icon in the left navigation.
+The OSCAR 3.11.0 Status of Health page gives operators one current-status row for every lane visible in the current Viewer scope. Open it with the heart-monitor icon in the left navigation.
 
 ## Lane scope
 
@@ -15,7 +15,7 @@ Operational views are a presentation boundary, not an authorization mechanism. S
 | Group | Meaning |
 | --- | --- |
 | RPM connection | **Online** or **Offline** from the RPM connection-status stream. **Waiting** means that the Viewer has not received a usable current value. |
-| Camera connections | One indicator per configured FFmpeg camera. OSCAR 3.9.2 publishes an explicit connection value after stream startup, reconnection failure, and shutdown, then republishes the current value every 30 seconds while the driver is running. |
+| Camera connections | One indicator per configured FFmpeg camera. OSCAR 3.11.0 publishes an explicit connection value after stream startup, reconnection failure, and shutdown, then republishes the current value every 30 seconds while the driver is running. |
 | Gamma high / gamma low / neutron high | **Fault**, **Clear**, or **Unknown** from the corresponding detector alarm-state telemetry. Missing or failed telemetry remains Unknown rather than appearing clear. |
 | Tamper | **Fault**, **Clear**, or **Unknown** from the lane's tamper telemetry. |
 | Extended occupancy | Active when the lane's canonical `occupancyStatus` remains occupied longer than the configured threshold. This status is model-independent across Rapiscan, Aspect, and RS350 RPMs. |
@@ -82,7 +82,7 @@ Hardware fault tests must follow the site's approved procedures. Do not create a
 | --- | --- |
 | Lane is missing | Check node reachability, lane discovery, operational-view assignment, and the exact `?view=` key. |
 | RPM remains Waiting | Verify the RPM driver exposes `connectionStatus`, the stream is reachable, and the Viewer can query its latest observation. |
-| Camera remains Waiting | Confirm the lane generated the FFmpeg child, the child is running OSCAR 3.9.2 code with the 30-second connection heartbeat, and its connection-status datastream was discovered. Query the latest observation twice at least 30 seconds apart; its timestamp should advance while the driver is running. If it does not, inspect the FFmpeg reconnect/heartbeat logs and deployed image. |
+| Camera remains Waiting | Confirm the lane generated the FFmpeg child, the child is running OSCAR 3.11.0 code with the 30-second connection heartbeat, and its connection-status datastream was discovered. Query the latest observation twice at least 30 seconds apart; its timestamp should advance while the driver is running. If it does not, inspect the FFmpeg reconnect/heartbeat logs and deployed image. |
 | Camera shows Offline | Verify RTSP host, port, credentials, codec/path, network reachability, and FFmpeg reconnect logs. |
 | Fault remains Unknown | Confirm the expected detector or tamper datastream exists, its latest observation is readable, and the next per-node refresh completes. Unknown is deliberately not treated as Clear. |
 | Rapiscan tamper remains Unknown while other values update | A current Rapiscan driver publishes Clear whenever it establishes the RPM connection. Confirm the child driver actually reconnected, its tamper datastream exists, the baseline observation is readable, and the deployment includes the connection-baseline fix. A later device `TT` must still change the state to Fault. |

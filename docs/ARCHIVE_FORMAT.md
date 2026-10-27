@@ -1,4 +1,4 @@
-# OSCAR 3.9.2 cold archive format
+# OSCAR 3.11.0 cold archive format
 
 OSCAR's cold observation tier is a portable set of ZSTD-compressed Parquet files, JSON manifests,
 gzip-compressed datastream schema snapshots, and a PostgreSQL catalog. OSCAR uses the catalog for

@@ -9,7 +9,7 @@ Start with [QUICKSTART.md](QUICKSTART.md) for installation. This guide documents
 - Windows 11 x86-64 with Docker Desktop and WSL 2
 - Ubuntu Server 24.04 x86-64 with Docker Engine and the Compose plugin
 
-The 3.9.2 storage profile fails closed on macOS because Docker Desktop for Mac cannot satisfy this
+The 3.11.0 storage profile fails closed on macOS because Docker Desktop for Mac cannot satisfy this
 release's tested bind-root ownership and recovery-media isolation contract. Use Ubuntu or Windows
 for initialization and operation; a Mac may still be used for source inspection or non-deployment
 development.
@@ -216,7 +216,7 @@ tls/server.key
 
 Docker Compose mounts secrets read-only. On Ubuntu, the setup CLI makes `secrets` and `tls` mode `0700`, with contained files readable by the deliberately non-root services. On Windows, it restricts the directories to the installing administrator and `SYSTEM` while preserving container-readable, read-only mounts.
 
-The application configuration is copied into the `oscar_state` volume on first startup. Runtime configuration saves update only that persistent copy. Application libraries and viewer assets remain read-only in the image. PostgreSQL data is stored in the `postgres_data` volume. OSCAR 3.9.2 uses a long-lived host bind for the primary Parquet cold tier (`OSCAR_ARCHIVE_DIR`). PostgreSQL runs with `archive_mode=off`, no external archive command, and no WAL bind. An existing `OSCAR_WAL_ARCHIVE_DIR` is preserved only to avoid deleting legacy data; current schema-v1/v2 restore does not use it. Fresh deployments set `OSCAR_BACKUP_MODE=disabled`; after explicit `single` opt-in, `OSCAR_BACKUP_DIR` is an operator-selected safe absolute host path that does not overlap the release or archive roots and is never mounted into a long-running service. A separate physical drive is recommended for failure isolation but is not required. A Docker named-volume backup or Parquet copy alone is incomplete.
+The application configuration is copied into the `oscar_state` volume on first startup. Runtime configuration saves update only that persistent copy. Application libraries and viewer assets remain read-only in the image. PostgreSQL data is stored in the `postgres_data` volume. OSCAR 3.11.0 uses a long-lived host bind for the primary Parquet cold tier (`OSCAR_ARCHIVE_DIR`). PostgreSQL runs with `archive_mode=off`, no external archive command, and no WAL bind. An existing `OSCAR_WAL_ARCHIVE_DIR` is preserved only to avoid deleting legacy data; current schema-v1/v2 restore does not use it. Fresh deployments set `OSCAR_BACKUP_MODE=disabled`; after explicit `single` opt-in, `OSCAR_BACKUP_DIR` is an operator-selected safe absolute host path that does not overlap the release or archive roots and is never mounted into a long-running service. A separate physical drive is recommended for failure isolation but is not required. A Docker named-volume backup or Parquet copy alone is incomplete.
 
 The OSCAR service keeps the general-purpose `/tmp` tmpfs `noexec`. Embedded Java native libraries,
 including DuckDB JDBC and JavaCPP/FFmpeg, are extracted instead to a separate 256 MiB tmpfs at
@@ -291,7 +291,7 @@ Every reported privilege flag for `oscar_app` must be false. A host scan must sh
 
 ## Upgrade
 
-For a 3.9.2-or-newer same-storage-profile upgrade, create and verify a coordinated snapshot first when the site has explicitly selected `OSCAR_BACKUP_MODE=single`. A disabled site must use its separately approved protection procedure or opt in through `upgrade` before invoking backup or restore. A pre-3.9.2 release does not have this CLI; use that release's supported backup/export procedure and retain the old system read-only until the separately qualified migration is complete. Extract the new release into a clean sibling directory; do not overlay it on the previous release because removed files would otherwise remain in the image build context. Copy only `.env`, `secrets/`, and `tls/` from the existing deployment into the clean release directory. If the deployment has a `.oscar-volume-adoption` receipt, copy that file too. Preserve `OSCAR_BACKUP_MODE`, the absolute active `OSCAR_ARCHIVE_DIR` and `OSCAR_BACKUP_DIR` values, and any existing absolute `OSCAR_WAL_ARCHIVE_DIR` compatibility binding; setup must never delete legacy roots or data while changing modes. Before starting services, use `docker compose config` to confirm the archive bind and the absence of a PostgreSQL WAL bind, then inspect the single mode and backup-root entries in `.env`. Compose attaches the exact external volumes `oscar_oscar_state` and `oscar_postgres_data`; setup owns their creation and validates deployment identity. Then run:
+For a 3.11.0-or-newer same-storage-profile upgrade, create and verify a coordinated snapshot first when the site has explicitly selected `OSCAR_BACKUP_MODE=single`. A disabled site must use its separately approved protection procedure or opt in through `upgrade` before invoking backup or restore. A pre-3.11.0 release does not have this CLI; use that release's supported backup/export procedure and retain the old system read-only until the separately qualified migration is complete. Extract the new release into a clean sibling directory; do not overlay it on the previous release because removed files would otherwise remain in the image build context. Copy only `.env`, `secrets/`, and `tls/` from the existing deployment into the clean release directory. If the deployment has a `.oscar-volume-adoption` receipt, copy that file too. Preserve `OSCAR_BACKUP_MODE`, the absolute active `OSCAR_ARCHIVE_DIR` and `OSCAR_BACKUP_DIR` values, and any existing absolute `OSCAR_WAL_ARCHIVE_DIR` compatibility binding; setup must never delete legacy roots or data while changing modes. Before starting services, use `docker compose config` to confirm the archive bind and the absence of a PostgreSQL WAL bind, then inspect the single mode and backup-root entries in `.env`. Compose attaches the exact external volumes `oscar_oscar_state` and `oscar_postgres_data`; setup owns their creation and validates deployment identity. Then run:
 
 ```powershell
 .\oscar.bat upgrade
@@ -301,7 +301,7 @@ For a 3.9.2-or-newer same-storage-profile upgrade, create and verify a coordinat
 sudo bash oscar.sh upgrade
 ```
 
-The command preserves existing settings and data while normalizing the required 3.9.2 managed
+The command preserves existing settings and data while normalizing the required 3.11.0 managed
 bindings: deployment identity, exact backup mode, absolute external storage roots, and the canonical backup-key
 binding. A legacy deployment may also receive a generated backup key plus explicit volume/root
 adoption metadata when the corresponding adoption options are supplied. After those guarded
@@ -345,7 +345,7 @@ every subsequent clean-directory upgrade.
 
 Storage-root ownership is a separate gate. New roots receive an administrator-owned
 `.oscar-storage-root` version-1 identity bound to `OSCAR_DEPLOYMENT_ID` and the exact root kind. A
-nonempty pre-3.9.2 active archive or backup root without that marker requires a one-time, reviewed
+nonempty pre-3.11.0 active archive or backup root without that marker requires a one-time, reviewed
 `oscar.bat upgrade -AdoptLegacyStorageRoots` or
 `sudo bash oscar.sh upgrade --adopt-legacy-storage-roots`. The marker records the adoption time and
 actor. Setup rejects a foreign UUID, swapped kind, unsafe marker, or unacknowledged nonempty root
@@ -353,11 +353,11 @@ before claiming any path. Backups exclude these host-local markers, and restore 
 revalidates the target markers instead of accepting identities from backup media. A retired
 legacy-WAL tree is neither claimed nor mutated by current setup.
 
-The OSCAR application libraries and exported Viewer are part of the `oscar:<version>` image. A restart does not rebuild that image. To test OSCAR 3.9.2 from a connected release artifact, prepare the clean release directory as described above. Use `init` and fresh state for the complete 3.9.2 storage profile; use `upgrade` only when intentionally retaining the existing storage/configuration profile. Confirm that `docker compose images` reports `oscar:3.9.2` before accepting the test result.
+The OSCAR application libraries and exported Viewer are part of the `oscar:<version>` image. A restart does not rebuild that image. To test OSCAR 3.11.0 from a connected release artifact, prepare the clean release directory as described above. Use `init` and fresh state for the complete 3.11.0 storage profile; use `upgrade` only when intentionally retaining the existing storage/configuration profile. Confirm that `docker compose images` reports `oscar:3.11.0` before accepting the test result.
 
-Release image tags are immutable once published. Connected `init` and `upgrade` rebuild both local image contexts (`oscar:3.9.2` and `oscar-postgis:3.9.2`) before recreating services, even when those tags already exist, so a pre-release same-tag iteration cannot silently retain an older application or restore helper. On Ubuntu this is equivalent to `OSCAR_VERSION=3.9.2 docker compose build oscar postgres`. The Windows setup performs two bounded `docker build` operations, including `docker build --platform linux/amd64 --build-arg OSCAR_VERSION=3.9.2 --tag oscar-postgis:3.9.2 --file postgis/Dockerfile postgis`; this avoids Docker Compose 5.6's in-tree Dockerfile entitlement regression without granting wildcard filesystem access. The regression platform check requires each packaged helper to match its deployed image byte-for-byte. Never replace a published `oscar:3.9.2` image with different contents.
+Release image tags are immutable once published. Connected `init` and `upgrade` rebuild both local image contexts (`oscar:3.11.0` and `oscar-postgis:3.11.0`) before recreating services, even when those tags already exist, so a pre-release same-tag iteration cannot silently retain an older application or restore helper. On Ubuntu this is equivalent to `OSCAR_VERSION=3.11.0 docker compose build oscar postgres`. The Windows setup performs two bounded `docker build` operations, including `docker build --platform linux/amd64 --build-arg OSCAR_VERSION=3.11.0 --tag oscar-postgis:3.11.0 --file postgis/Dockerfile postgis`; this avoids Docker Compose 5.6's in-tree Dockerfile entitlement regression without granting wildcard filesystem access. The regression platform check requires each packaged helper to match its deployed image byte-for-byte. Never replace a published `oscar:3.11.0` image with different contents.
 
-The default configuration for a new installation is labeled `OSCAR 3.9.2`. An upgrade preserves `/var/lib/oscar/config.json`, including a customized deployment name, so the Admin UI may continue to display the prior or site-specific label. Do not overwrite that value merely to display a version number. Use `OSCAR_VERSION` in `.env` and `docker compose images` to verify the running release. The OSCAR image also stamps that value into the OCI `org.opencontainers.image.version` label; inspect it on PowerShell or a POSIX shell with `docker image inspect oscar:3.9.2 --format '{{json .Config.Labels}}'` and require the label value `3.9.2` before accepting the image.
+The default configuration for a new installation is labeled `OSCAR 3.11.0`. An upgrade preserves `/var/lib/oscar/config.json`, including a customized deployment name, so the Admin UI may continue to display the prior or site-specific label. Do not overwrite that value merely to display a version number. Use `OSCAR_VERSION` in `.env` and `docker compose images` to verify the running release. The OSCAR image also stamps that value into the OCI `org.opencontainers.image.version` label; inspect it on PowerShell or a POSIX shell with `docker image inspect oscar:3.11.0 --format '{{json .Config.Labels}}'` and require the label value `3.11.0` before accepting the image.
 
 On Windows, setup and storage administration stream every bounded shell body and direct `psql`
 statement into the one-shot container over UTF-8 standard input. The direct `docker run` adapter owns
@@ -369,11 +369,11 @@ quoted values exactly under Windows PowerShell 5.1 native argument handling. A f
 check leaves the receipt in `INITIALIZING`; correct the reported problem and rerun `oscar.bat init`
 from the same release and protected runtime state rather than deleting the volumes.
 
-### 3.9.2 storage migration boundary
+### 3.11.0 storage migration boundary
 
-OSCAR 3.9.2 changes the default database module, write path, daily-file source capture, media-retention format, and PostgreSQL initialization. `upgrade` deliberately does not overwrite the saved module configuration or recreate the PostgreSQL cluster, so an upgraded pre-3.9.2 system does not automatically gain the complete 3.9.2 storage profile or data checksums.
+OSCAR 3.11.0 changes the default database module, write path, daily-file source capture, media-retention format, and PostgreSQL initialization. `upgrade` deliberately does not overwrite the saved module configuration or recreate the PostgreSQL cluster, so an upgraded pre-3.11.0 system does not automatically gain the complete 3.11.0 storage profile or data checksums.
 
-Initialize the current test systems and new production systems with a fresh 3.9.2 database/configuration. If existing production history must be retained, keep the old system read-only after a verified backup and use a separately designed and tested migration. Do not delete production volumes merely to make the new module start. Follow the parity, restore-drill, and bounded hot-deletion validation in [`../../docs/STORAGE_OPERATIONS.md`](../../docs/STORAGE_OPERATIONS.md).
+Initialize the current test systems and new production systems with a fresh 3.11.0 database/configuration. If existing production history must be retained, keep the old system read-only after a verified backup and use a separately designed and tested migration. Do not delete production volumes merely to make the new module start. Follow the parity, restore-drill, and bounded hot-deletion validation in [`../../docs/STORAGE_OPERATIONS.md`](../../docs/STORAGE_OPERATIONS.md).
 
 The OSCAR container keeps `/var/lib/oscar/config.json` readable and writable only by the OSCAR runtime user (`0600`) and repairs older read-only copies during startup. After importing a lane CSV, wait for every lane to appear under **Sensors**, select the global **Save** action, restart OSCAR, and confirm that the same lanes reload. Historical systems in PostgreSQL are not proof that runtime sensor modules were saved; an empty **Sensors** tree after restart indicates that the module configuration was not persisted.
 
@@ -394,7 +394,7 @@ commands. `backup-prune` is retired and performs no deletion. The full procedure
 The hold list and creation result include `resolution_mode`. A
 `COLD_RANGE_CONSERVATIVE` observation hold protects matching generation ranges but is not proof that
 the exact ID exists in sparse Parquet; verify the event or use an exact generation hold for legal
-certainty. `LEGACY_UNKNOWN` is a protective migration-only label for pre-3.9.2 observation holds
+certainty. `LEGACY_UNKNOWN` is a protective migration-only label for pre-3.11.0 observation holds
 whose exact-vs-range provenance cannot be reconstructed; the CLI never creates it. Active
 observation and generation holds are enforced inside the same transaction as
 hot/cold logical removal and tombstone creation. Single removal fails on a hold; filtered bulk
@@ -448,10 +448,24 @@ representations; the compact staging-owner ledger is removed with its child.
 Parquet is the primary cold tier, not a backup. Cold archive deletion always requires a reviewed
 `archive dry-run` plan and its one-time token.
 
-Certificate renewal and a site-specific migration of retained pre-3.9.2 history remain controlled administrator operations and must be validated before an upgrade is declared production-ready.
+Certificate renewal and a site-specific migration of retained pre-3.11.0 history remain controlled administrator operations and must be validated before an upgrade is declared production-ready.
 
 ## Compatibility scripts
 
 `setup.*`, `launch-all.*`, and `stop-all.*` remain as compatibility wrappers. New documentation and automation should use only `oscar.bat` or `oscar.sh`.
 
 Offline map layers are not currently required. The CLI retains an explicit MBTiles import TODO for a future milestone.
+
+## Local timezone and daily files
+
+Initialization prompts for an IANA timezone such as `America/Chicago`, `America/New_York`, or `UTC`. Use `--timezone America/Chicago` on Linux/macOS or `-Timezone America/Chicago` on Windows to specify it on the command line. Windows timezone display names such as `Central Standard Time` are not accepted. Setup validates the name against the OSCAR image's timezone database.
+
+The setting is saved as `OSCAR_TIMEZONE` in `.env`. A repeated initialization preserves the existing timezone by default; new deployments and non-interactive initialization without a timezone default to `UTC`.
+
+OSCAR uses this timezone as its Java default, including dailyfile local timestamps and local-midnight file rollover. Daylight-saving transitions follow the selected region. Dailyfile UTC timestamps remain UTC. Other application features using the Java default timezone also follow this setting.
+
+For an existing deployment, set `OSCAR_TIMEZONE=America/Chicago` in `.env` and run `docker compose up -d --no-build --pull never oscar` from the release directory to recreate the application container. A plain container restart does not apply changed environment variables. The release image must include the updated entrypoint.
+
+Rapiscan and Aspect both write `dailyfiles/<fileId>_<YYYY-MM-DD>.csv`, using the final segment of the sensor UID as the file ID. Rows contain device-specific message values followed by local and UTC times in `HH-mm-ss.SSS` format, with CRLF line endings and no header. Their SWE output names are both `dailyFile` (label `Daily File`), with `samplingTime` as the first field. Their second field is `rpmMessage` (label `RPM Message`) for both drivers. These datastream messages contain the device payload; the appended local and UTC columns belong to the stored CSV files.
+
+The `rpmMessage` field replaces `rapiscanMessage` and `aspectMessage`. External consumers selecting either old JSON property must use `rpmMessage` for new observations and retain support for the old names when reading historical data. On driver registration, OSH creates a new datastream version if the prior schema has observations; an empty datastream is updated in place. Consumers caching datastream IDs should rediscover the current `dailyFile` stream after upgrading. Stored CSV files have no field-name headers and are unaffected. The historical `test/staging-test-db.sql` snapshot retains its original field names.

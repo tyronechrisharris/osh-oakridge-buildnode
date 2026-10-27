@@ -87,7 +87,7 @@
         "uiClass": "com.botts.ui.oscar.forms.OSCARServiceForm"
       }
     ],
-    "deploymentName": "OSCAR 3.9.2",
+    "deploymentName": "OSCAR 3.11.0",
     "enableLandingPage": false,
     "id": "5cb05c9c-9123-4fa1-8731-ffaa51489678",
     "autoStart": true,
@@ -205,7 +205,8 @@
       "reports",
       "videos",
       "dailyfiles",
-      "adjudication"
+      "adjudication",
+      "spreadsheets"
     ],
     "fileStoreRootDir": "files",
     "endPoint": "/buckets",

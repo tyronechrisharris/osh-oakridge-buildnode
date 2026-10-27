@@ -10,7 +10,7 @@ installers/
     wsl.<version>.x64.msi
 ```
 
-OSCAR 3.9.2 storage deployment is not supported on macOS; no macOS prerequisite
+OSCAR 3.11.0 storage deployment is not supported on macOS; no macOS prerequisite
 payload is part of a supported release bundle.
 
 Run `tools/offline/build-offline-bundle.ps1 -BundleProfile Both -CreateArchive` on a connected build workstation to create both Windows production artifacts. `offline-full` contains the approved installers and container images; `offline-images` omits the installers for hosts with an existing Docker runtime. Component versions, official URLs, and SHA-256 values are pinned in `tools/offline/components.windows-x86_64.json`. The offline OSCAR CLI never downloads software or container images.

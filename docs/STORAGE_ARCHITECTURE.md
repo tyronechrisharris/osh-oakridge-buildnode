@@ -1,6 +1,6 @@
-# OSCAR 3.9.2 storage architecture
+# OSCAR 3.11.0 storage architecture
 
-OSCAR 3.9.2 separates live operational data, durable RPM source records, retained media, and
+OSCAR 3.11.0 separates live operational data, durable RPM source records, retained media, and
 long-term observation history. PostgreSQL remains the authoritative hot store and metadata catalog;
 immutable files carry the high-volume history. This keeps normal Open Sensor Hub (OSH) reads and
 identities intact while removing the requirement that every raw count remain in PostgreSQL forever.
@@ -116,7 +116,7 @@ avoids reconstructing a regulatory/source artifact from an already-purged databa
 
 ### PostgreSQL hot store
 
-The 3.9.2 database configuration uses sequential observation IDs, snapshots mutable OSH `DataBlock`
+The 3.11.0 database configuration uses sequential observation IDs, snapshots mutable OSH `DataBlock`
 values when they are accepted, and commits a prepared-statement batch at 10,000 rows or the
 configured `autoCommitPeriod` (one second in the standard configuration). The PostgreSQL JDBC
 driver rewrites compatible batches into multi-row inserts. A statement-level transition-table
@@ -241,7 +241,7 @@ tools; see [Archive format](ARCHIVE_FORMAT.md).
 
 Every embedded DuckDB connection—export, post-write verification, activation staging, hot/cold
 parity, cold result streaming, metadata scans, and counts—uses the same bounded
-resource policy. The 3.9.2 production defaults are 256 MiB of DuckDB memory, two worker threads,
+resource policy. The 3.11.0 production defaults are 256 MiB of DuckDB memory, two worker threads,
 and 4 GiB of spill per operation, with at most two embedded sessions admitted process-wide. A
 fair first-in/first-out gate waits up to 30 seconds and then fails busy; all independently
 configured archive stores share the gate, and the smallest cap registered by an active or waiting
@@ -383,9 +383,9 @@ policy to hot, cold, exported, and backup copies.
 - Do not include secrets, full manifests, raw records, or images in ordinary support tickets or
   unredacted diagnostic bundles.
 
-## 3.9.2 compatibility boundary
+## 3.11.0 compatibility boundary
 
-OSCAR 3.9.2 is a substantial storage-profile update. A new installation uses:
+OSCAR 3.11.0 is a substantial storage-profile update. A new installation uses:
 
 - `OscarTieredObsSystemDatabaseConfig` with explicit `PARQUET_PRIMARY`, sequential IDs, and batched
   commit-durable PostgreSQL staging for the allowlisted immutable outputs;
@@ -399,7 +399,7 @@ The legacy occupancy `videoPaths` field, legacy daily CSV syntax, and OSH identi
 However, an existing deployment's persistent `config.json` is intentionally not overwritten by
 `oscar upgrade`, and PostgreSQL data checksums are selected only when a new database cluster is
 initialized. There is no automatic conversion of an old database/configuration into the complete
-3.9.2 storage profile. The corrected 3.9.2 observation natural-key index also treats null fields as
+3.11.0 storage profile. The corrected 3.11.0 observation natural-key index also treats null fields as
 equal; index creation fails safely if a legacy database contains duplicates under that definition,
 and those rows require an explicit reviewed migration decision. Natural-key verification uses the
 same `COALESCE` expressions as the unique index, including for null fields, so PostgreSQL generic
@@ -409,7 +409,7 @@ ID. If the observation is already archive-owned, OSCAR writes the correction to 
 generation's PostgreSQL overlay—both during the brief verified staging transition and after the staging child has been dropped—
 instead of modifying Parquet or inserting a duplicate hot identity.
 
-For the current test systems and for new production deployments, initialize a fresh 3.9.2 database
+For the current test systems and for new production deployments, initialize a fresh 3.11.0 database
 and configuration. For a production system whose history must be preserved, keep the old deployment
 read-only, take and verify a backup, export records required by policy, and perform a separately
 validated migration rather than deleting volumes or assuming `upgrade` enabled the new lifecycle.

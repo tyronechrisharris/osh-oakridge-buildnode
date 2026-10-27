@@ -10,7 +10,7 @@ LABEL org.opencontainers.image.title="OSCAR" \
 COPY --chown=root:root docker/oscar/atomic-publish.c /tmp/oscar-atomic-publish.c
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends curl ca-certificates gcc libc6-dev \
+    && apt-get install --yes --no-install-recommends curl ca-certificates tzdata gcc libc6-dev \
     && gcc -O2 -Wall -Wextra -Werror -o /usr/local/bin/oscar-atomic-publish /tmp/oscar-atomic-publish.c \
     && sha256sum /tmp/oscar-atomic-publish.c | awk '{print $1}' > /usr/local/share/oscar-atomic-publish.source.sha256 \
     && chmod 0555 /usr/local/bin/oscar-atomic-publish \

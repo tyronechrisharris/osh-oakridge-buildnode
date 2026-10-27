@@ -719,7 +719,7 @@ function Clear-ComposeOverrideEnvironment {
         'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME', 'COMPOSE_ENV_FILES', 'COMPOSE_PROFILES',
         'OSCAR_VERSION', 'OSCAR_DEPLOYMENT_ID', 'OSCAR_ARCHIVE_DIR', 'OSCAR_BACKUP_MODE', 'OSCAR_BACKUP_DIR',
         'OSCAR_WAL_ARCHIVE_DIR', 'OSCAR_SECRETS_DIR', 'OSCAR_TLS_DIR', 'OSCAR_BACKUP_KEY_FILE',
-        'OSCAR_HTTPS_PORT', 'OSCAR_JAVA_OPTS', 'OSCAR_POSTGIS_PLATFORM')) {
+        'OSCAR_HTTPS_PORT', 'OSCAR_TIMEZONE', 'OSCAR_JAVA_OPTS', 'OSCAR_POSTGIS_PLATFORM')) {
         if (Test-Path -LiteralPath "Env:$name") {
             $saved[$name] = (Get-Item -LiteralPath "Env:$name").Value
             Remove-Item -LiteralPath "Env:$name"

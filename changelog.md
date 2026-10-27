@@ -1,12 +1,13 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
-## 3.9.2 2026-10-18
+
+## 3.11.0 2026-10-27
 ### Storage-profile changes and rollout
 - Introduce the `OscarTieredObsSystemDatabase` storage profile with sequential observation IDs, batched writes, compact short-lived stage ownership, and a versioned PostgreSQL archive catalog
 - Initialize new PostgreSQL clusters with data checksums, WAL compression, I/O timing, and `pg_stat_statements`, while explicitly keeping `archive_mode=off` and omitting any external WAL bind; an existing cluster is not recreated by `upgrade`
-- Preserve an upgraded deployment's saved `config.json` and database, so a pre-3.9.2 deployment is not silently converted to the complete 3.9.2 storage profile
-- Require a fresh 3.9.2 database and standard configuration for the current test systems and new production deployments; preserve any required pre-3.9.2 production history through a separately validated migration
-- Make fresh 3.9.2 deployments explicitly use `PARQUET_PRIMARY` for the five allowlisted immutable high-volume outputs: route each accepted value into a LOGGED, UTC-aligned 30-minute PostgreSQL staging partition, reject detector timestamps more than five minutes ahead of the database receipt clock, and run the Parquet-primary worker every minute with a five-minute closed-window safety delay
+- Preserve an upgraded deployment's saved `config.json` and database, so a pre-3.11.0 deployment is not silently converted to the complete 3.11.0 storage profile
+- Require a fresh 3.11.0 database and standard configuration for the current test systems and new production deployments; preserve any required pre-3.11.0 production history through a separately validated migration
+- Make fresh 3.11.0 deployments explicitly use `PARQUET_PRIMARY` for the five allowlisted immutable high-volume outputs: route each accepted value into a LOGGED, UTC-aligned 30-minute PostgreSQL staging partition, reject detector timestamps more than five minutes ahead of the database receipt clock, and run the Parquet-primary worker every minute with a five-minute closed-window safety delay
 - Publish Parquet, schema, and manifest objects before manifest-last catalog activation; record exact ownership in a compact short-lived ledger, re-hash the active Parquet object and require exact row/UUID parity, then transactionally detach and drop the complete staging relation instead of retaining raw detector rows for a three-day overlap or deleting them row by row; retire at most eight staging partitions per cycle
 - Keep Parquet and published daily files as the durable long-term representations of allowlisted detector data while retaining mutable occupancy/alarm workflows, adjudications, reports, small OSH metadata, archive control records, overlays, and tombstones in PostgreSQL; the normal healthy staging budget is at most 60 minutes but is an operational SLO rather than a hard deadline during backlog or failure
 - Omit the generic observation-payload GIN index and heavy event indexes from fresh `PARQUET_PRIMARY` staging children, while keeping lean routing/parity indexes on those short-lived relations and purpose-built event indexes on the PostgreSQL parent for mutable workflows; ordinary PostGIS, `HOT_RETENTION`, and existing schemas are unchanged
@@ -79,7 +80,7 @@ All notable changes to this project will be documented in this file.
 - Add coordinated schema-v2 snapshot commands for a streamed PostgreSQL base backup, OSCAR state, primary Parquet cold tier, release metadata, and AES-256-CBC/PBKDF2-encrypted deployment credentials; omit cumulative `wal-archive.tar.gz`
 - Automatically verify each new snapshot with SHA-256 and `pg_verifybackup`, retain versioned backup-epoch manifests and `VERIFIED` markers, and commit exactly one logical current snapshot through a four-line HMAC-authenticated `CURRENT` pointer
 - Preserve explicit schema-v1 verification/restore compatibility, authenticating its required historical WAL payload but ignoring that external payload during restore because streamed `postgres/pg_wal` is sufficient, without treating legacy media as schema v2 or exposing a PITR workflow
-- Authenticate each backup inventory with HMAC-SHA-256, stream the bounded canonical backup-time archive-generation UUID inventory, bind the catalog receipt to its count, byte length, and SHA-256 without duplicating a large UUID array in PostgreSQL, require the exact 3.9.2 epoch and image identities, and issue daily-journal confirmation receipts only after the recovery point has passed structural and cryptographic verification
+- Authenticate each backup inventory with HMAC-SHA-256, stream the bounded canonical backup-time archive-generation UUID inventory, bind the catalog receipt to its count, byte length, and SHA-256 without duplicating a large UUID array in PostgreSQL, require the exact 3.11.0 epoch and image identities, and issue daily-journal confirmation receipts only after the recovery point has passed structural and cryptographic verification
 - Authenticate the exact top-level backup payload inventory, require an explicit member allowlist for the release-configuration archive, reject duplicate names, path aliases, prefix collisions, links, reparse points, traversal, and out-of-root paths in every archive, and serialize every storage-administration mutation with a cross-command lock
 - Publish backup and portable-export directories through a compiled Linux `renameat2(RENAME_NOREPLACE)` helper after durability barriers; stamp the helper's packaged-source SHA-256 into the image and regression-test collision preservation
 - Keep coordinated snapshots outside every long-running service mount, give a network-scoped `pg_basebackup --wal-method=stream` client only its fresh staging directory, and exclude only verified image-owned state links from the mutable-state snapshot
@@ -107,13 +108,26 @@ All notable changes to this project will be documented in this file.
 - Build connected Windows OSCAR/PostGIS images from explicit validated release contexts, avoiding the Docker Compose 5.6/Buildx 0.37 in-tree Dockerfile entitlement regression without disabling filesystem checks or granting wildcard host access
 - Add supported generation/observation hold list/create/release commands with persistent actor, reason, and release audit fields
 - Resolve observation-hold membership from an exact PostgreSQL row before consulting coarse archive ID ranges, so sparse/interleaved retired generations cannot reject unrelated extant rows while tombstoned and cold-only ambiguous targets remain fail-closed
-- Persist each new hold's `GENERATION_EXACT`, `HOT_EXACT`, or `COLD_RANGE_CONSERVATIVE` resolution mode, expose it in both administration CLIs, preserve unresolvable pre-3.9.2 observation-hold provenance as protective `LEGACY_UNKNOWN`, and document that neither a cold range nor unknown legacy provenance proves a sparse observation ID exists
+- Persist each new hold's `GENERATION_EXACT`, `HOT_EXACT`, or `COLD_RANGE_CONSERVATIVE` resolution mode, expose it in both administration CLIs, preserve unresolvable pre-3.11.0 observation-hold provenance as protective `LEGACY_UNKNOWN`, and document that neither a cold range nor unknown legacy provenance proves a sparse observation ID exists
 - Enforce active observation and exact-generation holds transactionally across single and filtered hot/cold datastore removals and tombstones; single removal fails visibly, bulk removal skips protected rows, and set-based candidate lookup avoids per-row connection borrows or store-wide hold materialization
 - Fail closed for generic tiered datastore/datastream clear, drop, table-clone backup, and table-replacing restore APIs; prevent datastream removal while any held observation remains, and reject opening a catalog created by a newer storage-schema version
 - Add a two-step cold-deletion workflow that freezes eligible sealed generations in a 24-hour plan, emits a one-time token, rechecks holds and each object hash, validates relative paths, persists restartable `DELETING` intent, and retains generation tombstones plus catalog/deletion-ledger audit records
 - Add atomic portable archive generation packages with catalog-relative data/schema/manifest objects, catalog JSON, README, ready-to-run DuckDB query, and package checksums
 - Add complete architecture, lifecycle, archive-format, backup/restore, operations, monitoring, failure-recovery, privacy, and staged-rollout documentation
-- Fail closed on macOS for 3.9.2 deployment/storage operations because Docker Desktop for Mac cannot meet the protected bind-root ownership and recovery-media isolation contract; production hosts are Ubuntu 24.04 or Windows 11/WSL 2
+- Fail closed on macOS for 3.11.0 deployment/storage operations because Docker Desktop for Mac cannot meet the protected bind-root ownership and recovery-media isolation contract; production hosts are Ubuntu 24.04 or Windows 11/WSL 2
+- Add `(datastreamid, phenomenontime, id)` composite indexes and window-pruned partition routing on attached `PARQUET_PRIMARY` stage partitions to eliminate multi-partition sequential scans during live and historical chart queries
+- Migrate legacy `dailyFile` datastream schemas (`rapiscanMessage`/`aspectMessage` to `rpmMessage`) in-place during store initialization, preserve backward-compatible JSON key deserialization, and harden PostGIS datastream/command-stream schema-evolution and member-system queries
+- Refresh Event Details adjudication history deterministically after submission and deduplicate historical vs. live MQTT adjudication entries by observation ID and timestamp
+
+## 3.10.0 2026-10-25
+## Changes
+- Add custom disposition codes configurable in admin page
+- Sort alarms by priority: Gamma-Neutron > Neutron > Gamma
+- Update daily file format to use expected format with UTC and local timestamps
+- Set camera reconnect attempts to infinite (-1 in config)
+- Add ability to share links to specific occupancies, referencing the occupancy's observation ID
+- Add daily file output to historical occupancies and live lane view
+- Add ability to chart individual detectors instead of the sum in live lane view
 
 ## 3.9.1
 ### Upgrade notes

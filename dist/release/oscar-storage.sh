@@ -19,7 +19,7 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
     fail "OSCAR storage launcher must be a regular, non-symlink file: $script_path"
 require_supported_storage_host() {
     [[ $(uname -s) != Darwin ]] ||
-        fail 'OSCAR 3.9.2 storage administration is not supported on macOS Docker Desktop; use Ubuntu 24.04 or Windows.'
+        fail 'OSCAR 3.11.0 storage administration is not supported on macOS Docker Desktop; use Ubuntu 24.04 or Windows.'
 }
 heading() { printf '\n== %s ==\n' "$*"; }
 compose() {
@@ -28,7 +28,7 @@ compose() {
         env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME -u COMPOSE_ENV_FILES -u COMPOSE_PROFILES \
             -u OSCAR_VERSION -u OSCAR_DEPLOYMENT_ID -u OSCAR_ARCHIVE_DIR -u OSCAR_BACKUP_DIR \
             -u OSCAR_BACKUP_MODE -u OSCAR_WAL_ARCHIVE_DIR -u OSCAR_SECRETS_DIR -u OSCAR_TLS_DIR -u OSCAR_BACKUP_KEY_FILE \
-            -u OSCAR_HTTPS_PORT -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
+            -u OSCAR_HTTPS_PORT -u OSCAR_TIMEZONE -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
             docker compose --project-name oscar --env-file "$script_dir/.env" --file "$script_dir/compose.yaml" "$@"
     )
 }
@@ -1552,7 +1552,7 @@ upgrade_persistent_state() {
     compose stop gateway
     compose stop oscar
 
-    # Releases before 3.9.2 over-mounted /var/lib/oscar/backups. Remove only an
+    # Releases before 3.11.0 over-mounted /var/lib/oscar/backups. Remove only an
     # empty legacy mountpoint; nonempty content always requires an explicit
     # operator decision and is never silently discarded.
     docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \

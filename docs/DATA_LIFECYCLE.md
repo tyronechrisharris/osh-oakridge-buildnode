@@ -1,4 +1,4 @@
-# OSCAR 3.9.2 data lifecycle and retention policy
+# OSCAR 3.11.0 data lifecycle and retention policy
 
 This document defines when OSCAR data changes form, when it may be removed, and which safety gates
 apply. It complements the [storage architecture](STORAGE_ARCHITECTURE.md) and the operational
@@ -39,7 +39,7 @@ workflows, adjudications, reports, archive control state, and observations not s
 primary cold tier. For allowlisted immutable outputs, a successful commit to a LOGGED PostgreSQL
 child is the durable staging boundary; OSCAR does not acknowledge those observations through a direct-to-Parquet path.
 Parquet is the primary cold tier, not a backup, and only output names listed in
-`archive.outputNames` are eligible for cold tiering. The 3.9.2 default list is:
+`archive.outputNames` are eligible for cold tiering. The 3.11.0 default list is:
 
 ```text
 gammaCounts
@@ -154,7 +154,7 @@ its rows in ID order, loads the exact hot IDs in bounded batches, and compares c
 digests. The receipt records expected/actual rows and success or failure. A failed receipt leaves
 all hot data in place.
 
-The shipped 3.9.2 profile sets `deleteHotAfterArchive=true`. In `PARQUET_PRIMARY`, this means
+The shipped 3.11.0 profile sets `deleteHotAfterArchive=true`. In `PARQUET_PRIMARY`, this means
 relation-level retirement rather than row-wise deletion or a rollback-grace overlap. Before a child
 can retire, every row must have an `ACTIVE` or `SEALED` exact owner with a successful
 `HOT_COLD_PARITY` receipt, and the worker re-hashes each authoritative Parquet object. Under the
@@ -262,7 +262,7 @@ recovered journal; a conflicting immutable CSV or manifest is not overwritten.
   retain one value.
 - `NONE` disables compatibility observations but does not disable the durable journal.
 
-The 3.9.2 standard profile uses `LATEST`. The lane system consumes each live `dailyFile` event to
+The 3.11.0 standard profile uses `LATEST`. The lane system consumes each live `dailyFile` event to
 derive occupancy transitions, so `NONE` would disable a required operational input. `LATEST` keeps
 that live stream and registered datastream. The compatibility table contains the current unsealed
 local day plus any manifest-blocked backlog; the journal and immutable daily CSV are the
@@ -437,7 +437,7 @@ incorrect.
 New holds persist `GENERATION_EXACT`, `HOT_EXACT`, or `COLD_RANGE_CONSERVATIVE`. The conservative
 mode means a cold-only ID was covered by a candidate generation's min/max block; because sparse
 Parquet IDs may leave gaps, it protects the range but is not evidence that the exact observation
-exists. A migrated pre-3.9.2 observation hold is labeled `LEGACY_UNKNOWN`: its historical exact-vs-
+exists. A migrated pre-3.11.0 observation hold is labeled `LEGACY_UNKNOWN`: its historical exact-vs-
 range provenance cannot be reconstructed, so it remains protective but must not be cited as proof
 that an exact observation existed. Confirm the event or use an explicit generation hold when legal
 certainty is required.

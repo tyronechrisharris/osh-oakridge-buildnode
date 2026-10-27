@@ -42,7 +42,7 @@ trap cleanup EXIT HUP INT TERM
 printf '%s\n' "$password" >"$scratch/oscar-db-password.txt"
 chmod 0644 "$scratch/oscar-db-password.txt"
 
-docker build --quiet --platform linux/amd64 --build-arg OSCAR_VERSION=3.9.2 --tag "$image" \
+docker build --quiet --platform linux/amd64 --build-arg OSCAR_VERSION=3.11.0 --tag "$image" \
     "$repo_root/dist/release/postgis" >/dev/null
 for volume in "$data_volume" "$backup_volume" "$corrupt_backup_volume"; do
     docker volume create "$volume" >/dev/null

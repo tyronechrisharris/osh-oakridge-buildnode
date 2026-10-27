@@ -57,7 +57,7 @@ sh -n "$archive_validator"
 sh -n "$archive_object_helper"
 sh -n "$oscar_entrypoint"
 
-# The 3.9.2 shipping profile is intentionally conservative about backup
+# The 3.11.0 shipping profile is intentionally conservative about backup
 # creation, but aggressive about the two bounded high-volume lifecycles. Keep
 # these exact values visible in a fast source-level test so documentation or
 # packaging cannot silently drift from the approved policy.
@@ -141,7 +141,7 @@ cp "$environment_template" "$backup_mode_fixture/.env.example"
 write_backup_mode_environment() {
     local mode_line=$1
     cat >"$backup_mode_fixture/.env" <<EOF
-OSCAR_VERSION=3.9.2
+OSCAR_VERSION=3.11.0
 OSCAR_DEPLOYMENT_ID=11111111-1111-4111-8111-111111111111
 OSCAR_ARCHIVE_DIR=$backup_mode_fixture/archive
 $mode_line
@@ -1015,7 +1015,7 @@ if [[ $compose_volume_block != "$expected_compose_volume_block" ]]; then
     exit 1
 fi
 
-# A real pre-3.9.2 deployment does not have the backup-key binding. Upgrade may
+# A real pre-3.11.0 deployment does not have the backup-key binding. Upgrade may
 # add only that missing canonical binding; custom, duplicate, and current-release
 # omissions remain hard failures under the strict credential-binding validator.
 write_391_env_fixture() {
@@ -1043,7 +1043,7 @@ write_391_env_fixture "$legacy_duplicate_bash/.env"
 write_391_env_fixture "$current_missing_bash/.env"
 printf 'OSCAR_BACKUP_KEY_FILE=/source/keys/backup-key.txt\n' >>"$legacy_custom_bash/.env"
 printf 'OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\nOSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\n' >>"$legacy_duplicate_bash/.env"
-sed -i.bak 's/^OSCAR_VERSION=3\.9\.1$/OSCAR_VERSION=3.9.2/' "$current_missing_bash/.env"
+sed -i.bak 's/^OSCAR_VERSION=3\.9\.1$/OSCAR_VERSION=3.11.0/' "$current_missing_bash/.env"
 rm -f "$current_missing_bash/.env.bak"
 
 bash -c '
@@ -1084,7 +1084,7 @@ done
 # Exercise the actual normalization order for a real 3.9.1 environment: the
 # preliminary validator accepts absent new-schema keys, explicit adoption adds
 # the deployment identity, storage initialization adds all three roots, and the
-# strict validator then accepts the resulting 3.9.2 schema.
+# strict validator then accepts the resulting 3.11.0 schema.
 legacy_upgrade_path_bash="$test_root/legacy-upgrade-path-bash"
 mkdir -p "$legacy_upgrade_path_bash"
 write_391_env_fixture "$legacy_upgrade_path_bash/.env"
@@ -1110,7 +1110,7 @@ bash -c '
     assert_deployment_volume_ownership true
     configure_storage_paths
     require_unique_literal_environment_keys
-    set_env_value OSCAR_VERSION 3.9.2
+    set_env_value OSCAR_VERSION 3.11.0
     require_managed_environment_bindings
 ' _ "$setup_shell_script" "$legacy_upgrade_path_bash" >/dev/null
 for binding in OSCAR_VERSION OSCAR_DEPLOYMENT_ID OSCAR_ARCHIVE_DIR OSCAR_BACKUP_MODE OSCAR_BACKUP_DIR; do
@@ -3779,7 +3779,7 @@ if command -v pwsh >/dev/null 2>&1; then
                 [IO.Directory]::CreateDirectory($directory) | Out-Null
             }
             [IO.File]::WriteAllLines((Join-Path $ScriptRoot ".env"), @(
-                "OSCAR_VERSION=3.9.2", "OSCAR_DEPLOYMENT_ID=$deployment",
+                "OSCAR_VERSION=3.11.0", "OSCAR_DEPLOYMENT_ID=$deployment",
                 "OSCAR_BACKUP_MODE=single",
                 "OSCAR_ARCHIVE_DIR=$ArchiveDirectory", "OSCAR_BACKUP_DIR=$BackupDirectory",
                 "OSCAR_WAL_ARCHIVE_DIR=$WalArchiveDirectory", "OSCAR_SECRETS_DIR=./secrets",
@@ -4139,7 +4139,7 @@ if command -v pwsh >/dev/null 2>&1; then
     write_391_env_fixture "$legacy_duplicate_root_powershell/.env"
     printf 'OSCAR_BACKUP_KEY_FILE=C:\\source\\keys\\backup-key.txt\n' >>"$legacy_custom_powershell/.env"
     printf 'OSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\nOSCAR_BACKUP_KEY_FILE=./secrets/backup-key.txt\n' >>"$legacy_duplicate_powershell/.env"
-    sed -i.bak 's/^OSCAR_VERSION=3\.9\.1$/OSCAR_VERSION=3.9.2/' "$current_missing_powershell/.env"
+    sed -i.bak 's/^OSCAR_VERSION=3\.9\.1$/OSCAR_VERSION=3.11.0/' "$current_missing_powershell/.env"
     rm -f "$current_missing_powershell/.env.bak"
     printf 'OSCAR_ARCHIVE_DIR=C:\\one\nOSCAR_ARCHIVE_DIR=C:\\two\n' >>"$legacy_duplicate_root_powershell/.env"
     STORAGE_SETUP_PATH="$setup_powershell_script" \
@@ -4214,7 +4214,7 @@ if command -v pwsh >/dev/null 2>&1; then
             Assert-DeploymentVolumeOwnership $true
             Initialize-StoragePaths
             Assert-UniqueLiteralEnvironmentKeys
-            Set-EnvValue "OSCAR_VERSION" "3.9.2"
+            Set-EnvValue "OSCAR_VERSION" "3.11.0"
             Assert-ManagedEnvironmentBindings
             $lines = [IO.File]::ReadAllLines((Join-Path $ScriptRoot ".env"))
             foreach ($name in @("OSCAR_VERSION", "OSCAR_DEPLOYMENT_ID", "OSCAR_ARCHIVE_DIR", "OSCAR_BACKUP_MODE", "OSCAR_BACKUP_DIR")) {

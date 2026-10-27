@@ -20,13 +20,13 @@ test('updates canonical release metadata without rewriting historical guide boun
     try {
         fs.mkdirSync(path.join(root, 'tools'), {recursive: true});
         fs.copyFileSync(path.join(__dirname, 'update-version.js'), path.join(root, 'tools/update-version.js'));
-        write('build.gradle', 'allprojects {\n    version = "3.9.2"\n}\n');
-        write('dist/config/standard/config.json', '{\n  "deploymentName": "OSCAR 3.9.2"\n}\n');
-        write('dist/release/.env.example', 'OSCAR_VERSION=3.9.2\n');
-        write('.github/workflows/release.yml', "env:\n  RELEASE_VERSION: '3.9.2'\n");
-        write('changelog.md', '# Change log\n## 3.9.2 2026-10-17\n## 3.9.1 2026-10-16\n');
-        write('web/oscar-viewer/changelog.md', '# Viewer change log\n## 3.9.2\n## 3.9.1\n');
-        write('README.md', 'The storage migration boundary remains pre-3.9.2.\n');
+        write('build.gradle', 'allprojects {\n    version = "3.11.0"\n}\n');
+        write('dist/config/standard/config.json', '{\n  "deploymentName": "OSCAR 3.11.0"\n}\n');
+        write('dist/release/.env.example', 'OSCAR_VERSION=3.11.0\n');
+        write('.github/workflows/release.yml', "env:\n  RELEASE_VERSION: '3.11.0'\n");
+        write('changelog.md', '# Change log\n## 3.11.0 2026-10-17\n## 3.9.1 2026-10-16\n');
+        write('web/oscar-viewer/changelog.md', '# Viewer change log\n## 3.11.0\n## 3.9.1\n');
+        write('README.md', 'The storage migration boundary remains pre-3.11.0.\n');
 
         execFileSync(process.execPath, [path.join(root, 'tools/update-version.js'), '3.9.3']);
 
@@ -36,13 +36,13 @@ test('updates canonical release metadata without rewriting historical guide boun
         assert.match(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'), /RELEASE_VERSION: '3\.9\.3'/);
         assert.equal(
             fs.readFileSync(path.join(root, 'changelog.md'), 'utf8'),
-            '# Change log\n## 3.9.2 2026-10-17\n## 3.9.1 2026-10-16\n',
+            '# Change log\n## 3.11.0 2026-10-17\n## 3.9.1 2026-10-16\n',
         );
         assert.equal(
             fs.readFileSync(path.join(root, 'web/oscar-viewer/changelog.md'), 'utf8'),
-            '# Viewer change log\n## 3.9.2\n## 3.9.1\n',
+            '# Viewer change log\n## 3.11.0\n## 3.9.1\n',
         );
-        assert.equal(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), 'The storage migration boundary remains pre-3.9.2.\n');
+        assert.equal(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), 'The storage migration boundary remains pre-3.11.0.\n');
     } finally {
         fs.rmSync(root, {recursive: true, force: true});
     }

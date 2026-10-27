@@ -1,6 +1,6 @@
 # OSCAR Quick Start
 
-OSCAR 3.9.2 deployment and storage operation are supported only on Windows 11 x86-64 with Docker
+OSCAR 3.11.0 deployment and storage operation are supported only on Windows 11 x86-64 with Docker
 Desktop/WSL 2 and Ubuntu Server 24.04 x86-64 with Docker Engine/Compose. macOS is limited to source
 inspection and non-deployment development; initialization, start, restart, upgrade, and storage
 operations fail closed there.
@@ -16,7 +16,7 @@ operations fail closed there.
 .\oscar.bat init
 ```
 
-5. Enter the deployment hostname and an OSCAR administrator password of at least 14 characters.
+5. Enter the deployment hostname, local IANA timezone (for example, `America/Chicago`), and an OSCAR administrator password of at least 14 characters.
    New self-signed installations automatically include the host's active, non-container LAN IPv4
    and Tailscale IPv4/IPv6 addresses in the certificate. If clients will use a stable site-DNS or Tailscale
    MagicDNS name other than the primary hostname, add it with `--tls-san` on Ubuntu or `-TlsSan`
@@ -130,7 +130,7 @@ Retention-hold creation prints and persists a resolution label. `GENERATION_EXAC
 are exact catalog/row matches; `COLD_RANGE_CONSERVATIVE` protects candidate archive ranges but does
 not prove that a possibly sparse observation ID exists. Confirm the event or hold its exact
 generation when evidentiary certainty is required. A listed `LEGACY_UNKNOWN` mode is a protective
-migration-only label for a pre-3.9.2 observation hold; it does not prove exact observation
+migration-only label for a pre-3.11.0 observation hold; it does not prove exact observation
 existence. Active observation or generation holds also
 block Viewer/API datastore removals: a single remove fails visibly and a bulk remove skips held
 rows. See `documentation/STORAGE_OPERATIONS.md` before creating or releasing a hold.
@@ -147,7 +147,7 @@ After full acceptance it atomically replaces the HMAC-authenticated `CURRENT` po
 the previous non-current fully accepted schema-v2 snapshot be removed. A confirmation failure
 leaves the previous `CURRENT` authoritative. The explicit
 `backup-verify` command can run with PostgreSQL stopped: it uses a one-shot utility container and
-treats the live catalog receipt as optional. Restore additionally requires matching 3.9.2 backup,
+treats the live catalog receipt as optional. Restore additionally requires matching 3.11.0 backup,
 current-release, and backed-up release-config identities plus every exact local Compose image.
 Plan backup capacity for the old snapshot plus one complete replacement: one snapshot is the
 steady-state logical result, not the peak space required while `CURRENT` is changing. If a crash
@@ -176,10 +176,10 @@ replaces the selected backup's `VERIFIED` marker and normalizes permissions. It 
 one restorable. An optional live catalog update occurs only after deployment-volume ownership is
 proven.
 
-OSCAR 3.9.2's full storage profile is initialized with a new database and standard configuration.
+OSCAR 3.11.0's full storage profile is initialized with a new database and standard configuration.
 An upgrade preserves the old `config.json` and PostgreSQL volume, so it does not silently convert a
-pre-3.9.2 system to the tiered archive or enable PostgreSQL data checksums. Use a fresh deployment
-for the 3.9.2 test systems. Preserve and separately migrate any production history that policy
+pre-3.11.0 system to the tiered archive or enable PostgreSQL data checksums. Use a fresh deployment
+for the 3.11.0 test systems. Preserve and separately migrate any production history that policy
 requires.
 
 If a deliberately retained pre-label deployment uses unlabelled Docker volumes, follow the
@@ -203,7 +203,7 @@ the attempt-complete application-readiness signal before returning.
 
 Delete the prior extracted release only after health and container-mount verification, and never
 delete a persistent archive, legacy WAL, or backup root preserved by `.env`.
-If verified pre-3.9.2 archive or enabled-backup roots are nonempty and have no root marker, the
+If verified pre-3.11.0 archive or enabled-backup roots are nonempty and have no root marker, the
 upgrade also requires the separate one-time `-AdoptLegacyStorageRoots` (Windows) or
 `--adopt-legacy-storage-roots` (Ubuntu) switch. It records audited adoption metadata in each archive
 or enabled-backup root; it must never be used to claim foreign data or silence a mismatched existing

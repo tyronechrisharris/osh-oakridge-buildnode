@@ -1,6 +1,6 @@
-# OSCAR 3.9.2 backup, restore, and recovery
+# OSCAR 3.11.0 backup, restore, and recovery
 
-OSCAR 3.9.2 can create one coordinated recovery snapshot of the PostgreSQL cluster, application
+OSCAR 3.11.0 can create one coordinated recovery snapshot of the PostgreSQL cluster, application
 state, primary Parquet cold tier, release configuration, and encrypted deployment credentials.
 Fresh installations default to `OSCAR_BACKUP_MODE=disabled`; backup creation, verification, restore,
 and the retired prune command remain unavailable until an administrator explicitly changes the
@@ -123,7 +123,7 @@ scale. The automated restore returns PostgreSQL to the consistent endpoint inclu
 
 Compose enables PostgreSQL data checksums for **new** clusters and WAL compression, but explicitly
 runs PostgreSQL with `archive_mode=off`. It sets no external archive command or timeout and mounts no
-host WAL directory. OSCAR 3.9.2 supports restore only to the consistency endpoint carried by the
+host WAL directory. OSCAR 3.11.0 supports restore only to the consistency endpoint carried by the
 selected base backup; it does not provide point-in-time recovery to an arbitrary timestamp or LSN.
 The restore promotes the recovered cluster onto a fresh timeline without consulting an external WAL
 archive.
@@ -136,7 +136,7 @@ entry/byte bounds. Both launchers stream this file while calculating its receipt
 the complete list into memory or construct an SQL UUID-array literal. A backup with no active or
 sealed generations uses a valid empty file (count and bytes zero, with the standard SHA-256 of empty
 content). The epoch must identify exactly OSCAR
-3.9.2, not merely any semantic version. Before destructive restore, OSCAR also compares the current
+3.11.0, not merely any semantic version. Before destructive restore, OSCAR also compares the current
 application, PostgreSQL, and gateway image names, immutable IDs, and required release labels with
 the authenticated inventory. Exact names, content-addressed IDs, and required labels are hard
 gates. Repository digests are recorded as registry provenance, but a difference is only warned
@@ -346,10 +346,10 @@ authenticated `CURRENT` pointer. This prevents inspection or restoration of an o
 point from mutating current journal eligibility or the committed local snapshot. `backup-prune` is
 retired and performs no deletion.
 Re-verification proves the authenticated snapshot has not changed; the quiesced archive/catalog
-reconciliation is a mandatory invariant of creating that authenticated 3.9.2 snapshot, not a
+reconciliation is a mandatory invariant of creating that authenticated 3.11.0 snapshot, not a
 comparison against the current live deployment.
 
-For a newly created 3.9.2 backup, successful verification proves authenticated structural integrity
+For a newly created 3.11.0 backup, successful verification proves authenticated structural integrity
 at that time and confirms the locally configured OSCAR/PostgreSQL utility images can read it; it
 does not by itself complete schema-v2 acceptance. A
 directory without `SHA256SUMS.hmac` is rejected rather than promoted into the verified retention
@@ -384,7 +384,7 @@ that payload because streamed `postgres/pg_wal` is sufficient. Before
 stopping or replacing anything,
 the command requires the same valid backup ID twice, authenticates/verifies the backup, validates the
 release-configuration archive, and proves that the current `.env`, backup epoch, and backed-up
-`.env.example` all identify exactly OSCAR 3.9.2. It also requires every exact image resolved by the
+`.env.example` all identify exactly OSCAR 3.11.0. It also requires every exact image resolved by the
 current Compose configuration to exist locally; restore never substitutes or pulls a different tag.
 
 A restore attempt does not change the recovery point's lifecycle state. An accepted recovery point
@@ -419,7 +419,7 @@ Windows:
 The restore workflow:
 
 1. verifies the backup again;
-2. validates exact 3.9.2 release identity and local image availability again after verification;
+2. validates exact 3.11.0 release identity and local image availability again after verification;
 3. decrypts the backed-up `.env`, `secrets/`, and `tls/` into a private staging directory, merges
    the target-local environment bindings, and validates the entire staged replacement set;
 4. for schema v1 only, authenticates its required legacy WAL payload but does not stage, merge, or
@@ -543,7 +543,7 @@ and approver.
 
 ## Recovery boundary: no PITR
 
-OSCAR 3.9.2 does not continuously archive PostgreSQL WAL and does not support point-in-time recovery.
+OSCAR 3.11.0 does not continuously archive PostgreSQL WAL and does not support point-in-time recovery.
 The supported target is the consistency endpoint inside one verified coordinated snapshot. Do not
 present a preserved legacy WAL root, a schema-v1 compatibility payload, or the Parquet cold tier as
 a current PITR chain.
@@ -558,7 +558,7 @@ snapshot. This order prevents a failed backup or crash from leaving zero authent
 
 `backup-prune` is retired. It remains accepted only to print retirement guidance and performs no
 deletion. `OSCAR_BACKUP_RETENTION_COUNT` and `OSCAR_BACKUP_AUTO_PRUNE` are ignored legacy settings
-and are not present in the 3.9.2 template. Never hand-edit `CURRENT` or delete a pointed-to snapshot.
+and are not present in the 3.11.0 template. Never hand-edit `CURRENT` or delete a pointed-to snapshot.
 
 Define a policy that retains enough **verified, off-host** snapshot copies to meet recovery
 objectives. Off-host media are outside the local one-snapshot state machine; copy the complete

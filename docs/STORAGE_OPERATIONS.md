@@ -1,7 +1,7 @@
-# OSCAR 3.9.2 storage operations
+# OSCAR 3.11.0 storage operations
 
 This is the administrator runbook for OSCAR's PostgreSQL hot store, primary Parquet cold tier,
-direct daily journal, retained media, and optional single coordinated snapshot. Commands assume the extracted 3.9.2
+direct daily journal, retained media, and optional single coordinated snapshot. Commands assume the extracted 3.11.0
 release directory is the current directory.
 
 For design rationale see [Storage architecture](STORAGE_ARCHITECTURE.md). For exact state
@@ -34,7 +34,7 @@ fallback.
    `%ProgramData%\OSCAR\StorageLocks` (Windows), so a
    clean-release upgrade cannot evade an older process's lock.
 
-## Standard 3.9.2 configuration
+## Standard 3.11.0 configuration
 
 New installations receive these defaults from `dist/config/standard/config.json`:
 
@@ -110,7 +110,7 @@ the file shipped in the ZIP became active.
 
 ## New installation and storage paths
 
-For a new 3.9.2 production system, keep the live archive on durable monitored storage. Backup mode
+For a new 3.11.0 production system, keep the live archive on durable monitored storage. Backup mode
 is disabled until an administrator deliberately selects a safe absolute backup path that does not
 overlap the release or archive roots. A separate physical drive is recommended for failure
 isolation, but it is not required:
@@ -204,41 +204,41 @@ Use local NTFS for a Windows release directory; do not put live database or jour
 cloud-synchronization folder. On Ubuntu, avoid network filesystems that cannot provide the required
 rename, force, ownership, and PostgreSQL semantics.
 
-### Existing pre-3.9.2 deployments
+### Existing pre-3.11.0 deployments
 
-The complete 3.9.2 storage profile is not an automatic in-place conversion. `oscar upgrade` preserves
+The complete 3.11.0 storage profile is not an automatic in-place conversion. `oscar upgrade` preserves
 the existing application configuration and database volume, and PostgreSQL data checksums are an
 initial-cluster property.
 
 One narrow compatibility migration is automatic: supported `oscar upgrade` stops the application
 tier and runs the restartable daily-file lifecycle-index migration before startup. The tool reads
 the retained `/var/lib/oscar/config.json`, uses the configured Daily File Journal root/directory/zone,
-and skips safely when that module is absent. It upgrades an earlier 3.9.2 preview journal without
-scanning its historical tree on a live module thread. It does not convert a pre-3.9.2 database or
+and skips safely when that module is absent. It upgrades an earlier 3.11.0 preview journal without
+scanning its historical tree on a live module thread. It does not convert a pre-3.11.0 database or
 configuration into the complete tiered-storage profile. The same deployment-scoped lock excludes
 backup, restore, and archive administration until the new services pass health checks. On failure,
 final metadata stays uncommitted while restart-safe work markers may remain; the application stays
 stopped, so fix the reported condition and rerun `upgrade`.
 
-The 3.9.2 observation schema also installs a corrected natural-key unique index that treats null
+The 3.11.0 observation schema also installs a corrected natural-key unique index that treats null
 feature, phenomenon-time, and result-time fields as equal. This is important because a null result
 time is normal for OSCAR observations. If an older database already contains duplicates under that
 corrected key, PostgreSQL deliberately refuses to create the index instead of choosing a row or
 silently retaining ambiguity. Audit and resolve those duplicates under an approved migration before
-attempting an in-place database upgrade. A fresh 3.9.2 database has no such cleanup requirement.
+attempting an in-place database upgrade. A fresh 3.11.0 database has no such cleanup requirement.
 
-For the disposable test systems, initialize a clean 3.9.2 deployment and new database. For a
-production pre-3.9.2 system whose history must remain available:
+For the disposable test systems, initialize a clean 3.11.0 deployment and new database. For a
+production pre-3.11.0 system whose history must remain available:
 
 1. freeze retention/deletion changes;
 2. take and verify the existing system's supported backup/export;
 3. retain the old deployment read-only for policy lookup;
-4. initialize 3.9.2 on clean state;
+4. initialize 3.11.0 on clean state;
 5. validate lane configuration and workflows;
 6. migrate only records required by an approved, tested migration procedure; and
-7. preserve the pre-3.9.2 system until retention and audit owners accept the transition.
+7. preserve the pre-3.11.0 system until retention and audit owners accept the transition.
 
-Do not erase an old production volume simply to make the 3.9.2 module start.
+Do not erase an old production volume simply to make the 3.11.0 module start.
 
 ## Production rollout
 
@@ -476,7 +476,7 @@ shows the mode for active and released history:
   candidate generation range but **does not prove that the typed observation ID exists**. For legal
   certainty, verify the event/observation in OSCAR or place an explicit `GENERATION_EXACT` hold on
   the confirmed generation.
-- `LEGACY_UNKNOWN` is migration-only. It marks a pre-3.9.2 observation hold whose original exact-
+- `LEGACY_UNKNOWN` is migration-only. It marks a pre-3.11.0 observation hold whose original exact-
   row versus range-based resolution was not recorded. It remains protective but is not evidence
   that the exact observation existed. The CLI never creates a new hold with this mode.
 
@@ -712,7 +712,7 @@ For an event reached by the first eligible retained-media cycle:
   `DELETED` while the five frames remain viewable.
 
 A `404` from the retained-media event endpoint is a compatibility signal: the Viewer must fall back
-to the occupancy's legacy `videoPaths`. It is normal for legacy/pre-3.9.2 events. A manifest whose
+to the occupancy's legacy `videoPaths`. It is normal for legacy/pre-3.11.0 events. A manifest whose
 referenced frame is missing or corrupt is not normal; the API withholds that asset, and the source
 or backup should be used for recovery.
 
@@ -861,7 +861,7 @@ Track at least:
 | Retained-media lane parent cannot be resolved | No new manifest; source and retry state remain | Verify the RPM/camera systems are members of the intended OSH lane and that the deployed PostgreSQL datastore supports `getParent`; do not relabel an existing manifest by hand |
 | Media publication fails | Partial set stays invisible; source preserved; retry ledger records failure | Check FFmpeg, source integrity, filesystem/rename/space; allow idempotent retry |
 | Pressure cleanup cannot reach target | Protected data stays; error is logged | Add capacity or perform approved cold/media retention; never remove journal/adjudication files ad hoc |
-| PostgreSQL reports archiver activity or an external WAL mount | Deployment drifted from the 3.9.2 profile | Stop rollout, preserve legacy data, restore `archive_mode=off`/no-WAL-bind configuration through the supported release, and requalify backup/restore |
+| PostgreSQL reports archiver activity or an external WAL mount | Deployment drifted from the 3.11.0 profile | Stop rollout, preserve legacy data, restore `archive_mode=off`/no-WAL-bind configuration through the supported release, and requalify backup/restore |
 | Backup fails | `.partial` or finalized-but-unverified directory remains; services are resumed where possible | Check `status`, preserve diagnostics, correct the cause, then re-verify or run a new backup |
 | Restore fails | Deployment may remain stopped/partial | Keep producers disconnected; preserve `pre-restore-*`; repair cause and repeat from the same verified backup or escalate |
 | PostgreSQL shutdown errors appear during OSCAR stop/restart | Qualification fails; OSCAR may not complete its database-backed module drain | Use the release `oscar` launcher, which stops gateway, OSCAR, and PostgreSQL sequentially; confirm the media-retention cancellation log completes, preserve logs, and do not substitute an unscoped multi-service Compose stop/restart |

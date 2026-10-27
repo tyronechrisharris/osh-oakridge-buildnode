@@ -478,7 +478,7 @@ try {
         try { [void](Get-DockerShellInputOutput 'true' @('run', '--interactive', '--entrypoint', 'sh', 'oscar:test', '-seu')) }
         catch { $rejectedInteractiveCaller = $_.Exception.Message -like '*helper owns --interactive*' }
         $markerFixture = "marker=/data/marker`r`ntest `"`$(grep -Fxc `"version=`$1`" `"`$marker`")`" = 1`r`n"
-        $markerResult = @(Get-ComposeShellInputOutput $markerFixture @('exec', '-T', 'postgres', 'sh', '-seu', '3.9.2'))
+        $markerResult = @(Get-ComposeShellInputOutput $markerFixture @('exec', '-T', 'postgres', 'sh', '-seu', '3.11.0'))
         $markerInput = $script:capturedShellInput
         $markerArguments = @($script:capturedShellArguments)
         $configFixture = "config=/var/lib/oscar/config.json`r`ntest -f `"`$config`"`r`ngrep -Fq `"frameRetentionCount`" `"`$config`"`r`n"
@@ -501,7 +501,7 @@ try {
     $expectedConfigInput = "config=/var/lib/oscar/config.json`ntest -f `"`$config`"`ngrep -Fq `"frameRetentionCount`" `"`$config`"`n# oscar-powershell-stdin-terminator"
     Assert-True ($shellFixture.MarkerInput -ceq $expectedMarkerInput) 'Windows shell-input adapter did not deterministically preserve the multiline marker body with Unix line endings.'
     Assert-True ($shellFixture.ConfigInput -ceq $expectedConfigInput) 'Windows shell-input adapter did not deterministically preserve the multiline config body with Unix line endings.'
-    Assert-True (($shellFixture.MarkerArguments -join [char]0) -ceq (@('exec', '-T', 'postgres', 'sh', '-seu', '3.9.2') -join [char]0)) `
+    Assert-True (($shellFixture.MarkerArguments -join [char]0) -ceq (@('exec', '-T', 'postgres', 'sh', '-seu', '3.11.0') -join [char]0)) `
         'Windows shell-input adapter did not keep the release version at shell positional parameter $1.'
     Assert-True (($shellFixture.ConfigArguments -join [char]0) -ceq (@('exec', '-T', 'oscar', 'sh', '-seu') -join [char]0)) `
         'Windows shell-input adapter changed the config-check shell arguments.'
@@ -790,14 +790,14 @@ SELECT 'single quote '' and $dollar';
     Assert-True $rejectedOversized 'The Docker JSON parser accepted output above its fixed memory bound.'
     & {
         $script:CapturedDockerInspectArguments = @()
-        $imageJson = '[{"Id":"sha256:' + ('a' * 64) + '","RepoDigests":["oscar@sha256:' + ('b' * 64) + '"],"Config":{"Labels":{"org.opencontainers.image.version":"3.9.2"}}}]'
+        $imageJson = '[{"Id":"sha256:' + ('a' * 64) + '","RepoDigests":["oscar@sha256:' + ('b' * 64) + '"],"Config":{"Labels":{"org.opencontainers.image.version":"3.11.0"}}}]'
         function Get-ExternalOutput([string]$Program, [string[]]$Arguments) {
             $script:CapturedDockerInspectArguments = @($Arguments)
             return @($imageJson)
         }
-        Assert-True ((Get-ImageInspectValue 'oscar:3.9.2' 'org.opencontainers.image.version') -ceq '3.9.2') `
+        Assert-True ((Get-ImageInspectValue 'oscar:3.11.0' 'org.opencontainers.image.version') -ceq '3.11.0') `
             'The image JSON parser did not read the required OCI version label.'
-        Assert-True (($script:CapturedDockerInspectArguments -join '|') -ceq 'image|inspect|oscar:3.9.2') `
+        Assert-True (($script:CapturedDockerInspectArguments -join '|') -ceq 'image|inspect|oscar:3.11.0') `
             'Windows image inspection did not use the exact format-free JSON command.'
     }
     & {
@@ -1059,7 +1059,7 @@ SELECT 'single quote '' and $dollar';
     $envFixture = Join-Path $temporaryRoot 'unc-preflight'
     New-Item -ItemType Directory -Path $envFixture | Out-Null
     [IO.File]::WriteAllLines((Join-Path $envFixture '.env'), @(
-        'OSCAR_VERSION=3.9.2',
+        'OSCAR_VERSION=3.11.0',
         'OSCAR_DEPLOYMENT_ID=11111111-2222-4333-8444-555555555555',
         'OSCAR_ARCHIVE_DIR=\\server\share\archive',
         'OSCAR_BACKUP_DIR=D:\oscar-storage\backups',
