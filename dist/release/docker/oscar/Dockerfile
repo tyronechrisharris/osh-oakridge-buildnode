@@ -4,7 +4,7 @@ ARG OSCAR_UID=10001
 ARG OSCAR_GID=10001
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends curl ca-certificates \
+    && apt-get install --yes --no-install-recommends curl ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${OSCAR_GID}" oscar \
     && useradd --uid "${OSCAR_UID}" --gid "${OSCAR_GID}" --home-dir /var/lib/oscar --shell /usr/sbin/nologin oscar
