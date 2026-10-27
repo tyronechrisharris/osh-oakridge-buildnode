@@ -104,7 +104,7 @@ const archive = standardDatabases[0].dbConfig?.archive;
 const dailyJournal = standardDailyJournals[0];
 const expectedStorageDefaults = {
     'videoRetentionConfig.timeToRetention': [videoRetention?.timeToRetention, 0],
-    'videoRetentionConfig.videoQueryPeriod': [videoRetention?.videoQueryPeriod, 5],
+    'videoRetentionConfig.videoQueryPeriod': [videoRetention?.videoQueryPeriod, 1],
     'videoRetentionConfig.maximumCatchUpHours': [videoRetention?.maximumCatchUpHours, 6],
     'videoRetentionConfig.lateArrivalOverlapHours': [videoRetention?.lateArrivalOverlapHours, 24],
     'videoRetentionConfig.lateArrivalScanPeriodMinutes': [videoRetention?.lateArrivalScanPeriodMinutes, 360],
@@ -116,8 +116,12 @@ const expectedStorageDefaults = {
     'videoRetentionConfig.frameRetentionCount': [videoRetention?.frameRetentionCount, 5],
     'videoRetentionConfig.jpegQuality': [videoRetention?.jpegQuality, 85],
     'videoRetentionConfig.sourceRollbackGraceHours': [videoRetention?.sourceRollbackGraceHours, 24],
+    'videoRetentionConfig.enableSecondaryFramePruning': [videoRetention?.enableSecondaryFramePruning, true],
+    'videoRetentionConfig.secondaryFrameRetentionDays': [videoRetention?.secondaryFrameRetentionDays, 30],
     'videoRetentionConfig.maintenanceWorkLimit': [videoRetention?.maintenanceWorkLimit, 200],
     'videoRetentionConfig.metadataReclamationWorkLimit': [videoRetention?.metadataReclamationWorkLimit, 200],
+    'oscarService.delegateObservationLifecycleToDatabase': [standardOscar[0]?.delegateObservationLifecycleToDatabase, true],
+    'oscarService.connectionStatusRetentionHours': [standardOscar[0]?.connectionStatusRetentionHours, 1],
     'archive.enabled': [archive?.enabled, true],
     'archive.storageMode': [archive?.storageMode, 'PARQUET_PRIMARY'],
     'archive.hotRetentionDays': [archive?.hotRetentionDays, 2],

@@ -214,7 +214,7 @@ if (!fs.existsSync(standardConfigPath)) {
             module?.objClass === 'com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig');
         const expectedVideoRetention = {
             timeToRetention: 0,
-            videoQueryPeriod: 5,
+            videoQueryPeriod: 1,
             maximumCatchUpHours: 6,
             lateArrivalOverlapHours: 24,
             lateArrivalScanPeriodMinutes: 360,
@@ -226,6 +226,8 @@ if (!fs.existsSync(standardConfigPath)) {
             frameRetentionCount: 5,
             jpegQuality: 85,
             sourceRollbackGraceHours: 24,
+            enableSecondaryFramePruning: true,
+            secondaryFrameRetentionDays: 30,
             maintenanceWorkLimit: 200,
             metadataReclamationWorkLimit: 200,
         };

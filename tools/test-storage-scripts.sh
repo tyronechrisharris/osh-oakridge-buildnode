@@ -83,7 +83,7 @@ const dailyJournal = config.find(item =>
 const outputs = ['gammaCounts', 'gammaThreshold', 'neutronCounts', 'setupGamma', 'setupNeutron'];
 const expectedVideoRetention = {
     timeToRetention: 0,
-    videoQueryPeriod: 5,
+    videoQueryPeriod: 1,
     maximumCatchUpHours: 6,
     lateArrivalOverlapHours: 24,
     lateArrivalScanPeriodMinutes: 360,
@@ -97,6 +97,8 @@ const expectedVideoRetention = {
     frameRetentionCount: 5,
     jpegQuality: 85,
     sourceRollbackGraceHours: 24,
+    enableSecondaryFramePruning: true,
+    secondaryFrameRetentionDays: 30,
 };
 if (Object.entries(expectedVideoRetention).some(([field, expected]) =>
         service?.videoRetentionConfig?.[field] !== expected) ||
