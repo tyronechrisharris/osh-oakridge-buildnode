@@ -8,6 +8,7 @@ command_name=${1:-help}
 if (($#)); then shift; fi
 
 hostname_value=''
+timezone_value=''
 port_value=443
 tls_mode='self-signed'
 certificate_path=''
@@ -24,7 +25,7 @@ usage() {
     cat <<'EOF'
 OSCAR deployment administration
 
-  sudo ./oscar.sh init [--hostname oscar.local] [--port 443]
+  sudo ./oscar.sh init [--hostname oscar.local] [--port 443] [--timezone America/Chicago]
       [--tls-mode self-signed|import] [--certificate FILE --private-key FILE]
       [--add-hosts-entry] [--skip-hosts-entry] [--skip-start]
       [--prerequisites auto|existing|bundled]
@@ -43,6 +44,7 @@ heading() { printf '\n== %s ==\n' "$*"; }
 while (($#)); do
     case "$1" in
         --hostname) hostname_value=${2:?missing hostname}; shift 2 ;;
+        --timezone) timezone_value=${2:?missing timezone}; shift 2 ;;
         --port) port_value=${2:?missing port}; shift 2 ;;
         --tls-mode) tls_mode=${2:?missing TLS mode}; shift 2 ;;
         --certificate) certificate_path=${2:?missing certificate path}; shift 2 ;;
@@ -351,6 +353,18 @@ case "$command_name" in
             read -r -p 'Hostname or IP address [oscar.local]: ' hostname_value
             hostname_value=${hostname_value:-oscar.local}
         fi
+        if [[ -z $timezone_value ]]; then
+            timezone_default=UTC
+            if [[ -f $script_dir/.env ]]; then
+                timezone_default=$(awk -F= '$1 == "OSCAR_TIMEZONE" { print substr($0, index($0, "=") + 1); exit }' "$script_dir/.env")
+                timezone_default=${timezone_default:-UTC}
+            fi
+            if ! $non_interactive; then
+                read -r -p "Local IANA timezone (e.g. America/Chicago) [$timezone_default]: " timezone_value
+            fi
+            timezone_value=${timezone_value:-$timezone_default}
+        fi
+        [[ $timezone_value =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || fail 'Use an IANA timezone such as America/Chicago or UTC.'
         valid_hostname "$hostname_value" || fail "Invalid hostname or IP address: $hostname_value"
         [[ $port_value =~ ^[0-9]+$ ]] && ((port_value >= 1 && port_value <= 65535)) || fail 'Port must be between 1 and 65535.'
         ((port_value != 80)) || fail 'Port 80 is reserved for the HTTP-to-HTTPS redirect.'
@@ -362,6 +376,9 @@ case "$command_name" in
         [[ -e $script_dir/secrets/oscar-db-password.txt ]] || write_secret "$script_dir/secrets/oscar-db-password.txt" "$(random_password)"
         [[ -e $script_dir/secrets/postgres-bootstrap-password.txt ]] || write_secret "$script_dir/secrets/postgres-bootstrap-password.txt" "$(random_password)"
         prepare_deployment_images
+        docker run --rm --entrypoint test "$(oscar_image)" -f "/usr/share/zoneinfo/$timezone_value" \
+            || fail "Unknown IANA timezone: $timezone_value"
+        set_env_value OSCAR_TIMEZONE "$timezone_value"
         initialize_tls "$hostname_value"
         protect_deployment_files
         $add_hosts && add_local_hosts_mapping "$hostname_value"
