@@ -52,6 +52,7 @@ fi
 # JAVA_OPTS is intentionally word-split so administrators can provide normal JVM options.
 # shellcheck disable=SC2086
 exec java ${JAVA_OPTS:-} \
+    -Duser.timezone="${TZ:-UTC}" \
     -Dlogback.configurationFile=/opt/oscar/logback.xml \
     -cp '/opt/oscar/lib/*' \
     -Djava.system.class.loader=org.sensorhub.utils.NativeClassLoader \

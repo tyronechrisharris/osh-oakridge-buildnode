@@ -52,6 +52,7 @@ services:
       - source: oscar_db_password
         target: oscar_db_password
     environment:
+      TZ: "${OSCAR_TIMEZONE:-UTC}"
       INITIAL_ADMIN_PASSWORD_FILE: /run/secrets/oscar_admin_password
       OSCAR_DB_PASSWORD_FILE: /run/secrets/oscar_db_password
       JAVA_OPTS: "${OSCAR_JAVA_OPTS:--Xms1g -Xmx6g -Xss256k -XX:ReservedCodeCacheSize=512m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError}"
