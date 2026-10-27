@@ -137,7 +137,7 @@
     "videoRetentionConfig": {
       "objClass": "com.botts.impl.service.oscar.video.VideoRetentionConfig",
       "timeToRetention": 0,
-      "videoQueryPeriod": 5,
+      "videoQueryPeriod": 1,
       "maximumCatchUpHours": 6,
       "lateArrivalOverlapHours": 24,
       "lateArrivalScanPeriodMinutes": 360,
@@ -150,7 +150,9 @@
       "enableFrameRetention": true,
       "frameRetentionCount": 5,
       "jpegQuality": 85,
-      "sourceRollbackGraceHours": 24
+      "sourceRollbackGraceHours": 24,
+      "enableSecondaryFramePruning": true,
+      "secondaryFrameRetentionDays": 30
     },
     "storagePressureRetentionConfig": {
       "objClass": "com.botts.impl.service.oscar.retention.StoragePressureRetentionConfig",
@@ -166,6 +168,7 @@
     "statsFrequencyMinutes": 60,
     "delegateObservationLifecycleToDatabase": true,
     "dailyFilePurgeWorkLimit": 50,
+    "connectionStatusRetentionHours": 1,
     "webIdApiRoot": "",
     "id": "09422f61-0098-4ac2-bb0e-3f42ec470524",
     "autoStart": true,
