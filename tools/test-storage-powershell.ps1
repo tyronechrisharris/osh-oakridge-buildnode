@@ -366,7 +366,7 @@ try {
         @($setupSource, $storageSource) |
             ForEach-Object { $_ -split "`r?`n" } |
             Where-Object { $_.Contains("'--user', '0'") -or $_.Contains("'--user', '0:0'") })
-    Assert-True ($rootHelperLines.Count -eq 17) 'Windows root-helper inventory changed unexpectedly.'
+    Assert-True ($rootHelperLines.Count -eq 18) 'Windows root-helper inventory changed unexpectedly.'
     foreach ($rootHelperLine in $rootHelperLines) {
         Assert-True ($rootHelperLine.Contains("'--workdir', '/'") ) `
             'A Windows root helper inherited an image-owned working directory.'

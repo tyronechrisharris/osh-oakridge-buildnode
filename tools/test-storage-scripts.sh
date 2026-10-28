@@ -2432,17 +2432,21 @@ awk '
         if (index(previous "\n" $0, "--workdir /") == 0) missing++
     }
     { previous=$0 }
-    END { exit !(root_helpers == 16 && missing == 0) }
+    END { exit !(root_helpers == 17 && missing == 0) }
 ' "$shell_script" "$setup_shell_script" || {
     printf 'Bash root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
 windows_root_helper_count=$(grep -hE -- "'--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
 windows_neutral_root_helper_count=$(grep -hE -- "'--workdir', '/', '--user', '0(:0)?'" "$powershell_script" "$setup_powershell_script" | wc -l | tr -d ' ')
-[[ $windows_root_helper_count == 17 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
+[[ $windows_root_helper_count == 18 && $windows_neutral_root_helper_count == "$windows_root_helper_count" ]] || {
     printf 'PowerShell root helper inherited an image-owned working directory.\n' >&2
     exit 1
 }
+assert_contains '-days 3650' "$setup_shell_script"
+assert_contains '-checkend 0' "$setup_shell_script"
+assert_contains "'-days', '3650'" "$setup_powershell_script"
+assert_contains '-checkend 0' "$setup_powershell_script"
 
 # A failure after both validation and extraction must remove the private
 # snapshot and resume exactly the application services that were running.

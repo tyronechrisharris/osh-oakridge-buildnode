@@ -824,6 +824,15 @@ initialize_tls() {
     if [[ (-e $cert && ! -e $key) || (! -e $cert && -e $key) ]]; then fail 'TLS setup is incomplete. Remove the partial certificate/key pair or provide both files.'; fi
     image=$(oscar_image)
 
+    if [[ -e $cert && -e $key && $tls_mode == 'self-signed' ]]; then
+        if ! docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint openssl --volume "${tls_dir}:/tls:ro" "$image" \
+            x509 -in /tls/server.crt -noout -checkend 0 >/dev/null 2>&1; then
+            echo 'Existing self-signed TLS certificate has expired; regenerating a new 10-year certificate.'
+            rm -f "$cert" "$key"
+        fi
+    fi
+
     if [[ ! -e $cert && ! -e $key ]]; then
         case "$tls_mode" in
             import)
@@ -835,7 +844,7 @@ initialize_tls() {
             self-signed)
                 docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
                     --tmpfs /tmp:rw,noexec,nosuid,nodev --workdir / --user 0:0 --entrypoint openssl --volume "${tls_dir}:/out" "$image" \
-                    req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 -subj "/CN=$name" \
+                    req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 -subj "/CN=$name" \
                     -addext "subjectAltName=$(tls_san_extension)" -keyout /out/server.key -out /out/server.crt
                 ;;
             *) fail "Unsupported TLS mode: $tls_mode" ;;

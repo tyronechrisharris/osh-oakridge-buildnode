@@ -964,6 +964,18 @@ function Initialize-Tls([string]$Name, [string[]]$Names) {
         throw 'TLS setup is incomplete. Remove the partial certificate/key pair or provide both files.'
     }
 
+    if ($hasCertificate -and ($TlsMode -eq 'self-signed')) {
+        $image = Get-OscarImage
+        $expiryCheck = 'openssl x509 -in /tls/server.crt -noout -checkend 0 >/dev/null 2>&1 && printf VALID || printf EXPIRED'
+        $expiryState = (Get-DockerShellInputOutput $expiryCheck @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'sh', '--volume', "${tlsDirectory}:/tls:ro", $image, '-seu')).Trim()
+        if ($expiryState -eq 'EXPIRED') {
+            Write-Host 'Existing self-signed TLS certificate has expired; regenerating a new 10-year certificate.'
+            Remove-Item -LiteralPath $certificate, $privateKey -Force
+            $hasCertificate = $false
+            $hasPrivateKey = $false
+        }
+    }
+
     if (-not $hasCertificate) {
         if ($TlsMode -eq 'import') {
             $sourceCertificate = Read-RequiredValue 'Certificate PEM path' $CertificatePath
@@ -974,7 +986,7 @@ function Initialize-Tls([string]$Name, [string[]]$Names) {
             $parsedIp = $null
             $image = Get-OscarImage
             Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--workdir', '/', '--user', '0:0', '--entrypoint', 'openssl', '--volume', "${tlsDirectory}:/out", $image,
-                'req', '-x509', '-newkey', 'rsa:3072', '-sha256', '-nodes', '-days', '365', '-subj', "/CN=$Name", '-addext', "subjectAltName=$(Get-TlsSanExtension $Names)", '-keyout', '/out/server.key', '-out', '/out/server.crt')
+                'req', '-x509', '-newkey', 'rsa:3072', '-sha256', '-nodes', '-days', '3650', '-subj', "/CN=$Name", '-addext', "subjectAltName=$(Get-TlsSanExtension $Names)", '-keyout', '/out/server.key', '-out', '/out/server.crt')
         }
     }
 
