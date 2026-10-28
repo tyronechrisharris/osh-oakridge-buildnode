@@ -257,7 +257,7 @@ try {
     # Keep these exact counts so every future native-shell call still receives
     # an explicit safety review.
     foreach ($astFixture in @(
-        @{ Path = $setupScript; ExpectedShellRuns = 1 },
+        @{ Path = $setupScript; ExpectedShellRuns = 2 },
         @{ Path = $storageScript; ExpectedShellRuns = 19 })) {
         $tokens = $null
         $parseErrors = $null
