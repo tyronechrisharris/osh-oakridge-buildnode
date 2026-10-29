@@ -1,5 +1,11 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.11.0 2026-10-29
+## Changes
+- Add operational views based on configured keywords per lane
+- Modify daily file UI to show latest 15 messages on live view
+- Add individual detector charting to historical events
+
 ## 3.10.0 2026-10-25
 ## Changes
 - Add custom disposition codes configurable in admin page
