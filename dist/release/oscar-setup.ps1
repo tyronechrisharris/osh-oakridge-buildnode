@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('init', 'check', 'verify', 'start', 'stop', 'restart', 'status', 'logs', 'upgrade', 'backup', 'backup-verify', 'backup-prune', 'restore', 'archive', 'help')]
+    [ValidateSet('init', 'check', 'host-check', 'prepare-host', 'verify', 'start', 'stop', 'restart', 'status', 'logs', 'upgrade', 'backup', 'backup-verify', 'backup-prune', 'restore', 'archive', 'help')]
     [string]$Command = 'help',
     [string]$StorageAction,
     [string]$HoldAction,
@@ -46,7 +46,9 @@ param(
     [string]$CreatedBy,
     [string]$ReleasedBy,
     [ValidateRange(1, 10000)]
-    [int]$Keep = 0
+    [int]$Keep = 0,
+    [switch]$Json,
+    [switch]$Strict
 )
 
 Set-StrictMode -Version 2.0
@@ -1369,7 +1371,7 @@ OSCAR deployment administration
       [-AddHostsEntry] [-SkipHostsEntry] [-SkipStart]
       [-BackupMode disabled|single] [-BackupDir ABSOLUTE_PATH]
       [-Prerequisites auto|existing|bundled]
-  .\oscar.bat check|verify|start|stop|restart|status
+  .\oscar.bat check|host-check|prepare-host|verify|start|stop|restart|status
   .\oscar.bat upgrade [-AdoptLegacyVolumes] [-AdoptLegacyStorageRoots]
       [-BackupMode disabled|single] [-BackupDir ABSOLUTE_PATH]
   .\oscar.bat logs [-Service all|oscar|postgres|gateway] [-Tail 200] [-Follow]
@@ -1403,6 +1405,25 @@ try {
             Write-Host "Bundle verification: $(Get-OfflineBundleVerificationStatus)"
             Write-Host "Configured: $(try { Assert-Configured; $true } catch { $false })"
             # TODO(offline-maps): add MBTiles validation/import after deployment requirements are defined.
+        }
+        'host-check' {
+            Assert-DeploymentPathsSafe
+            $hostPrepScript = Join-Path $ScriptRoot 'configure-windows-host.ps1'
+            if (-not (Test-Path -LiteralPath $hostPrepScript -PathType Leaf)) { throw 'The Windows host readiness script is missing.' }
+            $hostPrepArgs = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $hostPrepScript, '-Mode', 'check')
+            if ($Json) { $hostPrepArgs += '-Json' }
+            if ($Strict) { $hostPrepArgs += '-Strict' }
+            Invoke-External 'powershell.exe' $hostPrepArgs
+        }
+        'prepare-host' {
+            Assert-Administrator
+            Assert-DeploymentPathsSafe
+            $hostPrepScript = Join-Path $ScriptRoot 'configure-windows-host.ps1'
+            if (-not (Test-Path -LiteralPath $hostPrepScript -PathType Leaf)) { throw 'The Windows host readiness script is missing.' }
+            $hostPrepArgs = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $hostPrepScript, '-Mode', 'apply')
+            if ($Json) { $hostPrepArgs += '-Json' }
+            if ($Strict) { $hostPrepArgs += '-Strict' }
+            Invoke-External 'powershell.exe' $hostPrepArgs
         }
         'verify' {
             Assert-Administrator

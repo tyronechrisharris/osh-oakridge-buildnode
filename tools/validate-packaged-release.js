@@ -81,7 +81,7 @@ for (const [relative, expected] of Object.entries(backupDisabledMessages)) {
 }
 
 const expected = [
-    'oscar-storage.sh', 'oscar-storage.ps1', 'validate-storage-archive.sh',
+    'oscar-storage.sh', 'oscar-storage.ps1', 'configure-windows-host.ps1', 'validate-storage-archive.sh',
     'postgis/archive-wal.sh', 'postgis/merge-wal-restore.sh', 'postgis/prepare-restore.sh',
     'docker/oscar/Dockerfile', 'docker/oscar/entrypoint.sh',
     'docker/oscar/archive-object-helper.sh',

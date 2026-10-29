@@ -373,6 +373,17 @@ After verification, copy the complete backup directory to at least one encrypted
 outside the OSCAR host and verify the checksums again at the destination. Restrict the copy because
 it contains operational records and encrypted—not anonymized—credentials.
 
+On Windows 11, format any external USB SSD or removable recovery carrier as `NTFS` (ideally
+protected with BitLocker) rather than `FAT32` or `exFAT`, and run `.\oscar.bat prepare-host`
+(`configure-windows-host.ps1 -Mode apply`) first so USB selective suspend and USB 3 Link Power
+Management cannot drop the enclosure during multi-gigabyte snapshot copies. `FAT32` rejects archives
+larger than 4 GiB, and `exFAT` cannot store the Windows DACLs (`SYSTEM`, `Administrators`, and
+`docker-users`) required on active `-BackupDir` roots. Because `.oscar-storage-root` binds an active
+`-BackupDir` to one `OSCAR_DEPLOYMENT_ID` and local machine SIDs, use the external USB drive as an
+off-host carrier (`<backup-id>\` plus `CURRENT`, with `secrets\backup-key.txt` escrowed separately)
+and copy the snapshot into the replacement host's initialized local NTFS `-BackupDir` before running
+`.\oscar.bat backup-verify` and `.\oscar.bat restore`.
+
 ## Restore a coordinated backup
 
 Restore is destructive to the current PostgreSQL cluster, OSCAR state, cold archive, and active

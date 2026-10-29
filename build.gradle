@@ -189,6 +189,7 @@ distributions{
                 include 'DEPLOYMENT.md'
                 include 'QUICKSTART.md'
                 include 'compose.yaml'
+                include 'configure-windows-host.ps1'
                 include 'docker/gateway/default.conf'
                 include 'docker/oscar/archive-object-helper.sh'
                 include 'docker/oscar/atomic-publish.c'

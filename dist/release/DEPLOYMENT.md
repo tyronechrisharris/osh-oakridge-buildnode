@@ -14,6 +14,36 @@ release's tested bind-root ownership and recovery-media isolation contract. Use 
 for initialization and operation; a Mac may still be used for source inspection or non-deployment
 development.
 
+### Windows 11 unattended server preparation
+
+Windows 11 desktops and mobile workstations ship with `Balanced` power defaults that can suspend
+idle sessions, close-lid laptops, USB 3 buses, USB Gigabit Ethernet adapters, and external USB SSDs.
+Before running a 24/7 OSCAR deployment on Windows 11, run `configure-windows-host.ps1` (directly or
+through `oscar.bat`) from an Administrator Windows PowerShell 5.1 window:
+
+```powershell
+.\oscar.bat host-check
+.\oscar.bat prepare-host
+```
+
+Standalone invocation supports JSON output, strict non-zero audit exit codes, and idempotent
+OpenSSH `administrators_authorized_keys` public-key enrollment with `SYSTEM` + `Administrators`
+ACLs (inheritance disabled):
+
+```powershell
+.\configure-windows-host.ps1 -Mode apply -AuthorizeSshPublicKeyFile C:\staging\operator.pub
+.\configure-windows-host.ps1 -Mode check -Strict -Json
+```
+
+`-Mode apply` sets AC and DC sleep, unattended-sleep, hibernate, and disk spin-down timeouts to `0`
+(Never), disables hibernation and Fast Startup unless `-KeepHibernate` is requested, sets laptop
+lid-close action to `Do nothing`, disables USB selective suspend and USB 3 Link Power Management,
+turns off PCIe Link State Power Management (ASPM), clears WMI `MSPower_DeviceEnable` power-off flags
+across USB controllers/storage/network devices, disables physical network-adapter power saving with
+`-NoRestart` so active SSH sessions stay connected, configures `sshd` and `w32time` for `Automatic`
+startup, sets `NoAutoRebootWithLoggedOnUsers=1` for Windows Update, and enables Docker Desktop
+auto-start when Docker Desktop user settings exist.
+
 ## Administrative CLI
 
 Use `oscar.bat` on Windows and `oscar.sh` on Ubuntu. The Windows launcher invokes Windows
@@ -27,6 +57,8 @@ The menu accepts the same command and options shown below. For example, enter `i
 | --- | --- | --- |
 | Initialize | `oscar.bat init` | `sudo bash oscar.sh init` |
 | Check prerequisites | `oscar.bat check` | `sudo bash oscar.sh check` |
+| Audit Windows 11 server power/USB readiness | `oscar.bat host-check` | Not applicable |
+| Apply Windows 11 unattended server settings | `oscar.bat prepare-host` | Not applicable |
 | Verify offline media | `oscar.bat verify` | Site-prepared bundles only: `sudo bash oscar.sh verify` |
 | Start | `oscar.bat start` | `sudo bash oscar.sh start` |
 | Stop | `oscar.bat stop` | `sudo bash oscar.sh stop` |

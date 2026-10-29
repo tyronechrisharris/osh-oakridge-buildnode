@@ -158,7 +158,10 @@ Each active storage root must be a dedicated directory at least two path compone
 filesystem/volume root. The archive and backup roots must not equal, contain, or overlap one
 another; neither may be inside or broad enough to contain the versioned release directory, and neither
 may contain the administrator's home/profile directory. Existing path components must not be
-symbolic links, junctions, or reparse points. Both
+symbolic links, junctions, or reparse points. On Windows 11, active storage roots must reside on
+`NTFS` volumes so `oscar-storage.ps1` can enforce `SYSTEM`, `Administrators`, and `docker-users`
+DACLs (`exFAT` and `FAT32` are rejected for managed roots; format external USB off-host carriers as
+`NTFS` and run `.\oscar.bat prepare-host` so USB selective suspend is disabled). Both
 launchers enforce these rules before privileged storage work and again after initialization creates
 the directories. This protects purge and restore operations from a typo such as `/`, `C:\`, a parent
 mount, or a redirected path.

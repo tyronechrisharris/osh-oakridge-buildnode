@@ -9,19 +9,26 @@ operations fail closed there.
 
 1. Choose `offline-full` when Docker Desktop or WSL may need installation. Choose `offline-images` when compatible Docker Desktop, WSL 2, and Docker Compose are already installed and running.
 2. Extract the OSCAR ZIP to a local NTFS directory.
-3. Double-click `oscar.bat`, approve the Windows administrator prompt, and enter `init` at the `oscar>` prompt. The launcher uses Windows PowerShell 5.1 (`powershell.exe`).
-4. Alternatively, for scripted or terminal-based setup, run:
+3. On an unattended 24/7 Windows 11 host (including mobile/laptop workstations with USB Gigabit Ethernet or external USB storage), disable sleep, hibernate, USB selective suspend, lid-close sleep, and PnP device power-off from an Administrator Windows PowerShell 5.1 window before starting continuous lane ingestion:
+
+```powershell
+.\oscar.bat prepare-host
+.\oscar.bat host-check
+```
+
+4. Double-click `oscar.bat`, approve the Windows administrator prompt, and enter `init` at the `oscar>` prompt. The launcher uses Windows PowerShell 5.1 (`powershell.exe`).
+5. Alternatively, for scripted or terminal-based setup, run:
 
 ```powershell
 .\oscar.bat init
 ```
 
-5. Enter the deployment hostname, local IANA timezone (for example, `America/Chicago`), and an OSCAR administrator password of at least 14 characters.
+6. Enter the deployment hostname, local IANA timezone (for example, `America/Chicago`), and an OSCAR administrator password of at least 14 characters.
    New self-signed installations automatically include the host's active, non-container LAN IPv4
    and Tailscale IPv4/IPv6 addresses in the certificate. If clients will use a stable site-DNS or Tailscale
    MagicDNS name other than the primary hostname, add it with `--tls-san` on Ubuntu or `-TlsSan`
    on Windows during initialization.
-6. Open the URL printed by setup, normally `https://oscar.local/sensorhub/admin`.
+7. Open the URL printed by setup, normally `https://oscar.local/sensorhub/admin`.
 
 Setup creates deployment-specific database credentials, defaults `OSCAR_BACKUP_MODE` to `disabled`,
 and persists the absolute archive path (and the backup path only when `single` mode is selected) under the sibling `oscar-storage` directory. The legacy-WAL

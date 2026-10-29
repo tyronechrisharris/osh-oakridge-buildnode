@@ -11,12 +11,13 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $PSVersionTa
 $repoRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..'))
 $storageScript = Join-Path $repoRoot 'dist\release\oscar-storage.ps1'
 $setupScript = Join-Path $repoRoot 'dist\release\oscar-setup.ps1'
+$hostPrepScript = Join-Path $repoRoot 'dist\release\configure-windows-host.ps1'
 $verifyScript = Join-Path $repoRoot 'dist\release\verify-bundle.ps1'
 $offlineBuilderScript = Join-Path $repoRoot 'tools\offline\build-offline-bundle.ps1'
 $composeFile = Join-Path $repoRoot 'dist\release\compose.yaml'
 $oscarDockerfile = Join-Path $repoRoot 'dist\release\docker\oscar\Dockerfile'
 $oscarEntrypoint = Join-Path $repoRoot 'dist\release\docker\oscar\entrypoint.sh'
-$releasePowerShellScripts = @($storageScript, $setupScript, $verifyScript, $offlineBuilderScript)
+$releasePowerShellScripts = @($storageScript, $setupScript, $hostPrepScript, $verifyScript, $offlineBuilderScript)
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('oscar-storage-ps5-' + [Guid]::NewGuid().ToString('N'))
 $createdDockerGroup = $false
 
@@ -258,6 +259,7 @@ try {
     # an explicit safety review.
     foreach ($astFixture in @(
         @{ Path = $setupScript; ExpectedShellRuns = 2 },
+        @{ Path = $hostPrepScript; ExpectedShellRuns = 0 },
         @{ Path = $storageScript; ExpectedShellRuns = 19 })) {
         $tokens = $null
         $parseErrors = $null
@@ -1311,6 +1313,27 @@ SELECT 'single quote '' and $dollar';
         $actual = Test-ObservationHoldFixture @holdValues
         Assert-True ($actual -eq $fixture.Expected) "Observation-hold sparse/interleaved fixture failed: $($fixture.Name)"
     }
+
+    . $hostPrepScript -Mode help | Out-Null
+    $parsedPowerCfg = Parse-PowerCfgSettingIndices @(
+        'Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)',
+        '    Current AC Power Setting Index: 0x00000000',
+        '    Current DC Power Setting Index: 0x0000003c'
+    )
+    Assert-True ($null -ne $parsedPowerCfg -and $parsedPowerCfg.AcValue -eq 0 -and $parsedPowerCfg.DcValue -eq 60) `
+        'Windows host readiness powercfg parser did not decode hex AC/DC indices.'
+    Assert-True (Test-ValidSshPublicKeyLine 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAFb7a4HsF13SLXjLbIgHKKUU6GMub+FyULTeA+QWuKY runner') `
+        'Windows host readiness rejected a valid ssh-ed25519 public key.'
+    Assert-True (-not (Test-ValidSshPublicKeyLine 'command="evil" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAFb7a4HsF13SLXjLbIgHKKUU6GMub+FyULTeA+QWuKY')) `
+        'Windows host readiness accepted an authorized_keys options prefix.'
+    $testAuthKeysPath = Join-Path $temporaryRoot 'ssh\administrators_authorized_keys'
+    $sampleKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAFb7a4HsF13SLXjLbIgHKKUU6GMub+FyULTeA+QWuKY runner'
+    Set-ProtectedAdministratorsAuthorizedKeys $testAuthKeysPath @($sampleKey, $sampleKey)
+    $aclStatus = Test-ProtectedAdministratorsAuthorizedKeysAcl $testAuthKeysPath
+    Assert-True ($aclStatus.Present -and $aclStatus.Compliant) `
+        "Windows host readiness did not apply strict SYSTEM+Administrators ACLs: $($aclStatus.Detail)"
+    Assert-True (@([IO.File]::ReadAllLines($testAuthKeysPath)).Count -eq 1) `
+        'Windows host readiness did not deduplicate administrators_authorized_keys entries.'
 
     Write-Host 'OSCAR Windows PowerShell 5.1 storage safety tests passed.' -ForegroundColor Green
 } finally {

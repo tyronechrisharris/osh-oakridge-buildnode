@@ -49,6 +49,8 @@ echo   status
 echo   logs -Service oscar -Tail 200
 echo   logs -Service postgres -Follow
 echo   check
+echo   host-check
+echo   prepare-host
 echo   verify
 echo   upgrade
 echo   backup
