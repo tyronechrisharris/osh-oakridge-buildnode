@@ -1,7 +1,7 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
 
-## 3.11.0 2026-10-27
+## 3.11.0 2026-10-29
 ### Storage-profile changes and rollout
 - Introduce the `OscarTieredObsSystemDatabase` storage profile with sequential observation IDs, batched writes, compact short-lived stage ownership, and a versioned PostgreSQL archive catalog
 - Initialize new PostgreSQL clusters with data checksums, WAL compression, I/O timing, and `pg_stat_statements`, while explicitly keeping `archive_mode=off` and omitting any external WAL bind; an existing cluster is not recreated by `upgrade`
@@ -118,6 +118,9 @@ All notable changes to this project will be documented in this file.
 - Add `(datastreamid, phenomenontime, id)` composite indexes and window-pruned partition routing on attached `PARQUET_PRIMARY` stage partitions to eliminate multi-partition sequential scans during live and historical chart queries
 - Migrate legacy `dailyFile` datastream schemas (`rapiscanMessage`/`aspectMessage` to `rpmMessage`) in-place during store initialization, preserve backward-compatible JSON key deserialization, and harden PostGIS datastream/command-stream schema-evolution and member-system queries
 - Refresh Event Details adjudication history deterministically after submission and deduplicate historical vs. live MQTT adjudication entries by observation ID and timestamp
+- Add operational views based on configured keywords per lane
+- Modify daily file UI to show latest 15 messages on live view
+- Add individual detector charting to historical events
 
 ## 3.10.0 2026-10-25
 ## Changes
