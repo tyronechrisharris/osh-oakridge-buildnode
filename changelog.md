@@ -1,5 +1,12 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.11.0 2026-10-29
+## Changes
+- Add operational views based on configured keywords per lane
+- Modify daily file UI to show latest 15 messages on live view
+- Add individual detector charting to historical events
+- Fix Rapiscan neutron chart not showing first point in occupancy
+
 ## 3.9.1 2026-09-24
 ## Changes
 - Add a localized Status of Health page showing every visible lane, RPM and camera connectivity, gamma high/low, neutron high, tamper, and configurable extended-occupancy faults
