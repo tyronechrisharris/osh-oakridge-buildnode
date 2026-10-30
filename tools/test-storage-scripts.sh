@@ -1829,6 +1829,22 @@ printf 'state\n' >"$test_root/tar-state-good/data/state.bin"
 printf 'recovery media\n' >"$test_root/tar-state-reserved/backups/point.bin"
 tar -czf "$test_root/oscar-state-good.tar.gz" -C "$test_root/tar-state-good" .
 sh "$archive_validator" oscar-state "$test_root/oscar-state-good.tar.gz"
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$test_root/oscar-state-scale.tar.gz" <<'PY'
+import io
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w:gz", compresslevel=1) as archive:
+    for idx in range(5000):
+        member = tarfile.TarInfo(
+            f"files/videos/retained-media/v1/events/ev{idx:06d}/lanes/dXJuOm9zaDpzeXN0ZW06bGFuZTpsYW5lLTMx/cameras/dXJuOm9zaDpzZW5zb3I6ZmZtcGVnOmxhbmU6bGFuZS0zMTow/frame-01.jpg"
+        )
+        member.size = 0
+        archive.addfile(member, io.BytesIO(b""))
+PY
+    sh "$archive_validator" oscar-state "$test_root/oscar-state-scale.tar.gz"
+fi
 tar -czf "$test_root/oscar-state-reserved.tar.gz" -C "$test_root/tar-state-reserved" .
 if sh "$archive_validator" oscar-state "$test_root/oscar-state-reserved.tar.gz" >/dev/null 2>&1; then
     printf 'OSCAR-state validator accepted a reserved backups path.\n' >&2
