@@ -333,10 +333,41 @@ function Invoke-DisableDevicePowerSaving([bool]$ApplyChanges) {
     }
 }
 
+$DockerAutoStartTaskName = 'OSCAR-DockerDesktop-AutoStart'
+
+function Ensure-DockerDesktopAutoStartTask([bool]$ApplyChanges) {
+    $dockerExe = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+    $installed = Test-Path -LiteralPath $dockerExe -PathType Leaf
+    if (-not $installed) {
+        return [pscustomobject]@{ Installed = $false; Registered = $false; Detail = 'Docker Desktop executable not present' }
+    }
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{ Installed = $true; Registered = $false; Detail = 'ScheduledTasks module unavailable' }
+    }
+    $existing = Get-ScheduledTask -TaskName $DockerAutoStartTaskName -ErrorAction SilentlyContinue
+    if ($ApplyChanges -and (Test-HostAdministrator)) {
+        $currentUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $action = New-ScheduledTaskAction -Execute $dockerExe -Argument '-Autostart'
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUserName
+        $principal = New-ScheduledTaskPrincipal -UserId $currentUserName -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName $DockerAutoStartTaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+        $existing = Get-ScheduledTask -TaskName $DockerAutoStartTaskName -ErrorAction SilentlyContinue
+    }
+    $registered = ($null -ne $existing -and [string]$existing.State -ne 'Disabled')
+    return [pscustomobject]@{
+        Installed = $true
+        Registered = $registered
+        Detail = $(if ($registered) { "ARSO logon task=$DockerAutoStartTaskName" } else { 'ARSO logon task missing' })
+    }
+}
+
 function Ensure-DockerDesktopAutoStart([bool]$ApplyChanges) {
     $appData = $env:APPDATA
     if ([string]::IsNullOrWhiteSpace($appData)) {
-        return [pscustomobject]@{ Present = $false; AutoStart = $false; Detail = 'APPDATA unavailable' }
+        return [pscustomobject]@{ Present = $false; AutoStart = $false; ResourceSaverOff = $false; Detail = 'APPDATA unavailable' }
     }
     $candidates = @(
         (Join-Path $appData 'Docker\settings-store.json'),
@@ -355,34 +386,53 @@ function Ensure-DockerDesktopAutoStart([bool]$ApplyChanges) {
             } else {
                 'AutoStart'
             }
+            $saverName = if ($null -ne $jsonObj.PSObject.Properties['UseResourceSaver']) {
+                'UseResourceSaver'
+            } elseif ($null -ne $jsonObj.PSObject.Properties['useResourceSaver']) {
+                'useResourceSaver'
+            } else {
+                'UseResourceSaver'
+            }
             $currentValue = $false
             if ($null -ne $jsonObj.PSObject.Properties[$propName]) {
                 $currentValue = [bool]$jsonObj.$propName
             }
-            if ($ApplyChanges -and -not $currentValue) {
+            $saverDisabled = $false
+            if ($null -ne $jsonObj.PSObject.Properties[$saverName]) {
+                $saverDisabled = (-not [bool]$jsonObj.$saverName)
+            }
+            if ($ApplyChanges -and (-not $currentValue -or -not $saverDisabled)) {
                 if ($null -ne $jsonObj.PSObject.Properties[$propName]) {
                     $jsonObj.$propName = $true
                 } else {
                     $jsonObj | Add-Member -NotePropertyName $propName -NotePropertyValue $true
                 }
+                if ($null -ne $jsonObj.PSObject.Properties[$saverName]) {
+                    $jsonObj.$saverName = $false
+                } else {
+                    $jsonObj | Add-Member -NotePropertyName $saverName -NotePropertyValue $false
+                }
                 $serialized = $jsonObj | ConvertTo-Json -Depth 10
                 [IO.File]::WriteAllText($settingsPath, "$serialized`n", $Utf8NoBom)
                 $currentValue = $true
+                $saverDisabled = $true
             }
             return [pscustomobject]@{
                 Present = $true
                 AutoStart = $currentValue
-                Detail = "$(Split-Path -Leaf $settingsPath): $propName=$currentValue"
+                ResourceSaverOff = $saverDisabled
+                Detail = "$(Split-Path -Leaf $settingsPath): $propName=$currentValue, $saverName=$(-not $saverDisabled)"
             }
         } catch {
             return [pscustomobject]@{
                 Present = $true
                 AutoStart = $false
+                ResourceSaverOff = $false
                 Detail = "could not parse $(Split-Path -Leaf $settingsPath): $($_.Exception.Message)"
             }
         }
     }
-    return [pscustomobject]@{ Present = $false; AutoStart = $false; Detail = 'Docker Desktop user settings not yet initialized' }
+    return [pscustomobject]@{ Present = $false; AutoStart = $false; ResourceSaverOff = $false; Detail = 'Docker Desktop user settings not yet initialized' }
 }
 
 function Get-HostNetworkSummary {
@@ -471,6 +521,8 @@ function Invoke-WindowsHostApply([string[]]$ResolvedSshKeys) {
         New-Item -Path $wuAuKey -Force | Out-Null
     }
     Set-ItemProperty -LiteralPath $wuAuKey -Name 'NoAutoRebootWithLoggedOnUsers' -Value 1 -Type DWord
+    Set-ItemProperty -LiteralPath $wuAuKey -Name 'AlwaysAutoRebootAtScheduledTime' -Value 0 -Type DWord
+    Set-ItemProperty -LiteralPath $wuAuKey -Name 'AUOptions' -Value 3 -Type DWord
 
     $fsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
     if (Test-Path -LiteralPath $fsKey) {
@@ -513,6 +565,38 @@ function Invoke-WindowsHostApply([string[]]$ResolvedSshKeys) {
         }
     }
     [void](Ensure-DockerDesktopAutoStart $true)
+    $taskState = Ensure-DockerDesktopAutoStartTask $true
+    if ($taskState.Registered -and (Get-Command docker -ErrorAction SilentlyContinue) -and
+        (Get-Command Start-ScheduledTask -ErrorAction SilentlyContinue)) {
+        $engineUp = $false
+        $prevPref = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            & docker info *> $null
+            $engineUp = ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $prevPref
+        }
+        if (-not $engineUp) {
+            try {
+                Start-ScheduledTask -TaskName $DockerAutoStartTaskName -ErrorAction Stop
+                $deadline = [DateTime]::UtcNow.AddSeconds(90)
+                while ([DateTime]::UtcNow -lt $deadline) {
+                    Start-Sleep -Seconds 3
+                    $prevLoopPref = $ErrorActionPreference
+                    try {
+                        $ErrorActionPreference = 'SilentlyContinue'
+                        & docker info *> $null
+                        if ($LASTEXITCODE -eq 0) { break }
+                    } finally {
+                        $ErrorActionPreference = $prevLoopPref
+                    }
+                }
+            } catch {
+                # If no interactive user session is currently signed in on the console, Task Scheduler leaves startup for next logon.
+            }
+        }
+    }
 }
 
 function Get-WindowsHostReadinessReport {
@@ -640,11 +724,12 @@ function Get-WindowsHostReadinessReport {
 
     $wuAuKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
     $wuProps = if (Test-Path -LiteralPath $wuAuKey) { Get-ItemProperty -LiteralPath $wuAuKey -ErrorAction SilentlyContinue } else { $null }
-    if ($null -ne $wuProps -and $null -ne $wuProps.PSObject.Properties['NoAutoRebootWithLoggedOnUsers'] -and
-        [int]$wuProps.NoAutoRebootWithLoggedOnUsers -eq 1) {
-        & $addCheck 'windows-update-reboot-guard' 'PASS' 'NoAutoRebootWithLoggedOnUsers=1 configured'
+    if ($null -ne $wuProps -and
+        $null -ne $wuProps.PSObject.Properties['NoAutoRebootWithLoggedOnUsers'] -and [int]$wuProps.NoAutoRebootWithLoggedOnUsers -eq 1 -and
+        $null -ne $wuProps.PSObject.Properties['AlwaysAutoRebootAtScheduledTime'] -and [int]$wuProps.AlwaysAutoRebootAtScheduledTime -eq 0) {
+        & $addCheck 'windows-update-reboot-guard' 'PASS' 'NoAutoRebootWithLoggedOnUsers=1, AlwaysAutoRebootAtScheduledTime=0 configured'
     } else {
-        & $addCheck 'windows-update-reboot-guard' 'WARN' 'NoAutoRebootWithLoggedOnUsers policy not yet set to 1'
+        & $addCheck 'windows-update-reboot-guard' 'WARN' 'Windows Update auto-reboot suppression policy not fully applied (run -Mode apply)'
     }
 
     $fsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
@@ -706,11 +791,18 @@ function Get-WindowsHostReadinessReport {
     }
 
     $dockerAutoStart = Ensure-DockerDesktopAutoStart $false
-    if ($dockerEngineOk) {
-        $autoDetail = if ($dockerAutoStart.Present) { $dockerAutoStart.Detail } else { 'daemon reachable' }
-        & $addCheck 'docker-runtime' 'PASS' "Docker Engine reachable ($autoDetail)"
+    $dockerTask = Ensure-DockerDesktopAutoStartTask $false
+    $autoSummary = if ($dockerAutoStart.Present) {
+        "$($dockerAutoStart.Detail); $($dockerTask.Detail)"
     } else {
-        & $addCheck 'docker-runtime' 'WARN' "Docker Engine not currently reachable ($($dockerAutoStart.Detail))"
+        $dockerTask.Detail
+    }
+    if ($dockerEngineOk -and (-not $dockerTask.Installed -or $dockerTask.Registered) -and (-not $dockerAutoStart.Present -or $dockerAutoStart.ResourceSaverOff)) {
+        & $addCheck 'docker-runtime' 'PASS' "Docker Engine reachable ($autoSummary)"
+    } elseif ($dockerEngineOk) {
+        & $addCheck 'docker-runtime' 'WARN' "Docker Engine reachable, but ARSO logon task or UseResourceSaver=False not yet applied ($autoSummary)"
+    } else {
+        & $addCheck 'docker-runtime' 'WARN' "Docker Engine not currently reachable ($autoSummary)"
     }
 
     $failCount = @($checks | Where-Object { $_.Status -eq 'FAIL' }).Count

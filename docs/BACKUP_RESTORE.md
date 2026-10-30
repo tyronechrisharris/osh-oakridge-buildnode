@@ -288,7 +288,12 @@ archive and a new private snapshot directory; it cannot see the backup root. On 
 capability-free extractor is followed by an administrator-side ownership handoff. On Windows, the
 extractor receives only the `CHOWN` capability needed for the same handoff. The Java confirmation
 then runs as OSCAR UID/GID `10001:10001` with the snapshot mounted read-only. The snapshot is always
-removed and previously running application services are resumed on success or failure.
+removed and previously running application services are resumed on success or failure. On Windows
+Docker Desktop (WSL 2), extracting and cleaning up a multi-hundred-thousand-file `oscar-state.tar.gz`
+snapshot across the Windows NTFS bind mount (`9P` bridge) is small-file metadata bound rather than
+throughput bound—expect ~2–3 hours total backup wall time for ~300,000 retained-media/journal entries
+(~18–20 GiB total snapshot size), whereas `restore` extracts `oscar-state.tar.gz` directly into the
+Linux `oscar_oscar_state` named volume inside WSL 2 and completes much faster.
 
 ## Verify or re-verify a backup
 
@@ -518,8 +523,8 @@ restore, review container image provenance, endpoint identity, and TLS acceptanc
   restored, while the target `OSCAR_HOSTNAME`, `OSCAR_HTTPS_PORT`, and `OSCAR_TLS_SANS` bindings in
   `.env` remain authoritative. If the replacement host uses a new IP address or DNS name that is not
   present in the restored self-signed certificate's Subject Alternative Names, regenerate or install
-  a certificate covering the replacement host's SANs after verifying data recovery and restart the
-  `gateway` container.
+  a certificate covering the replacement host's SANs after verifying data recovery and recreate the
+  `gateway` container (`docker compose --project-name oscar --env-file .env --file compose.yaml up --detach --no-deps --no-build --pull never --force-recreate gateway`) so its bind-mounted TLS secret files refresh.
 
 The `pre-restore-*` directory is a safety copy of credentials, not a data rollback. It contains
 sensitive plaintext files; protect it and remove it under the site's credential-retention policy
@@ -531,7 +536,29 @@ under a `umask 077`. On Windows, inheritance is removed; the invoking administra
 the local Administrators group retain control, while the local `docker-users` group receives
 inherited read/execute access so confined one-shot Docker helpers can read backup payloads. Treat
 `docker-users` as Docker-engine-equivalent privileged membership, not as an ordinary backup reader.
-Preserve equivalent controls on copied backup media.
+Preserve equivalent controls on copied backup media. When importing an off-host snapshot
+(`<backup-id>\` plus `CURRENT`) and the separately escrowed `secrets\backup-key.txt` onto a
+replacement Windows host, file-copy tools such as `Copy-Item`, `robocopy /COPY:DAT`, or `scp` leave
+inherited DACLs (`AreAccessRulesProtected = $false`), which `oscar-storage.ps1` rejects fail-closed.
+Re-apply explicit protected administrator + local `docker-users` read/execute ACLs from an elevated
+PowerShell prompt before running `.\oscar.bat backup-verify` and `.\oscar.bat restore`:
+
+```powershell
+$BackupDir = 'D:\oscar-storage\backups'
+$BackupId  = '20261017T153000Z-1a2b3c4d'
+$KeyFile   = '.\secrets\backup-key.txt'
+$AdminUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+icacls "$BackupDir\$BackupId" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "${AdminUser}:(OI)(CI)F" "docker-users:(OI)(CI)RX"
+foreach ($ProtectedFile in @(
+    "$BackupDir\CURRENT",
+    "$BackupDir\$BackupId\VERIFIED",
+    "$BackupDir\$BackupId\JOURNAL_CONFIRMED",
+    $KeyFile
+)) {
+    icacls $ProtectedFile /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" "${AdminUser}:F" "docker-users:RX"
+}
+```
 
 ## Post-restore acceptance
 

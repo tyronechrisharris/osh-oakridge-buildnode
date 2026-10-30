@@ -41,9 +41,15 @@ lid-close action to `Do nothing`, disables USB selective suspend and USB 3 Link 
 turns off PCIe Link State Power Management (ASPM), clears WMI `MSPower_DeviceEnable` power-off flags
 across USB controllers/storage/network devices, disables physical network-adapter power saving with
 `-NoRestart` so active SSH sessions stay connected, configures `sshd` and `w32time` for `Automatic`
-startup, sets `NoAutoRebootWithLoggedOnUsers=1` for Windows Update, sets Win32 `LongPathsEnabled=1`
-for tools that inspect deep retained-media paths, and enables Docker Desktop auto-start when Docker
-Desktop user settings exist. On trusted site LANs where newly connected USB or PCIe Ethernet
+startup, sets `NoAutoRebootWithLoggedOnUsers=1`, `AlwaysAutoRebootAtScheduledTime=0`, and
+`AUOptions=3` for Windows Update, sets Win32 `LongPathsEnabled=1` for tools that inspect deep
+retained-media paths, disables Docker Desktop idle Resource Saver (`UseResourceSaver=false`), and
+registers an interactive `AtLogOn` Scheduled Task (`OSCAR-DockerDesktop-AutoStart`) alongside
+`AutoStart=true`. Because Windows 11 Automatic Restart Sign-On (ARSO) signs the operator back in
+behind a locked console after an unattended Windows Update or domain-GPO maintenance reboot while
+deferring `HKCU\...\Run` GUI startups until manual screen unlock, the `AtLogOn` Scheduled Task
+launches Docker Desktop immediately inside the locked interactive session so `restart: unless-stopped`
+OSCAR containers recover automatically without human console intervention. On trusted site LANs where newly connected USB or PCIe Ethernet
 adapters default to Windows' `Public` firewall profile (which blocks inbound Docker Desktop port
 publishing on `443`), pass `-ConfigureLanHttpsFirewall` (or `.\oscar.bat prepare-host -ConfigureLanHttpsFirewall`)
 to switch connected wired `802.3` Ethernet adapters to `Private` and configure a scoped

@@ -1355,6 +1355,19 @@ SELECT 'single quote '' and $dollar';
         "Windows host readiness did not apply strict SYSTEM+Administrators ACLs: $($aclStatus.Detail)"
     Assert-True (@([IO.File]::ReadAllLines($testAuthKeysPath)).Count -eq 1) `
         'Windows host readiness did not deduplicate administrators_authorized_keys entries.'
+    $savedAppData = $env:APPDATA
+    try {
+        $fakeAppData = Join-Path $temporaryRoot 'appdata'
+        $fakeDockerDir = Join-Path $fakeAppData 'Docker'
+        New-Item -ItemType Directory -Path $fakeDockerDir -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $fakeDockerDir 'settings-store.json'), '{"AutoStart":false,"UseResourceSaver":true}', [Text.UTF8Encoding]::new($false))
+        $env:APPDATA = $fakeAppData
+        $appliedSettings = Ensure-DockerDesktopAutoStart $true
+        Assert-True ($appliedSettings.Present -and $appliedSettings.AutoStart -and $appliedSettings.ResourceSaverOff) `
+            'Windows host readiness did not enforce AutoStart=true and UseResourceSaver=false in settings-store.json.'
+    } finally {
+        $env:APPDATA = $savedAppData
+    }
 
     Assert-True (-not $setupSource.Contains('--accept-license')) `
         'Windows setup must never auto-accept the Docker Desktop license.'
