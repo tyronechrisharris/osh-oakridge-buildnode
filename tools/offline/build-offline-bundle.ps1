@@ -4,6 +4,7 @@ param(
     [ValidateSet('Full', 'ImagesOnly', 'Both')]
     [string]$BundleProfile = 'Both',
     [switch]$SkipConnectedBuild,
+    [switch]$UseExistingExpandedRelease,
     [switch]$SkipDownloads,
     [switch]$SkipImageExport,
     [switch]$CreateArchive
@@ -107,9 +108,13 @@ try {
             Invoke-Checked 'bash' @((Join-Path $RepositoryRoot 'build-all.sh'))
         }
     }
-    Write-Host 'Preparing the expanded release for offline packaging...' -ForegroundColor Cyan
-    $gradleExecutable = if ($RunningOnWindows) { Join-Path $RepositoryRoot 'gradlew.bat' } else { Join-Path $RepositoryRoot 'gradlew' }
-    Invoke-Checked $gradleExecutable @('installRelDist')
+    if (-not $UseExistingExpandedRelease) {
+        Write-Host 'Preparing the expanded release for offline packaging...' -ForegroundColor Cyan
+        $gradleExecutable = if ($RunningOnWindows) { Join-Path $RepositoryRoot 'gradlew.bat' } else { Join-Path $RepositoryRoot 'gradlew' }
+        Invoke-Checked $gradleExecutable @('installRelDist')
+    } else {
+        Write-Host "Using existing expanded release at $expandedRelease..." -ForegroundColor Cyan
+    }
 } finally { $env:GRADLE_USER_HOME = $previousGradleHome }
 if (-not (Test-Path -LiteralPath (Join-Path $expandedRelease 'compose.yaml') -PathType Leaf)) {
     throw "Expanded release was not produced at $expandedRelease"
@@ -186,7 +191,14 @@ foreach ($profile in $profiles) {
                 Write-Host "Downloading $($component.name) $($component.version)..." -ForegroundColor Cyan
                 $partialPath = "$cachePath.partial"
                 if (Test-Path -LiteralPath $partialPath) { Remove-Item -LiteralPath $partialPath -Force }
-                Invoke-WebRequest -Uri $component.url -OutFile $partialPath -UseBasicParsing
+                $previousProgressPreference = $ProgressPreference
+                try {
+                    $ProgressPreference = 'SilentlyContinue'
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                    Invoke-WebRequest -Uri $component.url -OutFile $partialPath -UseBasicParsing
+                } finally {
+                    $ProgressPreference = $previousProgressPreference
+                }
                 Assert-Hash $partialPath $component.sha256
                 Move-Item -LiteralPath $partialPath -Destination $cachePath
             }
