@@ -320,6 +320,7 @@ jobs:
             documentation/retained-media-v1.md \
             oscar-storage.sh \
             oscar-storage.ps1 \
+            configure-windows-host.ps1 \
             validate-storage-archive.sh \
             docker/oscar/archive-object-helper.sh \
             docker/oscar/atomic-publish.c \
@@ -425,6 +426,7 @@ jobs:
               QUICKSTART.md
               SHA256SUMS
               compose.yaml
+              configure-windows-host.ps1
               offline-images.tar
               oscar-setup.ps1
               oscar-setup.sh
