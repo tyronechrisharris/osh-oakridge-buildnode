@@ -44,6 +44,12 @@ across USB controllers/storage/network devices, disables physical network-adapte
 startup, sets `NoAutoRebootWithLoggedOnUsers=1` for Windows Update, and enables Docker Desktop
 auto-start when Docker Desktop user settings exist.
 
+Because Docker Desktop on Windows runs inside an interactive administrator desktop session rather
+than as a pre-logon Session-0 service, sign in to the physical console after any host reboot so
+Docker Desktop starts automatically, then lock the workstation (`Win+L`). Once Docker Desktop is
+running in that signed-in desktop session, all routine `oscar.bat` administration, backups,
+restores, and monitoring work normally over SSH.
+
 ## Administrative CLI
 
 Use `oscar.bat` on Windows and `oscar.sh` on Ubuntu. The Windows launcher invokes Windows
@@ -207,7 +213,11 @@ selected. The images-only artifact must be initialized with a working existing r
 .\oscar.bat init -Prerequisites existing
 ```
 
-If an installer requires a restart, restart Windows and run `oscar.bat init` again.
+If an installer requires a restart, restart Windows and run `oscar.bat init` again. When `init` runs
+with `-NonInteractive` or from an OpenSSH Session-0 shell, OSCAR passes `--quiet` (never
+`--accept-license`) to the bundled Docker Desktop installer so it cannot block on an unseen
+Session-0 completion dialog, then stops cleanly whenever a Windows feature restart or interactive
+desktop Docker Desktop launch/license acceptance is required.
 
 The offline CLI does not contact package repositories or container registries. Docker Desktop
 licensing must be reviewed and accepted independently by the deploying organization; OSCAR does not

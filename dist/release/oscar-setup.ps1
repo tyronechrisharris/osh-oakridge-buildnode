@@ -219,6 +219,19 @@ function Test-WslReady {
     return (Invoke-ExternalProbe { wsl.exe --status })
 }
 
+function Test-SessionZeroProcess {
+    return ([Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0)
+}
+
+function Test-WindowsRebootPending {
+    foreach ($registryPath in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
+        if (Test-Path -LiteralPath $registryPath) { return $true }
+    }
+    return $false
+}
+
 function Get-BundledWslInstaller([string]$InstallerRoot) {
     $candidates = @(Get-ChildItem -LiteralPath $InstallerRoot -Filter 'wsl*.msi' -Force -ErrorAction SilentlyContinue)
     if ($candidates.Count -ne 1) {
@@ -258,14 +271,27 @@ function Install-BundledPrerequisites {
         }
         Write-Host 'Launching the official Docker Desktop installer. Setup will resume when it exits.'
         Write-Host 'The administrator must review and accept the Docker Desktop license in the official installer or application.'
-        $process = Start-Process -FilePath $dockerInstaller -ArgumentList @('install', '--backend=wsl-2', '--no-windows-containers') -Wait -PassThru
-        if ($process.ExitCode -ne 0) { throw "Docker Desktop installer exited with code $($process.ExitCode)." }
+        $dockerInstallArgs = @('install', '--backend=wsl-2', '--no-windows-containers')
+        if ($NonInteractive -or (Test-SessionZeroProcess)) {
+            $dockerInstallArgs += '--quiet'
+        }
+        $process = Start-Process -FilePath $dockerInstaller -ArgumentList $dockerInstallArgs -Wait -PassThru
+        if ($process.ExitCode -notin @(0, 3010)) { throw "Docker Desktop installer exited with code $($process.ExitCode)." }
         $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         $env:Path = "$machinePath;$userPath"
+        if ($process.ExitCode -eq 3010 -or (Test-WindowsRebootPending)) {
+            throw 'Docker Desktop prerequisite installation requires a Windows restart. Restart Windows, sign in to the interactive desktop session to start Docker Desktop (and accept its license on first launch), then run this command again.'
+        }
     }
 
     if (-not (Test-DockerReady)) {
+        if (Test-WindowsRebootPending) {
+            throw 'A pending Windows feature restart must complete before Docker Desktop can start. Restart Windows, sign in to the interactive desktop session to start Docker Desktop, then run setup again.'
+        }
+        if (Test-SessionZeroProcess) {
+            throw 'Docker Desktop is installed, but its engine is not running and cannot be started from a non-interactive SSH/service session (Session 0). Sign in to the Windows desktop session, start Docker Desktop (and accept its license on first launch), then run setup again.'
+        }
         $dockerDesktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
         if (Test-Path -LiteralPath $dockerDesktop) {
             Write-Host 'Starting Docker Desktop and waiting for its engine...'

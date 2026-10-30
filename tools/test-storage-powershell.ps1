@@ -1335,6 +1335,13 @@ SELECT 'single quote '' and $dollar';
     Assert-True (@([IO.File]::ReadAllLines($testAuthKeysPath)).Count -eq 1) `
         'Windows host readiness did not deduplicate administrators_authorized_keys entries.'
 
+    Assert-True (-not $setupSource.Contains('--accept-license')) `
+        'Windows setup must never auto-accept the Docker Desktop license.'
+    Assert-True ($setupSource.Contains("if (`$NonInteractive -or (Test-SessionZeroProcess))") -and
+        $setupSource.Contains("`$dockerInstallArgs += '--quiet'") -and
+        $setupSource.Contains('Test-WindowsRebootPending')) `
+        'Windows setup does not guard bundled Docker Desktop installation against Session 0 GUI hangs and pending feature restarts.'
+
     Write-Host 'OSCAR Windows PowerShell 5.1 storage safety tests passed.' -ForegroundColor Green
 } finally {
     Remove-Item Env:OSCAR_STORAGE_TEST_MODE -ErrorAction SilentlyContinue

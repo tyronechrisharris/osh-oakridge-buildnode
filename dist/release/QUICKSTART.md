@@ -56,9 +56,10 @@ before offline transfer. You can run `oscar.bat verify` explicitly at any time. 
 artifact, use `oscar.bat init -Prerequisites existing` to guarantee setup will not launch prerequisite
 installers.
 
-If a prerequisite installer requires a Windows restart, restart and run `oscar.bat init` again.
-Docker Desktop license review and acceptance are administrator actions; OSCAR never accepts that
-agreement on the organization's behalf.
+If a prerequisite installer requires a Windows restart, restart, sign in to the Windows desktop so
+Docker Desktop starts (and accept its license on first launch; you may then lock the screen with
+`Win+L`), and run `oscar.bat init` again. Docker Desktop license review and acceptance are
+administrator actions; OSCAR never accepts that agreement on the organization's behalf.
 
 ## Ubuntu Server 24.04
 
