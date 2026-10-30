@@ -15,7 +15,8 @@ hosts. macOS deployment and storage operations fail closed; it is not a supporte
 | Other PostgreSQL observations and transactional records | Remain hot | Existing application policy | Not by the cold-tier scheduler |
 | Raw RPM daily-file source | Append immediately; publish prior day after rollover | Valid immutable CSV, v1 manifest, `PUBLISHED` ledger, 30 days after the later of day close or actual publication, and exact sealed-journal replay parity; sites may additionally require verified backup confirmation | Yes for eligible private sealed segments; published daily files are not pressure-cleanup candidates |
 | Alarm source MP4 | Immediately eligible for an asynchronous attempt to publish exactly five JPEGs | Exactly five verified JPEGs and manifest, then 24-hour rollback grace and no hold | Yes, on a later successful retention pass |
-| Retained five-JPEG media set | Remains available | Complete set, no hold, rollback grace elapsed, minimum pressure age met, filesystem at pressure threshold | Yes, only under configured storage pressure |
+| Secondary retained JPEGs (`FIRST`, `QUARTER`, `THREE_QUARTERS`, `LAST`) | Pruned to the `MIDDLE` (`frame-03.jpg`) representative frame after `secondaryFrameRetentionDays` (30 by default) | Source MP4 already deleted (`SOURCE_DELETED`), no active manifest hold, and `frame-03.jpg` re-verified against its SHA-256 and byte count | Yes, on a later media-maintenance pass (`secondaryFrameRetentionDays > 0`) |
+| Retained JPEG media set | Remains available (`5` JPEGs before secondary pruning, `MIDDLE` JPEG afterward) | Complete published manifest, no hold, rollback grace elapsed, minimum pressure age met, filesystem at pressure threshold | Yes, only under configured storage pressure |
 | Uncatalogued legacy video | Legacy behavior only | Not eligible for new pressure cleanup | No |
 | Daily files, reports, adjudication, sitemap | Remain in application state | Site policy and explicit administration | No by storage-pressure cleanup |
 | Cold archive generation | Primary cold tier; `ACTIVE` during verified stage retirement, then `SEALED` after the complete stage child is gone | Explicit dry-run plan selecting only `SEALED` generations, review, unexpired one-time token, no hold, object hash recheck | No; an administrator must run `archive purge` |
@@ -350,6 +351,15 @@ externally supplied clip with fewer than five decoded frames, preserves the sour
 failed job. After successful publication the source is
 `PRESERVED_FOR_ROLLBACK` for `sourceRollbackGraceHours` (24 by default). A subsequent retention pass
 re-verifies the set and, if no hold applies, advances through `ELIGIBLE_FOR_DELETION` to `DELETED`.
+
+Once a media set reaches `SOURCE_DELETED` and exceeds `secondaryFrameRetentionDays` (30 by default;
+set `-1` to keep all five frames until storage-pressure cleanup), the maintenance worker re-verifies
+the `MIDDLE` (`frame-03.jpg`) asset against its manifest SHA-256 and byte count, unlinks the four
+secondary frames (`FIRST`, `QUARTER`, `THREE_QUARTERS`, and `LAST`), and updates their manifest
+entries to `DELETED` while keeping `MIDDLE` `PUBLISHED`. The Viewer renders only `PUBLISHED` frames
+without broken image requests. Any active manifest hold (`hold.active = true` with non-blank
+`hold.reason` and ISO-8601 `hold.placedAt`) defers source deletion, secondary-frame pruning, and
+storage-pressure deletion.
 
 The standard worker runs every five minutes and advances the primary cursor by at most six hours of
 event time per cycle. A separate delayed cursor revisits event time only after the 24-hour
