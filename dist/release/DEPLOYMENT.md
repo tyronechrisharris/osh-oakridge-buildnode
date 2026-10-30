@@ -31,7 +31,7 @@ OpenSSH `administrators_authorized_keys` public-key enrollment with `SYSTEM` + `
 ACLs (inheritance disabled):
 
 ```powershell
-.\configure-windows-host.ps1 -Mode apply -AuthorizeSshPublicKeyFile C:\staging\operator.pub
+.\configure-windows-host.ps1 -Mode apply -ConfigureLanHttpsFirewall -AuthorizeSshPublicKeyFile C:\staging\operator.pub
 .\configure-windows-host.ps1 -Mode check -Strict -Json
 ```
 
@@ -41,8 +41,13 @@ lid-close action to `Do nothing`, disables USB selective suspend and USB 3 Link 
 turns off PCIe Link State Power Management (ASPM), clears WMI `MSPower_DeviceEnable` power-off flags
 across USB controllers/storage/network devices, disables physical network-adapter power saving with
 `-NoRestart` so active SSH sessions stay connected, configures `sshd` and `w32time` for `Automatic`
-startup, sets `NoAutoRebootWithLoggedOnUsers=1` for Windows Update, and enables Docker Desktop
-auto-start when Docker Desktop user settings exist.
+startup, sets `NoAutoRebootWithLoggedOnUsers=1` for Windows Update, sets Win32 `LongPathsEnabled=1`
+for tools that inspect deep retained-media paths, and enables Docker Desktop auto-start when Docker
+Desktop user settings exist. On trusted site LANs where newly connected USB or PCIe Ethernet
+adapters default to Windows' `Public` firewall profile (which blocks inbound Docker Desktop port
+publishing on `443`), pass `-ConfigureLanHttpsFirewall` (or `.\oscar.bat prepare-host -ConfigureLanHttpsFirewall`)
+to switch connected wired `802.3` Ethernet adapters to `Private` and configure a scoped
+`OSCAR-HTTPS-Gateway-In` rule (`TCP 443,80`, `Private,Domain`, `LocalSubnet` and `100.64.0.0/10`).
 
 Because Docker Desktop on Windows runs inside an interactive administrator desktop session rather
 than as a pre-logon Session-0 service, sign in to the physical console after any host reboot so

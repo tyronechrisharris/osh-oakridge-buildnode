@@ -47,6 +47,7 @@ param(
     [string]$ReleasedBy,
     [ValidateRange(1, 10000)]
     [int]$Keep = 0,
+    [switch]$ConfigureLanHttpsFirewall,
     [switch]$Json,
     [switch]$Strict
 )
@@ -1447,6 +1448,7 @@ try {
             $hostPrepScript = Join-Path $ScriptRoot 'configure-windows-host.ps1'
             if (-not (Test-Path -LiteralPath $hostPrepScript -PathType Leaf)) { throw 'The Windows host readiness script is missing.' }
             $hostPrepArgs = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $hostPrepScript, '-Mode', 'apply')
+            if ($ConfigureLanHttpsFirewall) { $hostPrepArgs += '-ConfigureLanHttpsFirewall' }
             if ($Json) { $hostPrepArgs += '-Json' }
             if ($Strict) { $hostPrepArgs += '-Strict' }
             Invoke-External 'powershell.exe' $hostPrepArgs

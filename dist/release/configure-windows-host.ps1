@@ -4,6 +4,7 @@ param(
     [string]$Mode = 'check',
     [string[]]$AuthorizeSshPublicKey = @(),
     [string]$AuthorizeSshPublicKeyFile,
+    [switch]$ConfigureLanHttpsFirewall,
     [switch]$KeepHibernate,
     [ValidateRange(0, 1440)]
     [int]$MonitorTimeoutMinutesAc = 0,
@@ -44,17 +45,20 @@ function Show-HostPrepHelp {
 OSCAR Windows 11 unattended server preparation
 
   .\configure-windows-host.ps1 [-Mode check|apply] [-Strict] [-Json]
-      [-MonitorTimeoutMinutesAc 0] [-KeepHibernate]
+      [-MonitorTimeoutMinutesAc 0] [-KeepHibernate] [-ConfigureLanHttpsFirewall]
       [-AuthorizeSshPublicKey KEY[,KEY...]] [-AuthorizeSshPublicKeyFile FILE]
 
 Modes:
   check   Read-only audit of sleep, hibernate, disk spin-down, USB selective
           suspend, PnP USB/NIC power saving, PCIe ASPM, OpenSSH Server,
-          Windows Time, Windows Update auto-restart guard, WSL 2, and Docker.
+          Windows Time, Windows Update auto-restart guard, Win32 long paths,
+          wired LAN firewall profile, WSL 2, and Docker.
   apply   Requires an Administrator Windows PowerShell 5.1 session. Applies
           24/7 unattended server settings without resetting active network
-          links, optionally enrolls SSH public keys with strict Windows
-          OpenSSH administrators_authorized_keys ACLs, and re-verifies state.
+          links, enables Win32 long paths, optionally configures Private wired
+          LAN + scoped HTTPS firewall access (-ConfigureLanHttpsFirewall),
+          optionally enrolls SSH public keys with strict Windows OpenSSH
+          administrators_authorized_keys ACLs, and re-verifies state.
 '@ | Write-Host
 }
 
@@ -468,6 +472,39 @@ function Invoke-WindowsHostApply([string[]]$ResolvedSshKeys) {
     }
     Set-ItemProperty -LiteralPath $wuAuKey -Name 'NoAutoRebootWithLoggedOnUsers' -Value 1 -Type DWord
 
+    $fsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+    if (Test-Path -LiteralPath $fsKey) {
+        Set-ItemProperty -LiteralPath $fsKey -Name 'LongPathsEnabled' -Value 1 -Type DWord
+    }
+
+    if ($ConfigureLanHttpsFirewall) {
+        if ((Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) -and
+            (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) -and
+            (Get-Command Set-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+            $wiredAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue |
+                Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -and $_.MediaType -eq '802.3' })
+            foreach ($nic in $wiredAdapters) {
+                $netProfile = Get-NetConnectionProfile -InterfaceIndex $nic.InterfaceIndex -ErrorAction SilentlyContinue
+                if ($null -ne $netProfile -and $netProfile.NetworkCategory -eq 'Public') {
+                    Set-NetConnectionProfile -InterfaceIndex $nic.InterfaceIndex -NetworkCategory Private -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        if (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue) {
+            $existingRule = Get-NetFirewallRule -Name 'OSCAR-HTTPS-Gateway-In' -ErrorAction SilentlyContinue
+            if ($null -eq $existingRule) {
+                New-NetFirewallRule -Name 'OSCAR-HTTPS-Gateway-In' `
+                    -DisplayName 'OSCAR HTTPS Gateway (LAN)' `
+                    -Description 'Allow inbound HTTPS/HTTP to OSCAR gateway from Private/Domain LAN and Tailscale subnets' `
+                    -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443, 80 `
+                    -Profile Private, Domain -RemoteAddress LocalSubnet, '100.64.0.0/10' | Out-Null
+            } else {
+                Set-NetFirewallRule -Name 'OSCAR-HTTPS-Gateway-In' -Enabled True -Action Allow `
+                    -Profile Private, Domain -RemoteAddress LocalSubnet, '100.64.0.0/10' | Out-Null
+            }
+        }
+    }
+
     $dockerService = Get-Service -Name 'com.docker.service' -ErrorAction SilentlyContinue
     if ($null -ne $dockerService) {
         Set-Service -Name 'com.docker.service' -StartupType Automatic
@@ -608,6 +645,42 @@ function Get-WindowsHostReadinessReport {
         & $addCheck 'windows-update-reboot-guard' 'PASS' 'NoAutoRebootWithLoggedOnUsers=1 configured'
     } else {
         & $addCheck 'windows-update-reboot-guard' 'WARN' 'NoAutoRebootWithLoggedOnUsers policy not yet set to 1'
+    }
+
+    $fsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+    $fsProps = if (Test-Path -LiteralPath $fsKey) { Get-ItemProperty -LiteralPath $fsKey -ErrorAction SilentlyContinue } else { $null }
+    if ($null -ne $fsProps -and $null -ne $fsProps.PSObject.Properties['LongPathsEnabled'] -and
+        [int]$fsProps.LongPathsEnabled -eq 1) {
+        & $addCheck 'win32-long-paths' 'PASS' 'Win32 LongPathsEnabled=1 configured'
+    } else {
+        & $addCheck 'win32-long-paths' 'WARN' 'LongPathsEnabled is not 1 (run -Mode apply so Windows tools handle >260-char paths)'
+    }
+
+    $publicWiredNames = @()
+    if ((Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) -and
+        (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+        $wiredUp = @(Get-NetAdapter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -and $_.MediaType -eq '802.3' })
+        foreach ($nic in $wiredUp) {
+            $prof = Get-NetConnectionProfile -InterfaceIndex $nic.InterfaceIndex -ErrorAction SilentlyContinue
+            if ($null -ne $prof -and $prof.NetworkCategory -eq 'Public') {
+                $publicWiredNames += [string]$nic.Name
+            }
+        }
+    }
+    $httpsRuleOk = $false
+    if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
+        $oscarFw = Get-NetFirewallRule -Name 'OSCAR-HTTPS-Gateway-In' -ErrorAction SilentlyContinue
+        if ($null -ne $oscarFw -and $oscarFw.Enabled -eq 'True' -and $oscarFw.Action -eq 'Allow') {
+            $httpsRuleOk = $true
+        }
+    }
+    if ($publicWiredNames.Count -gt 0) {
+        & $addCheck 'lan-https-firewall' 'WARN' "Wired Ethernet ($($publicWiredNames -join ', ')) is on Public network profile; Windows Firewall blocks inbound Docker/HTTPS on Public (use -Mode apply -ConfigureLanHttpsFirewall on trusted LANs)"
+    } elseif ($httpsRuleOk) {
+        & $addCheck 'lan-https-firewall' 'PASS' 'Wired Ethernet uses Private/Domain profile and OSCAR-HTTPS-Gateway-In rule is enabled'
+    } else {
+        & $addCheck 'lan-https-firewall' 'WARN' 'Scoped OSCAR-HTTPS-Gateway-In firewall rule not yet configured (use -Mode apply -ConfigureLanHttpsFirewall if remote LAN browsers need HTTPS 443)'
     }
 
     $previousPreference = $ErrorActionPreference

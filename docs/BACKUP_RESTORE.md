@@ -382,7 +382,11 @@ larger than 4 GiB, and `exFAT` cannot store the Windows DACLs (`SYSTEM`, `Admini
 `-BackupDir` to one `OSCAR_DEPLOYMENT_ID` and local machine SIDs, use the external USB drive as an
 off-host carrier (`<backup-id>\` plus `CURRENT`, with `secrets\backup-key.txt` escrowed separately)
 and copy the snapshot into the replacement host's initialized local NTFS `-BackupDir` before running
-`.\oscar.bat backup-verify` and `.\oscar.bat restore`.
+`.\oscar.bat backup-verify` and `.\oscar.bat restore`. On Windows PowerShell 5.1, `oscar-storage.ps1`
+walks and removes temporary daily-file confirmation and restore staging trees through Win32
+extended-length (`\\?\`) paths while rejecting nested reparse points, so base64-encoded retained-media
+camera directories longer than 260 characters clean up reliably even on hosts where Win32
+`LongPathsEnabled` has not yet been enabled.
 
 ## Restore a coordinated backup
 
