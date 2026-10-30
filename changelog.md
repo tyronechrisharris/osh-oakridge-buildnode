@@ -1,5 +1,12 @@
 # OSCAR Build Node Change Log
 All notable changes to this project will be documented in this file. 
+## 3.11.0 2026-10-29
+## Changes
+- Add operational views based on configured keywords per lane
+- Modify daily file UI to show latest 15 messages on live view
+- Add individual detector charting to historical events
+- Fix Rapiscan neutron chart not showing first point in occupancy
+
 ## 3.9.1 2026-09-24
 ## Changes
 - Export alarms from the dashboard or Event Details as compact QR codes, PNG images, or portable alarm files for air-gapped transfer
