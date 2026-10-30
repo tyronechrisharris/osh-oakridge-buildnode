@@ -845,17 +845,22 @@ SELECT 'single quote '' and $dollar';
         } finally {
             $BackupDirectory = $savedBackupDirectory
         }
-        Assert-True ($calls.Count -eq 3) 'Daily journal confirmation did not run exactly validator, extractor, and Java verifier containers.'
-        $validatorArgs = [string]::Join('|', $calls[0].Arguments)
-        $extractorArgs = [string]::Join('|', $calls[1].Arguments)
-        $javaArgs = [string]::Join('|', $calls[2].Arguments)
+        Assert-True ($calls.Count -eq 5) 'Daily journal confirmation did not run volume-create, validator, extractor, Java verifier, and volume-rm steps.'
+        $volumeCreateArgs = [string]::Join('|', $calls[0].Arguments)
+        $validatorArgs = [string]::Join('|', $calls[1].Arguments)
+        $extractorArgs = [string]::Join('|', $calls[2].Arguments)
+        $javaArgs = [string]::Join('|', $calls[3].Arguments)
+        $volumeRemoveArgs = [string]::Join('|', $calls[4].Arguments)
+        Assert-True ($volumeCreateArgs -cmatch '^volume\|create\|(oscar_journal_confirm_[0-9a-f]{32})$') `
+            'Daily journal confirmation did not create an isolated Docker named volume for snapshot extraction.'
+        $snapshotVolumeName = $Matches[1]
         Assert-True ($validatorArgs.Contains('--user|0') -and
-            ([string]$calls[0].InputText).Contains('/validate-storage-archive.sh oscar-state')) `
+            ([string]$calls[1].InputText).Contains('/validate-storage-archive.sh oscar-state')) `
             'Daily journal confirmation does not validate the authenticated archive as root before extraction.'
-        foreach ($required in @('--cap-drop|ALL|--cap-add|CHOWN', '--workdir|/|--user|0|--entrypoint|sh')) {
-            Assert-True ($extractorArgs.Contains($required)) "Daily journal extraction is missing its constrained root ownership bridge: $required"
+        foreach ($required in @('--cap-drop|ALL|--cap-add|CHOWN', '--workdir|/|--user|0|--entrypoint|sh', "--volume|${snapshotVolumeName}:/snapshot")) {
+            Assert-True ($extractorArgs.Contains($required)) "Daily journal extraction is missing its constrained root ownership bridge or Docker volume mount: $required"
         }
-        $extractCommand = [string]$calls[1].InputText
+        $extractCommand = [string]$calls[2].InputText
         $extractIndex = $extractCommand.IndexOf('tar --no-same-owner', [StringComparison]::Ordinal)
         $directoryModeIndex = $extractCommand.IndexOf('find /snapshot -type d -exec chmod 0700', [StringComparison]::Ordinal)
         $fileModeIndex = $extractCommand.IndexOf('find /snapshot -type f -exec chmod 0600', [StringComparison]::Ordinal)
@@ -864,8 +869,10 @@ SELECT 'single quote '' and $dollar';
             $fileModeIndex -gt $directoryModeIndex -and $ownerIndex -gt $fileModeIndex) `
             'Daily journal extraction does not validate modes before handing the private snapshot to UID 10001.'
         Assert-True ($javaArgs.Contains('--user|10001:10001|--entrypoint|java') -and
-            $javaArgs.Contains('/verified-snapshot:ro')) `
-            'Daily journal Java confirmation does not remain an unprivileged read-only consumer.'
+            $javaArgs.Contains("--volume|${snapshotVolumeName}:/verified-snapshot:ro")) `
+            'Daily journal Java confirmation does not remain an unprivileged read-only consumer over the isolated snapshot volume.'
+        Assert-True ($volumeRemoveArgs -ceq "volume|rm|--force|${snapshotVolumeName}") `
+            'Daily journal confirmation did not remove the temporary Docker snapshot volume in finally.'
     }
     $statusStart = $storageSource.IndexOf('function Show-ArchiveStatus', [StringComparison]::Ordinal)
     $statusEnd = $storageSource.IndexOf('function Invoke-RetentionHold', $statusStart, [StringComparison]::Ordinal)

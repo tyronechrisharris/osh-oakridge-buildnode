@@ -2215,25 +2215,27 @@ function Assert-RestoreCompatibility([string]$Root) {
 
 function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, [string]$OscarStateSha256) {
     if ($OscarStateSha256 -notmatch '^[0-9a-f]{64}$') { Fail 'Authenticated oscar-state.tar.gz SHA-256 is missing.' }
-    $snapshot = Join-Path $BackupDirectory ".journal-confirm-$Id-$([Guid]::NewGuid().ToString('N'))"
-    New-Item -ItemType Directory -Path $snapshot | Out-Null
-    Protect-DockerStorageDirectory $snapshot 'ReadWrite'
+    $snapshotVolume = "oscar_journal_confirm_$([Guid]::NewGuid().ToString('N'))"
+    $volumeCreated = $false
     $running = @(Get-ComposeOutput @('ps', '--status', 'running', '--services'))
     $resumeOscar = $running -contains 'oscar'
     $resumeGateway = $running -contains 'gateway'
     $resumePostgres = $running -contains 'postgres'
     if (-not $resumePostgres) { Fail 'PostgreSQL must be running to create a coordinated backup.' }
     try {
+        Invoke-External 'docker' @('volume', 'create', $snapshotVolume)
+        $volumeCreated = $true
         if ($resumeGateway) { Invoke-Compose @('stop', 'gateway') }
         if ($resumeOscar) { Invoke-Compose @('stop', 'oscar') }
         $validation = 'exec sh /validate-storage-archive.sh oscar-state /oscar-state.tar.gz'
         Invoke-DockerShellInput $validation @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', $ValidatorScratchTmpfs, '--env', 'TMPDIR=/tmp', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "$(Join-Path $ScriptRoot 'validate-storage-archive.sh'):/validate-storage-archive.sh:ro", $Image, '-seu')
         $extract = 'umask 077; tar --no-same-owner -C /snapshot -xzf /oscar-state.tar.gz; find /snapshot -type d -exec chmod 0700 {} +; find /snapshot -type f -exec chmod 0600 {} +; chown -R 10001:10001 /snapshot'
-        Invoke-DockerShellInput $extract @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-seu')
-        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshot}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)
+        Invoke-DockerShellInput $extract @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshotVolume}:/snapshot", $Image, '-seu')
+        Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshotVolume}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)
     } finally {
-        if (Test-Path -LiteralPath $snapshot) {
-            Remove-DirectoryTreeLongPathSafe $snapshot 'daily-file journal confirmation snapshot' -IgnoreErrors
+        if ($volumeCreated) {
+            try { Invoke-External 'docker' @('volume', 'rm', '--force', $snapshotVolume) }
+            catch { Write-Warning "Could not remove temporary daily-file journal confirmation volume ${snapshotVolume}: $($_.Exception.Message)" }
         }
         $services = @()
         if ($resumeOscar) { $services += 'oscar' }
