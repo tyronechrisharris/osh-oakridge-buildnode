@@ -507,8 +507,18 @@ does not mount the legacy WAL directory.
 Restore checks volume ownership again
 after installing the merged environment and before starting services. On a same-host restore, the
 source and target local bindings are normally identical, so behavior is unchanged. On a cross-host
-restore, review endpoint and TLS acceptance carefully: source TLS and application credentials are
-restored, while the target hostname and port remain authoritative.
+restore, review container image provenance, endpoint identity, and TLS acceptance carefully:
+
+- `image-inventory.txt` enforces exact OCI image `sha256` ID parity (`application_id`,
+  `postgres_id`, and `gateway_id`) during `restore`. Load the exact `offline-images.tar` (or
+  digest-pinned images) that produced the backup—or upgrade the source deployment to the target
+  host's exact 3.11.0 release bundle before taking the migration backup—so image IDs match bit-for-bit.
+- Source TLS material (`tls/server.crt` and `tls/server.key`) and application credentials are
+  restored, while the target `OSCAR_HOSTNAME`, `OSCAR_HTTPS_PORT`, and `OSCAR_TLS_SANS` bindings in
+  `.env` remain authoritative. If the replacement host uses a new IP address or DNS name that is not
+  present in the restored self-signed certificate's Subject Alternative Names, regenerate or install
+  a certificate covering the replacement host's SANs after verifying data recovery and restart the
+  `gateway` container.
 
 The `pre-restore-*` directory is a safety copy of credentials, not a data rollback. It contains
 sensitive plaintext files; protect it and remove it under the site's credential-retention policy

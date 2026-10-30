@@ -699,7 +699,12 @@ edit or fast-forward them. For release qualification, save the accelerated profi
 initialized disposable site and perform the supported restart before importing lanes or permitting
 emulator traffic. Verify the current checkpoint first, then provision the lane fixture. If that
 order was not followed, recreate the disposable database and application state or allow normal
-oldest-first catch-up; checkpoint deletion is not an accepted shortcut.
+oldest-first catch-up; checkpoint deletion is not an accepted shortcut. Note also that when
+`OSCARServiceConfig.spreadsheetConfigPath` references a CSV file, `OSCARServiceModule` re-parses
+that spreadsheet on startup and applies its video-retention and storage-pressure settings over
+`config.json`; either update/export the CSV policy columns or clear `spreadsheetConfigPath` after
+lane import has been saved so edited `videoRetentionConfig` and `storagePressureRetentionConfig`
+values persist across restarts.
 
 For an event reached by the first eligible retained-media cycle:
 
