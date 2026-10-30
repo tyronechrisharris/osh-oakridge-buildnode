@@ -102,8 +102,38 @@ function Initialize-NativeStorageMethods {
     if ('OscarStorageNative' -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 public static class OscarStorageNative {
+    private const uint FILE_ATTRIBUTE_READONLY = 0x00000001;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    private const uint FILE_ATTRIBUTE_DEVICE = 0x00000040;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    private const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
+    private const int ERROR_FILE_NOT_FOUND = 2;
+    private const int ERROR_PATH_NOT_FOUND = 3;
+    private const int ERROR_NO_MORE_FILES = 18;
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WIN32_FIND_DATAW {
+        public uint dwFileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint dwReserved0;
+        public uint dwReserved1;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string cFileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+        public string cAlternateFileName;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool MoveFileEx(string existingName, string newName, uint flags);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -112,8 +142,232 @@ public static class OscarStorageNative {
     public static extern bool FlushFileBuffers(IntPtr handle);
     [DllImport("kernel32.dll")]
     public static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFileAttributesW(string lpFileName);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetFileAttributesW(string lpFileName, uint dwFileAttributes);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATAW lpFindFileData);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATAW lpFindFileData);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FindClose(IntPtr hFindFile);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool DeleteFileW(string lpFileName);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool RemoveDirectoryW(string lpPathName);
+
+    public static string ToExtendedPath(string fullPath) {
+        if (string.IsNullOrWhiteSpace(fullPath)) {
+            throw new ArgumentException("Storage path must not be empty.");
+        }
+        if (fullPath.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+            return fullPath.TrimEnd('\\', '/');
+        }
+        string normalized = fullPath.Replace('/', '\\');
+        if (normalized.Length < 248) {
+            normalized = Path.GetFullPath(normalized);
+        } else if (!Regex.IsMatch(normalized, @"^[A-Za-z]:\\") && !normalized.StartsWith(@"\\", StringComparison.Ordinal)) {
+            throw new ArgumentException("Extended storage path must be rooted: " + fullPath);
+        }
+        normalized = normalized.TrimEnd('\\');
+        if (normalized.StartsWith(@"\\", StringComparison.Ordinal)) {
+            return @"\\?\UNC\" + normalized.Substring(2);
+        }
+        return @"\\?\" + normalized;
+    }
+
+    private static string StripExtendedPrefix(string extendedPath) {
+        if (extendedPath.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) {
+            return @"\\" + extendedPath.Substring(8);
+        }
+        if (extendedPath.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+            return extendedPath.Substring(4);
+        }
+        return extendedPath;
+    }
+
+    public static void AssertRegularDirectoryTree(string fullPath, string description) {
+        string root = ToExtendedPath(fullPath);
+        uint rootAttr = GetFileAttributesW(root);
+        if (rootAttr == INVALID_FILE_ATTRIBUTES) {
+            int err = Marshal.GetLastWin32Error();
+            throw new IOException(string.Format("{0} is missing (Win32 {1}): {2}", description, err, StripExtendedPrefix(root)));
+        }
+        if ((rootAttr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            throw new InvalidOperationException(string.Format("{0} is a reparse point: {1}", description, StripExtendedPrefix(root)));
+        }
+        if ((rootAttr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            throw new InvalidOperationException(string.Format("{0} is not a directory: {1}", description, StripExtendedPrefix(root)));
+        }
+        Stack<string> pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.Count > 0) {
+            string current = pending.Pop();
+            WIN32_FIND_DATAW data;
+            IntPtr handle = FindFirstFileW(current + @"\*", out data);
+            if (handle == INVALID_HANDLE_VALUE) {
+                int err = Marshal.GetLastWin32Error();
+                if (err == ERROR_FILE_NOT_FOUND) continue;
+                throw new IOException(string.Format("Could not enumerate {0} (Win32 {1}): {2}", description, err, StripExtendedPrefix(current)));
+            }
+            try {
+                do {
+                    string name = data.cFileName;
+                    if (name == "." || name == "..") continue;
+                    string child = current + @"\" + name;
+                    uint attr = data.dwFileAttributes;
+                    if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                        throw new InvalidOperationException(string.Format("{0} contains a reparse point: {1}", description, StripExtendedPrefix(child)));
+                    }
+                    if ((attr & FILE_ATTRIBUTE_DEVICE) != 0) {
+                        throw new InvalidOperationException(string.Format("{0} contains a non-regular entry: {1}", description, StripExtendedPrefix(child)));
+                    }
+                    if ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                        pending.Push(child);
+                    }
+                } while (FindNextFileW(handle, out data));
+                int lastErr = Marshal.GetLastWin32Error();
+                if (lastErr != ERROR_NO_MORE_FILES) {
+                    throw new IOException(string.Format("Directory enumeration failed in {0} (Win32 {1}): {2}", description, lastErr, StripExtendedPrefix(current)));
+                }
+            } finally {
+                FindClose(handle);
+            }
+        }
+    }
+
+    public static void DeleteValidatedDirectoryTree(string fullPath, string description) {
+        string root = ToExtendedPath(fullPath);
+        uint rootAttr = GetFileAttributesW(root);
+        if (rootAttr == INVALID_FILE_ATTRIBUTES) {
+            int err = Marshal.GetLastWin32Error();
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return;
+            throw new IOException(string.Format("Could not inspect {0} (Win32 {1}): {2}", description, err, StripExtendedPrefix(root)));
+        }
+        if ((rootAttr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            throw new InvalidOperationException(string.Format("{0} is a reparse point: {1}", description, StripExtendedPrefix(root)));
+        }
+        if ((rootAttr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            throw new InvalidOperationException(string.Format("{0} is not a directory: {1}", description, StripExtendedPrefix(root)));
+        }
+        List<string> files = new List<string>();
+        List<string> directories = new List<string>();
+        Stack<string> pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.Count > 0) {
+            string current = pending.Pop();
+            directories.Add(current);
+            WIN32_FIND_DATAW data;
+            IntPtr handle = FindFirstFileW(current + @"\*", out data);
+            if (handle == INVALID_HANDLE_VALUE) {
+                int err = Marshal.GetLastWin32Error();
+                if (err == ERROR_FILE_NOT_FOUND) continue;
+                throw new IOException(string.Format("Could not enumerate {0} (Win32 {1}): {2}", description, err, StripExtendedPrefix(current)));
+            }
+            try {
+                do {
+                    string name = data.cFileName;
+                    if (name == "." || name == "..") continue;
+                    string child = current + @"\" + name;
+                    uint attr = data.dwFileAttributes;
+                    if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                        throw new InvalidOperationException(string.Format("{0} contains a reparse point: {1}", description, StripExtendedPrefix(child)));
+                    }
+                    if ((attr & FILE_ATTRIBUTE_DEVICE) != 0) {
+                        throw new InvalidOperationException(string.Format("{0} contains a non-regular entry: {1}", description, StripExtendedPrefix(child)));
+                    }
+                    if ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                        pending.Push(child);
+                    } else {
+                        files.Add(child);
+                    }
+                } while (FindNextFileW(handle, out data));
+                int lastErr = Marshal.GetLastWin32Error();
+                if (lastErr != ERROR_NO_MORE_FILES) {
+                    throw new IOException(string.Format("Directory enumeration failed in {0} (Win32 {1}): {2}", description, lastErr, StripExtendedPrefix(current)));
+                }
+            } finally {
+                FindClose(handle);
+            }
+        }
+        foreach (string file in files) {
+            uint attr = GetFileAttributesW(file);
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                throw new InvalidOperationException(string.Format("{0} contains a reparse point: {1}", description, StripExtendedPrefix(file)));
+            }
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY) != 0) {
+                SetFileAttributesW(file, FILE_ATTRIBUTE_NORMAL);
+            }
+            if (!DeleteFileW(file)) {
+                int err = Marshal.GetLastWin32Error();
+                if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                    throw new IOException(string.Format("Could not delete file in {0} (Win32 {1}): {2}", description, err, StripExtendedPrefix(file)));
+                }
+            }
+        }
+        for (int i = directories.Count - 1; i >= 0; i--) {
+            string dir = directories[i];
+            uint attr = GetFileAttributesW(dir);
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                throw new InvalidOperationException(string.Format("{0} contains a reparse point: {1}", description, StripExtendedPrefix(dir)));
+            }
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY) != 0) {
+                SetFileAttributesW(dir, FILE_ATTRIBUTE_DIRECTORY);
+            }
+            if (!RemoveDirectoryW(dir)) {
+                int err = Marshal.GetLastWin32Error();
+                if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                    throw new IOException(string.Format("Could not remove directory in {0} (Win32 {1}): {2}", description, err, StripExtendedPrefix(dir)));
+                }
+            }
+        }
+    }
 }
 '@
+}
+
+function Assert-RegularDirectoryTree([string]$FullPath, [string]$Description) {
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Initialize-NativeStorageMethods
+        try {
+            [OscarStorageNative]::AssertRegularDirectoryTree($FullPath, $Description)
+        } catch {
+            Fail $_.Exception.Message
+        }
+        return
+    }
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($FullPath)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail "$Description contains a reparse point: $($child.FullName)"
+            }
+            if ($child.PSIsContainer) { $pending.Push($child.FullName); continue }
+            if ($child -isnot [IO.FileInfo]) { Fail "$Description contains a non-regular entry: $($child.FullName)" }
+        }
+    }
+}
+
+function Remove-DirectoryTreeLongPathSafe([string]$FullPath, [string]$Description, [switch]$IgnoreErrors) {
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Initialize-NativeStorageMethods
+        try {
+            [OscarStorageNative]::DeleteValidatedDirectoryTree($FullPath, $Description)
+        } catch {
+            if (-not $IgnoreErrors) {
+                Fail $_.Exception.Message
+            }
+        }
+        return
+    }
+    if ($IgnoreErrors) {
+        Remove-Item -LiteralPath $FullPath -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        Remove-Item -LiteralPath $FullPath -Recurse -Force
+    }
 }
 
 function Sync-DurableMetadata([string]$Path) {
@@ -1978,7 +2232,9 @@ function Confirm-DailyJournalBackup([string]$Id, [string]$Root, [string]$Image, 
         Invoke-DockerShellInput $extract @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges', '--workdir', '/', '--user', '0', '--entrypoint', 'sh', '--volume', "$(Join-Path $Root 'oscar-state.tar.gz'):/oscar-state.tar.gz:ro", '--volume', "${snapshot}:/snapshot", $Image, '-seu')
         Invoke-External 'docker' @('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev', '--user', '10001:10001', '--entrypoint', 'java', '--volume', 'oscar_oscar_state:/var/lib/oscar', '--volume', "${snapshot}:/verified-snapshot:ro", $Image, '-cp', '/opt/oscar/lib/*', 'com.botts.impl.service.dailyfile.DailyFileBackupConfirmationCli', '/var/lib/oscar', '/verified-snapshot', $Id, $OscarStateSha256)
     } finally {
-        Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $snapshot) {
+            Remove-DirectoryTreeLongPathSafe $snapshot 'daily-file journal confirmation snapshot' -IgnoreErrors
+        }
         $services = @()
         if ($resumeOscar) { $services += 'oscar' }
         if ($resumeGateway) { $services += 'gateway' }
@@ -2368,23 +2624,12 @@ function Assert-SafeBackupCleanupDirectory([string]$Path, [string]$ExpectedName,
     $item = Get-Item -LiteralPath $full -Force
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Fail "$Description is a reparse point: $full" }
     Assert-BackupCleanupAcl $full $Description
-    $pending = New-Object 'Collections.Generic.Stack[string]'
-    $pending.Push($full)
-    while ($pending.Count -gt 0) {
-        $directory = $pending.Pop()
-        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
-            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                Fail "$Description contains a reparse point: $($child.FullName)"
-            }
-            if ($child.PSIsContainer) { $pending.Push($child.FullName); continue }
-            if ($child -isnot [IO.FileInfo]) { Fail "$Description contains a non-regular entry: $($child.FullName)" }
-        }
-    }
+    Assert-RegularDirectoryTree $full $Description
 }
 
 function Remove-SafeBackupCleanupDirectory([string]$Path, [string]$ExpectedName, [string]$Description) {
     Assert-SafeBackupCleanupDirectory $Path $ExpectedName $Description
-    Remove-Item -LiteralPath $Path -Recurse -Force
+    Remove-DirectoryTreeLongPathSafe $Path $Description
     Sync-DurableMetadata $BackupDirectory
 }
 
@@ -2908,8 +3153,8 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
         Prepare-RestoredDeploymentCredentials $restoreTemp $ScriptRoot
         Assert-StorageRootIdentities -IncludeBackup
     } catch {
-        Remove-Item -LiteralPath $restoreTemp -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $restoreStage -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $restoreTemp) { Remove-DirectoryTreeLongPathSafe $restoreTemp 'restore credential staging directory' -IgnoreErrors }
+        if (Test-Path -LiteralPath $restoreStage) { Remove-DirectoryTreeLongPathSafe $restoreStage 'restore payload staging directory' -IgnoreErrors }
         throw
     }
     try {
@@ -2935,8 +3180,8 @@ function Restore-Backup([string]$Id, [string]$Confirmation) {
         Install-PreparedDeploymentCredentials $restoreTemp $ScriptRoot
         Assert-DeploymentVolumeOwnership
     } finally {
-        Remove-Item -LiteralPath $restoreTemp -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $restoreStage -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $restoreTemp) { Remove-DirectoryTreeLongPathSafe $restoreTemp 'restore credential staging directory' -IgnoreErrors }
+        if (Test-Path -LiteralPath $restoreStage) { Remove-DirectoryTreeLongPathSafe $restoreStage 'restore payload staging directory' -IgnoreErrors }
     }
     $restoredPostgresRunning = $false
     try {
@@ -3454,7 +3699,7 @@ The generation manifest defines column types, sort order, compression, row count
         Sync-DurableTree $partial
         Move-DurableNoReplace $partial $targetRoot
     } finally {
-        if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Recurse -Force }
+        if (Test-Path -LiteralPath $partial) { Remove-DirectoryTreeLongPathSafe $partial 'archive export partial' }
         if ($resumeOscar) {
             Invoke-Compose @('up', '--detach', '--no-deps', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300', 'oscar')
         }

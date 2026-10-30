@@ -1363,6 +1363,66 @@ SELECT 'single quote '' and $dollar';
         $setupSource.Contains('Test-WindowsRebootPending')) `
         'Windows setup does not guard bundled Docker Desktop installation against Session 0 GUI hangs and pending feature restarts.'
 
+    # Verify Windows PowerShell 5.1 backup scratch cleanup handles >260-character
+    # retained-media paths (.publication-commit.json) even when LongPathsEnabled=0,
+    # while still rejecting nested reparse points before deleting anything outside.
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Initialize-NativeStorageMethods
+        $longRoot = Join-Path $temporaryRoot '.journal-confirm-20261030T012635Z-a6ec4c7a-7e62d1297dae41eabc7566ffa86a8d8b'
+        New-Item -ItemType Directory -Path $longRoot | Out-Null
+        $segments = @(
+            'files', 'videos', 'retained-media', 'v1', 'events', 'MGkwNWE',
+            'lanes', 'dXJuOm9zaDpzeXN0ZW06bGFuZTpsYW5lLTMy',
+            'cameras', 'dXJuOm9zaDpzZW5zb3I6ZmZtcGVnOmxhbmU6bGFuZS0zMjow'
+        )
+        $extendedCurrent = [OscarStorageNative]::ToExtendedPath($longRoot)
+        if (-not ('OscarLongPathTestHelper' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OscarLongPathTestHelper {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CreateDirectoryW(string lpPathName, IntPtr lpSecurityAttributes);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+'@
+        }
+        foreach ($seg in $segments) {
+            $extendedCurrent = "$extendedCurrent\$seg"
+            Assert-True ([OscarLongPathTestHelper]::CreateDirectoryW($extendedCurrent, [IntPtr]::Zero)) "Failed to create long-path directory segment: $seg"
+        }
+        $deepFile = "$extendedCurrent\.publication-commit.json"
+        Assert-True (($deepFile.Length - 4) -gt 270) "Expected synthetic retained-media scratch path >270 chars, got $($deepFile.Length - 4)."
+        $fileHandle = [OscarLongPathTestHelper]::CreateFileW($deepFile, [uint32]0x40000000, [uint32]0, [IntPtr]::Zero, [uint32]2, [uint32]0x80, [IntPtr]::Zero)
+        Assert-True ($fileHandle -ne [IntPtr](-1)) 'Failed to create >270-char .publication-commit.json fixture.'
+        [void][OscarLongPathTestHelper]::CloseHandle($fileHandle)
+
+        Assert-RegularDirectoryTree $longRoot 'long-path backup scratch fixture'
+        Remove-DirectoryTreeLongPathSafe $longRoot 'long-path backup scratch fixture'
+        Assert-True (-not (Test-Path -LiteralPath $longRoot)) 'Remove-DirectoryTreeLongPathSafe did not remove the >270-char backup scratch tree.'
+
+        $junctionParent = Join-Path $temporaryRoot 'reparse-guard-root'
+        $junctionTarget = Join-Path $temporaryRoot 'reparse-outside-target'
+        New-Item -ItemType Directory -Path $junctionParent | Out-Null
+        New-Item -ItemType Directory -Path $junctionTarget | Out-Null
+        [IO.File]::WriteAllText((Join-Path $junctionTarget 'keep.txt'), "keep`n", $Utf8NoBom)
+        $junctionLink = Join-Path $junctionParent 'nested-junction'
+        & cmd.exe /c "mklink /J `"$junctionLink`" `"$junctionTarget`"" *> $null
+        $junctionRejected = $false
+        try {
+            Remove-DirectoryTreeLongPathSafe $junctionParent 'reparse guard fixture'
+        } catch {
+            $junctionRejected = $_.Exception.Message.Contains('contains a reparse point')
+        }
+        Assert-True $junctionRejected 'Remove-DirectoryTreeLongPathSafe did not reject a nested junction reparse point.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $junctionTarget 'keep.txt') -PathType Leaf) 'Reparse guard deleted a file inside an external junction target.'
+        & cmd.exe /c "rmdir `"$junctionLink`"" *> $null
+        Remove-DirectoryTreeLongPathSafe $junctionParent 'reparse guard fixture'
+    }
+
     Write-Host 'OSCAR Windows PowerShell 5.1 storage safety tests passed.' -ForegroundColor Green
 } finally {
     Remove-Item Env:OSCAR_STORAGE_TEST_MODE -ErrorAction SilentlyContinue
