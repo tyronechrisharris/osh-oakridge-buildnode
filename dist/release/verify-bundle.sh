@@ -26,6 +26,18 @@ atomic_replace_receipt() {
         return 1
     fi
 }
+is_reserved_runtime_path() {
+    local candidate=$1
+    [[ $candidate =~ ^(SHA256SUMS|\.bundle-verified|\.bundle-verified\.tmp\.[A-Za-z0-9._-]+|\.env|\.oscar-init-state|\.oscar-init-state\.tmp\.[A-Za-z0-9._-]+|\.oscar-volume-adoption|\.oscar-volume-adoption\.tmp\.[A-Za-z0-9._-]+|secrets/(oscar-admin-password|oscar-db-password|postgres-bootstrap-password|backup-key)\.txt|tls/server\.(crt|key)|pre-restore-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}/(\.env|secrets/(oscar-admin-password|oscar-db-password|postgres-bootstrap-password|backup-key)\.txt|tls/server\.(crt|key)))$ ]]
+}
+is_reserved_manifest_path() {
+    local lowered
+    lowered=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case $lowered in
+        secrets/*|tls/*|pre-restore-*/*) return 0 ;;
+    esac
+    is_reserved_runtime_path "$lowered"
+}
 assert_no_symlink_components "$script_dir"
 [[ -f SHA256SUMS ]] || { printf 'ERROR: SHA256SUMS is missing.\n' >&2; exit 1; }
 [[ ! -L SHA256SUMS ]] || { printf 'ERROR: SHA256SUMS must not be a symbolic link.\n' >&2; exit 1; }
@@ -46,8 +58,7 @@ while IFS= read -r line || [[ -n $line ]]; do
     case "/$relative/" in
         //*|*/../*|*/./*|*//*|*\\*) printf 'ERROR: unsafe SHA256SUMS path: %s\n' "$relative" >&2; exit 1 ;;
     esac
-    [[ -n $relative && $relative != /* && $relative != SHA256SUMS && $relative != .bundle-verified &&
-       $relative != .bundle-verified.tmp.* ]] || {
+    [[ -n $relative && $relative != /* ]] && ! is_reserved_manifest_path "$relative" || {
         printf 'ERROR: reserved or unsafe SHA256SUMS path: %s\n' "$relative" >&2; exit 1;
     }
     printf '%s\n' "$relative" >>"$declared"
@@ -65,7 +76,7 @@ while IFS= read -r -d '' entry; do
     fi
     if [[ -d $entry ]]; then continue; fi
     [[ -f $entry ]] || { printf 'ERROR: offline bundle contains a non-regular entry: %s\n' "$relative" >&2; exit 1; }
-    case $relative in SHA256SUMS|.bundle-verified|.bundle-verified.tmp.*) continue ;; esac
+    if is_reserved_runtime_path "$relative"; then continue; fi
     printf '%s\n' "$relative" >>"$actual"
 done < <(find "$script_dir" -mindepth 1 -print0)
 LC_ALL=C sort -f "$declared" -o "$declared"

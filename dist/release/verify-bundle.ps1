@@ -27,6 +27,14 @@ public static class OscarVerifyBundleNative {
 }
 '@
 }
+function Test-ReservedBundleRuntimePath([string]$RelativePath, [switch]$IgnoreCase) {
+    $exactPattern = '^(?:SHA256SUMS|\.bundle-verified|\.bundle-verified\.tmp\.[A-Za-z0-9._-]+|\.env|\.oscar-init-state|\.oscar-init-state\.tmp\.[A-Za-z0-9._-]+|\.oscar-volume-adoption|\.oscar-volume-adoption\.tmp\.[A-Za-z0-9._-]+|secrets/(?:oscar-admin-password|oscar-db-password|postgres-bootstrap-password|backup-key)\.txt|tls/server\.(?:crt|key)|pre-restore-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}/(?:\.env|secrets/(?:oscar-admin-password|oscar-db-password|postgres-bootstrap-password|backup-key)\.txt|tls/server\.(?:crt|key)))$'
+    if ($IgnoreCase) {
+        if ($RelativePath -imatch '^(?:secrets|tls|pre-restore-[^/]+)/') { return $true }
+        return ($RelativePath -imatch $exactPattern)
+    }
+    return ($RelativePath -cmatch $exactPattern)
+}
 Assert-NoReparseComponents $root
 $checksumFile = Join-Path $root 'SHA256SUMS'
 $checksumItem = Get-Item -LiteralPath $checksumFile -Force -ErrorAction SilentlyContinue
@@ -46,8 +54,7 @@ foreach ($line in [IO.File]::ReadAllLines($checksumFile)) {
     $manifestRelative = $Matches[2]
     if (-not $manifestRelative -or $manifestRelative.StartsWith('/') -or $manifestRelative.Contains('\') -or
         $manifestRelative.Contains('//') -or $manifestRelative -match '(^|/)\.{1,2}(/|$)' -or
-        $manifestRelative -in @('SHA256SUMS', '.bundle-verified') -or
-        $manifestRelative.StartsWith('.bundle-verified.tmp.', [StringComparison]::Ordinal)) {
+        (Test-ReservedBundleRuntimePath $manifestRelative -IgnoreCase)) {
         throw "Unsafe or reserved SHA256SUMS path: $manifestRelative"
     }
     if (-not $declared.Add($manifestRelative)) { throw "Duplicate or case-colliding SHA256SUMS path: $manifestRelative" }
@@ -78,8 +85,7 @@ while ($pending.Count -gt 0) {
         }
         if ($item.PSIsContainer) { $pending.Push($item.FullName); continue }
         if ($item -isnot [IO.FileInfo]) { throw "Offline bundle contains a non-regular entry: $relative" }
-        if ($relative -in @('SHA256SUMS', '.bundle-verified') -or
-            $relative.StartsWith('.bundle-verified.tmp.', [StringComparison]::Ordinal)) { continue }
+        if (Test-ReservedBundleRuntimePath $relative) { continue }
         if (-not $actual.Add($relative)) { throw "Offline bundle contains case-colliding paths: $relative" }
     }
 }

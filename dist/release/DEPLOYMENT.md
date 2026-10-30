@@ -199,9 +199,12 @@ Extract the offline ZIP into a local NTFS directory. From an Administrator Windo
 ```
 
 The equivalent CLI command is `oscar.bat verify`. Verification requires the exact bundle inventory:
-every allowed regular file appears once in `SHA256SUMS`, every listed digest matches, and no extra,
-linked, reparse-point, aliased, or prefix-colliding path is accepted. OSCAR records a receipt for
-audit, but every later mutating `init` or `upgrade` repeats the full pass before it can execute a
+every allowed regular payload file appears once in `SHA256SUMS`, every listed digest matches, only
+OSCAR's closed non-executable runtime state paths (`.env`, `.oscar-init-state`,
+`.oscar-volume-adoption`, the four `secrets/*.txt` files, `tls/server.{crt,key}`, and
+`pre-restore-<id>` credential backups) may exist outside `SHA256SUMS` after initialization, and no
+extra, linked, reparse-point, aliased, or prefix-colliding path is accepted. OSCAR records a receipt
+for audit, but every later mutating `init` or `upgrade` repeats the full pass before it can execute a
 bundle payload. Routine non-setup commands do not perform full bundle verification; run `verify`
 explicitly whenever post-installation tampering is suspected.
 

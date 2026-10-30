@@ -156,6 +156,27 @@ try {
     [IO.File]::WriteAllText((Join-Path $bundle 'extra.msi'), 'unmanifested', (New-Object Text.UTF8Encoding($false)))
     Assert-True ((Invoke-Verifier $bundle) -ne 0) 'The Windows verifier accepted an unmanifested installer.'
     Remove-Item -LiteralPath (Join-Path $bundle 'extra.msi') -Force
+    New-Item -ItemType Directory -Path (Join-Path $bundle 'secrets'), (Join-Path $bundle 'tls'), (Join-Path $bundle 'pre-restore-20261030T010000Z-deadbeef\secrets'), (Join-Path $bundle 'pre-restore-20261030T010000Z-deadbeef\tls') -Force | Out-Null
+    foreach ($runtimeFile in @(
+        '.env',
+        '.oscar-init-state',
+        '.oscar-volume-adoption',
+        'secrets\oscar-admin-password.txt',
+        'secrets\oscar-db-password.txt',
+        'secrets\postgres-bootstrap-password.txt',
+        'secrets\backup-key.txt',
+        'tls\server.crt',
+        'tls\server.key',
+        'pre-restore-20261030T010000Z-deadbeef\.env',
+        'pre-restore-20261030T010000Z-deadbeef\secrets\backup-key.txt',
+        'pre-restore-20261030T010000Z-deadbeef\tls\server.crt'
+    )) {
+        [IO.File]::WriteAllText((Join-Path $bundle $runtimeFile), "state`n", (New-Object Text.UTF8Encoding($false)))
+    }
+    Assert-True ((Invoke-Verifier $bundle) -eq 0) 'The Windows verifier rejected initialized OSCAR runtime state during post-init verify/upgrade.'
+    [IO.File]::WriteAllText((Join-Path $bundle 'secrets\extra.exe'), 'unmanifested', (New-Object Text.UTF8Encoding($false)))
+    Assert-True ((Invoke-Verifier $bundle) -ne 0) 'The Windows verifier accepted an unmanifested file inside secrets.'
+    Remove-Item -LiteralPath (Join-Path $bundle 'secrets\extra.exe') -Force
     Add-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS') -Value ([IO.File]::ReadAllLines((Join-Path $bundle 'SHA256SUMS'))[0])
     Assert-True ((Invoke-Verifier $bundle) -ne 0) 'The Windows verifier accepted a duplicate manifest path.'
 
