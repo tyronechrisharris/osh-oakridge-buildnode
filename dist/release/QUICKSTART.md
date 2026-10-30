@@ -101,12 +101,13 @@ This lets OSCAR finish its bounded journal and database-backed module shutdown b
 is stopped. Do not replace the launcher command with a multi-service `docker compose restart`.
 
 Fresh deployments cannot create, verify, or restore a coordinated snapshot until an administrator
-selects the manual single-snapshot mode and a safe absolute backup path that does not overlap the
-release or archive roots. A separate physical drive is recommended for failure isolation, but it is
-not required. Opt in through setup:
+selects the manual single-snapshot mode and a safe absolute backup path (at least two path
+components below its drive or filesystem root) that does not overlap the release or archive roots.
+A separate physical drive is recommended for failure isolation, but it is not required. Opt in
+through setup:
 
 ```powershell
-.\oscar.bat upgrade -BackupMode single -BackupDir D:\oscar-backups
+.\oscar.bat upgrade -BackupMode single -BackupDir D:\oscar-storage\backups
 ```
 
 ```sh

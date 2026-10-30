@@ -274,14 +274,15 @@ Review parity receipts and failed archive jobs with the queries below.
 
 ### Phase 2: recovery acceptance
 
-If the site requires OSCAR-managed recovery snapshots, opt in explicitly:
+If the site requires OSCAR-managed recovery snapshots, opt in explicitly using a dedicated directory
+at least two path components below its drive or filesystem root:
 
 ```sh
 sudo bash oscar.sh upgrade --backup-mode single --backup-dir /srv/oscar-backups
 ```
 
 ```powershell
-.\oscar.bat upgrade -BackupMode single -BackupDir D:\oscar-backups
+.\oscar.bat upgrade -BackupMode single -BackupDir D:\oscar-storage\backups
 ```
 
 Create and verify the single coordinated snapshot, copy it off-host, restore it on an isolated test
